@@ -39,12 +39,16 @@ fn fmt_opt(v: Option<u64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "-".into())
 }
 
-/// Parsed chat completion: reply text plus model id and usage.
+/// Parsed chat completion: reply text plus model id, usage, and finish reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuseChatResponse {
     pub content: String,
     pub model: String,
     pub usage: Option<MuseUsage>,
+    /// `choices[0].finish_reason` (`"stop"`, `"length"`, ...); `None` when
+    /// missing or null. Callers that only need text keep using
+    /// [`ModelClient::complete`]; truncation handling reads this field.
+    pub finish_reason: Option<String>,
 }
 
 /// Muse Spark client. Holds no secrets, so `Debug` is safe to print.
@@ -128,9 +132,14 @@ impl MuseClient {
 
     /// Request body for a single user prompt.
     pub fn request_body(&self, prompt: &str) -> serde_json::Value {
+        self.request_body_messages(serde_json::json!([{"role": "user", "content": prompt}]))
+    }
+
+    /// Request body for an explicit multi-turn message list (continuations).
+    pub fn request_body_messages(&self, messages: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_completion_tokens": self.max_completion_tokens,
             "reasoning_effort": self.reasoning_effort,
         })
@@ -140,12 +149,22 @@ impl MuseClient {
     /// Fails closed without the paid switch or the API key; never touches
     /// the network in those cases.
     pub fn chat(&self, prompt: &str) -> Result<MuseChatResponse, RouterError> {
+        self.chat_messages(serde_json::json!([{"role": "user", "content": prompt}]))
+    }
+
+    /// Send an explicit multi-turn message list and parse the full response.
+    /// Same fail-closed rules as [`Self::chat`]; existing single-prompt
+    /// callers keep using [`Self::chat`] unchanged.
+    pub fn chat_messages(
+        &self,
+        messages: serde_json::Value,
+    ) -> Result<MuseChatResponse, RouterError> {
         if !self.allow_paid {
             return Err(RouterError::PaidCallsDisabled);
         }
         // Key lives in env only; an empty value counts as missing.
         let api_key = get_env("META_API_KEY").ok_or(RouterError::MissingEnv("META_API_KEY"))?;
-        let body = self.request_body(prompt);
+        let body = self.request_body_messages(messages);
         let raw: serde_json::Value = ureq::post(&self.endpoint())
             .timeout(std::time::Duration::from_secs(60))
             .set("Authorization", &format!("Bearer {api_key}"))
@@ -157,9 +176,10 @@ impl MuseClient {
     }
 
     /// Parse an OpenAI-compatible chat completion value.
-    /// Reads `choices[0].message.content` plus `model` and `usage`.
-    /// A null content (reasoning tokens consumed the budget, typically with
-    /// `finish_reason` "length") is a clear `BadResponse` naming the reason.
+    /// Reads `choices[0].message.content` plus `model`, `usage`, and
+    /// `finish_reason`. A null content (reasoning tokens consumed the budget,
+    /// typically with `finish_reason` "length") is a clear `BadResponse`
+    /// naming the reason.
     pub fn parse_chat_response(value: &serde_json::Value) -> Result<MuseChatResponse, RouterError> {
         let choice = value
             .get("choices")
@@ -203,10 +223,15 @@ impl MuseClient {
             completion_tokens: u.get("completion_tokens").and_then(as_u64),
             total_tokens: u.get("total_tokens").and_then(as_u64),
         });
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|r| r.as_str())
+            .map(str::to_string);
         Ok(MuseChatResponse {
             content: content.to_string(),
             model,
             usage,
+            finish_reason,
         })
     }
 }
@@ -334,6 +359,7 @@ mod tests {
         let resp = MuseClient::parse_chat_response(&raw).unwrap();
         assert_eq!(resp.content, "ok");
         assert_eq!(resp.model, "muse-spark-1.3");
+        assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
         assert_eq!(
             resp.usage,
             Some(MuseUsage {
@@ -342,6 +368,36 @@ mod tests {
                 total_tokens: Some(11),
             })
         );
+    }
+
+    #[test]
+    fn exposes_finish_reason_for_truncation() {
+        let length = serde_json::json!({
+            "model": "muse-spark-1.3",
+            "choices": [{
+                "message": {"role": "assistant", "content": "part one "},
+                "finish_reason": "length"
+            }],
+        });
+        let resp = MuseClient::parse_chat_response(&length).unwrap();
+        assert_eq!(resp.finish_reason.as_deref(), Some("length"));
+
+        let missing = serde_json::json!({
+            "model": "muse-spark-1.3",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        });
+        let resp = MuseClient::parse_chat_response(&missing).unwrap();
+        assert_eq!(resp.finish_reason, None);
+
+        let null_reason = serde_json::json!({
+            "model": "muse-spark-1.3",
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": null
+            }],
+        });
+        let resp = MuseClient::parse_chat_response(&null_reason).unwrap();
+        assert_eq!(resp.finish_reason, None);
     }
 
     #[test]
@@ -370,6 +426,24 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "hello");
         assert_eq!(body["max_completion_tokens"], 16);
         assert_eq!(body["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn builds_multi_turn_continuation_body() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "original"},
+            {"role": "assistant", "content": "part one "},
+            {"role": "user", "content": "Continue exactly where you stopped."},
+        ]);
+        let body = test_client(true).request_body_messages(messages);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][1]["role"], "assistant");
+        assert_eq!(body["messages"][1]["content"], "part one ");
+        assert_eq!(
+            body["messages"][2]["content"],
+            "Continue exactly where you stopped."
+        );
+        assert_eq!(body["max_completion_tokens"], 16);
     }
 
     #[test]

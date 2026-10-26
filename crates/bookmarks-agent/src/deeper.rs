@@ -6,10 +6,11 @@
 //! fetch and quoted/linked posts are looked up one by one through an injected
 //! fetcher. Any fetch error fails closed (no file, no log entry). Offline
 //! mode builds the same context from a fixture JSONL with no network. At
-//! most one Muse Spark call (paid switch on and online only); otherwise a
+//! most two Muse Spark calls (first try plus one continuation on
+//! `finish_reason` "length", paid switch on and online only); otherwise a
 //! deterministic local fallback walkthrough. Only metadata enters the
 //! decision log — never post text or walkthrough output.
-use crate::delegate::{MuseCaller, ThreadFetcher};
+use crate::delegate::ThreadFetcher;
 use crate::fixture::Bookmark;
 use crate::unroll::{ReferencedTweet, ThreadPost};
 use ancientos_core::log::DecisionLog;
@@ -19,12 +20,24 @@ use std::path::{Path, PathBuf};
 
 pub const DEEPER_DONE_KIND: &str = "deeper.write";
 pub const DEEPER_DIR_NAME: &str = "deeper";
-pub const DEEPER_MAX_COMPLETION_TOKENS: u32 = 1000;
+pub const DEEPER_MAX_COMPLETION_TOKENS: u32 = 3000;
 pub const DEEPER_REASONING_EFFORT: &str = "low";
+/// User instruction for the single continuation request on truncation.
+pub const DEEPER_CONTINUE_PROMPT: &str = "Continue exactly where you stopped.";
+/// Marker appended when output is still truncated after the continuation.
+pub const DEEPER_TRUNCATED_MARKER: &str = "[truncated]";
 
 /// One-post lookup: a post id -> the fetched post. Read-only; any error
 /// fails the whole run closed.
 pub type PostFetcher<'a> = dyn Fn(&str) -> Result<ThreadPost, String> + 'a;
+
+/// Deeper Muse caller: `(prompt, prior_content)` -> `(content, model, usage,
+/// finish_reason)`. `prior_content` is `None` for the first call and
+/// `Some(prior)` for the single continuation on `finish_reason` "length".
+/// Production sends the continuation as user prompt + assistant prior +
+/// user [`DEEPER_CONTINUE_PROMPT`]; tests inject canned responses.
+pub type DeeperMuseCaller<'a> = dyn Fn(&str, Option<&str>) -> Result<(String, String, Option<MuseUsage>, Option<String>), String>
+    + 'a;
 
 #[derive(Debug, Clone)]
 pub struct DeeperResult {
@@ -161,14 +174,116 @@ pub fn build_paid_prompt(
     )
 }
 
+/// Remove `https?://t.co/\S+` matches (case-sensitive, `/` plus at least
+/// one non-whitespace char required, like the regex). Pure.
+fn strip_tco_links(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        let prefix_len = if rest.starts_with("https://t.co/") {
+            Some("https://t.co/".len())
+        } else if rest.starts_with("http://t.co/") {
+            Some("http://t.co/".len())
+        } else {
+            None
+        };
+        if let Some(n) = prefix_len {
+            let after = i + n;
+            let next_is_content = s[after..]
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_whitespace());
+            if next_is_content {
+                let mut j = after;
+                while j < s.len() {
+                    let c = s[j..].chars().next().expect("char boundary");
+                    if c.is_whitespace() {
+                        break;
+                    }
+                    j += c.len_utf8();
+                }
+                i = j;
+                continue;
+            }
+        }
+        let c = s[i..].chars().next().expect("char boundary");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// Convert `[text](url)` and `![alt](url)` to their inner text, dropping the
+/// URL. Unmatched brackets pass through. Pure.
+fn strip_markdown_links(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let bang = chars[i] == '!' && i + 1 < chars.len() && chars[i + 1] == '[';
+        let bracket = chars[i] == '[';
+        if bang || bracket {
+            let open = if bang { i + 1 } else { i };
+            let close = chars[open + 1..]
+                .iter()
+                .position(|&c| c == ']')
+                .map(|p| open + 1 + p);
+            if let Some(close) = close {
+                if close + 1 < chars.len() && chars[close + 1] == '(' {
+                    let paren = chars[close + 2..]
+                        .iter()
+                        .position(|&c| c == ')')
+                        .map(|p| close + 2 + p);
+                    if let Some(end) = paren {
+                        out.extend(chars[open + 1..close].iter());
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Strip leading `>` blockquote markers (repeated) plus surrounding space.
+/// Only the line start is affected; mid-line `>` is kept. Pure.
+fn strip_quote_markers(s: &str) -> String {
+    let mut t = s.trim_start();
+    while let Some(rest) = t.strip_prefix('>') {
+        t = rest.trim_start();
+    }
+    t.to_string()
+}
+
+/// Clean one step line for the Steps section: reduce markdown
+/// links/images to their text first (so link text survives), then drop
+/// standalone t.co links, strip leading quote markers, and collapse
+/// whitespace. Pure.
+fn clean_step_text(s: &str) -> String {
+    let no_md = strip_markdown_links(s);
+    let no_tco = strip_tco_links(&no_md);
+    let no_quote = strip_quote_markers(&no_tco);
+    no_quote.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Try-it appendix for both paid and local output: extracted practice steps
-/// plus rendered media, only when the classifier fires. Empty otherwise.
-fn try_it_appendix(joined: &str, media: &[crate::media::Media], is_try_it: bool) -> String {
+/// (thread text only; quoted/linked posts never become steps) plus rendered
+/// media, only when the classifier fires. Empty otherwise. Steps are plain
+/// numbered lines with no t.co links, markdown links, or quote markers.
+fn try_it_appendix(thread_joined: &str, media: &[crate::media::Media], is_try_it: bool) -> String {
     if !is_try_it {
         return String::new();
     }
     let mut out = String::from("\n## Steps\n");
-    let steps = crate::try_it::extract_steps(joined);
+    let steps: Vec<String> = crate::try_it::extract_steps(thread_joined)
+        .iter()
+        .map(|s| clean_step_text(s))
+        .filter(|s| !s.is_empty())
+        .collect();
     if steps.is_empty() {
         out.push_str("_No explicit steps found._\n");
     } else {
@@ -389,13 +504,15 @@ fn has_order_marker(lower: &str) -> bool {
 }
 
 /// `(post_id, step)` in thread order: numbered/bulleted lines first, then
-/// imperative or first/then/next sentences. Empty when nothing actionable
+/// imperative or first/then/next sentences. Thread posts only; quoted and
+/// linked posts never become steps. Each step is cleaned plain text (no t.co
+/// links, markdown links, or quote markers). Empty when nothing actionable
 /// is found. Deterministic, capped. Pure.
 fn fallback_steps(thread: &[ThreadPost]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |id: &str, raw: &str| {
-        let item = truncate_item(raw);
+        let item = clean_step_text(&truncate_item(raw));
         if item.chars().count() >= 2 && seen.insert(item.clone()) && out.len() < MAX_FALLBACK_ITEMS
         {
             out.push((id.to_string(), item));
@@ -403,15 +520,18 @@ fn fallback_steps(thread: &[ThreadPost]) -> Vec<(String, String)> {
     };
     for p in thread {
         // Raw lines: sanitizing collapses newlines, so markers are found
-        // first and each extracted item is sanitized on its own.
+        // first and each extracted item is sanitized on its own. Markdown
+        // links reduce to their text before sanitizing so the text survives.
         for line in p.text.lines() {
             if let Some(body) = strip_step_marker(line).or_else(|| strip_bullet(line)) {
-                push(&p.id, &crate::sanitize::sanitize_uncapped(body));
+                let no_md = strip_markdown_links(body);
+                push(&p.id, &crate::sanitize::sanitize_uncapped(&no_md));
             }
         }
     }
     for p in thread {
-        let clean = crate::sanitize::sanitize_uncapped(&p.text);
+        let no_md = strip_markdown_links(&p.text);
+        let clean = crate::sanitize::sanitize_uncapped(&no_md);
         for s in fallback_sentences(&clean) {
             let lower = s.to_lowercase();
             if crate::try_it::is_imperative_sentence(&s) || has_order_marker(&lower) {
@@ -423,6 +543,8 @@ fn fallback_steps(thread: &[ThreadPost]) -> Vec<(String, String)> {
 }
 
 /// Deterministic local fallback walkthrough with fixed sections.
+/// `thread_joined` is thread text only for the Steps section; quoted and
+/// linked text appears only under Quoted sections, never as steps.
 #[allow(clippy::too_many_arguments)]
 fn local_walkthrough(
     post_id: &str,
@@ -430,7 +552,7 @@ fn local_walkthrough(
     thread: &[ThreadPost],
     quoted: &[ThreadPost],
     linked: &[ThreadPost],
-    joined: &str,
+    thread_joined: &str,
     media: &[crate::media::Media],
     is_try_it: bool,
 ) -> String {
@@ -467,11 +589,11 @@ fn local_walkthrough(
                 out.push_str(&format!("### Linked {}\n{clean}\n\n", l.id));
             }
         }
-        out.push_str(&try_it_appendix(joined, media, true));
+        out.push_str(&try_it_appendix(thread_joined, media, true));
     } else {
         // Non-Try-it threads: quote real thread content (claims, steps,
         // quoted/linked posts) with the post each item came from. No
-        // generic placeholder lines.
+        // generic placeholder lines. Steps are plain numbered lines.
         out.push_str("## Key claims\n");
         for (id, claim) in fallback_claims(thread) {
             out.push_str(&format!("- ({id}) {claim}\n"));
@@ -480,8 +602,8 @@ fn local_walkthrough(
         let steps = fallback_steps(thread);
         if !steps.is_empty() {
             out.push_str("## Steps\n");
-            for (id, step) in &steps {
-                out.push_str(&format!("- ({id}) {step}\n"));
+            for (i, (_, step)) in steps.iter().enumerate() {
+                out.push_str(&format!("{}. {step}\n", i + 1));
             }
             out.push('\n');
         }
@@ -689,12 +811,37 @@ fn offline_context(fixture_path: &Path, post_id: &str) -> Result<Context, String
     Ok((thread, username, quoted_posts, linked_posts, media))
 }
 
+/// Add two optional token counts; `None` + `None` stays `None`. Pure.
+fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
+/// Sum two usages field-wise for the first try plus its continuation.
+/// Pure.
+fn combine_usage(a: Option<MuseUsage>, b: Option<MuseUsage>) -> Option<MuseUsage> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(u), None) | (None, Some(u)) => Some(u),
+        (Some(x), Some(y)) => Some(MuseUsage {
+            prompt_tokens: add_opt(x.prompt_tokens, y.prompt_tokens),
+            completion_tokens: add_opt(x.completion_tokens, y.completion_tokens),
+            total_tokens: add_opt(x.total_tokens, y.total_tokens),
+        }),
+    }
+}
+
 /// Same as [`run`] with injected thread/post fetchers, Muse caller, and
 /// paths, so tests need no network or home directory. `offline_fixture`
 /// selects fixture mode (always the local fallback); otherwise the thread
-/// and quoted/linked posts are fetched read-only and one Muse call is made
-/// when `allow_paid` is set. Any fetch error or empty model output fails
-/// closed with nothing written.
+/// and quoted/linked posts are fetched read-only and up to two Muse calls
+/// are made when `allow_paid` is set (first try plus one continuation on
+/// `finish_reason` "length"). Any fetch error, model error, or empty model
+/// output fails closed with nothing written.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with(
     post_id: &str,
@@ -702,7 +849,7 @@ pub fn run_with(
     offline_fixture: Option<&Path>,
     fetch_thread: &ThreadFetcher<'_>,
     fetch_post: &PostFetcher<'_>,
-    call: &MuseCaller<'_>,
+    call: &DeeperMuseCaller<'_>,
     log_path: &Path,
     out_dir: &Path,
 ) -> Result<DeeperResult, String> {
@@ -714,18 +861,26 @@ pub fn run_with(
     if thread.is_empty() {
         return Err("thread is empty".to_string());
     }
-    let mut joined = String::new();
-    for p in thread.iter().chain(quoted.iter()).chain(linked.iter()) {
-        if !joined.is_empty() {
-            joined.push_str("\n\n");
+    let mut thread_joined = String::new();
+    for p in thread.iter() {
+        if !thread_joined.is_empty() {
+            thread_joined.push_str("\n\n");
         }
-        joined.push_str(&p.text);
+        thread_joined.push_str(&p.text);
     }
-    // Probe the hands-on classifier with the full context text.
+    let mut full_joined = String::new();
+    for p in thread.iter().chain(quoted.iter()).chain(linked.iter()) {
+        if !full_joined.is_empty() {
+            full_joined.push_str("\n\n");
+        }
+        full_joined.push_str(&p.text);
+    }
+    // Probe the hands-on classifier with the full context text. Steps use
+    // thread text only so quoted/linked posts never become steps.
     let probe = Bookmark {
         post_id: post_id.to_string(),
         url: crate::delegate::post_url(post_id, username.as_deref()),
-        text: joined.clone(),
+        text: full_joined,
         author_username: username.clone(),
         created_at: None,
         folders: None,
@@ -736,12 +891,37 @@ pub fn run_with(
     let is_try_it = crate::try_it::classify(&probe).is_some();
     let (output, model, usage, mode) = if allow_paid && offline_fixture.is_none() {
         let prompt = build_paid_prompt(&thread, &quoted, &linked);
-        let (content, model, usage) = call(&prompt)?;
+        let (first, model_first, usage_first, reason_first) = call(&prompt, None)?;
+        if first.trim().is_empty() && reason_first.as_deref() != Some("length") {
+            return Err("model returned an empty walkthrough".to_string());
+        }
+        let (content, model, usage) = if reason_first.as_deref() == Some("length") {
+            let (second, model_second, usage_second, reason_second) = call(&prompt, Some(&first))?;
+            let mut combined = format!("{first}{second}");
+            if combined.trim().is_empty() {
+                return Err("model returned an empty walkthrough".to_string());
+            }
+            if reason_second.as_deref() == Some("length") {
+                combined = format!("{}\n\n{DEEPER_TRUNCATED_MARKER}", combined.trim_end());
+            }
+            let merged_model = if model_first.is_empty() {
+                model_second
+            } else {
+                model_first
+            };
+            (
+                combined,
+                merged_model,
+                combine_usage(usage_first, usage_second),
+            )
+        } else {
+            (first, model_first, usage_first)
+        };
         if content.trim().is_empty() {
             return Err("model returned an empty walkthrough".to_string());
         }
         let mut out = format!("{}\n", content.trim_end());
-        out.push_str(&try_it_appendix(&joined, &media, is_try_it));
+        out.push_str(&try_it_appendix(&thread_joined, &media, is_try_it));
         (out, model, usage, "paid".to_string())
     } else {
         let out = local_walkthrough(
@@ -750,7 +930,7 @@ pub fn run_with(
             &thread,
             &quoted,
             &linked,
-            &joined,
+            &thread_joined,
             &media,
             is_try_it,
         );
@@ -800,9 +980,10 @@ pub fn run_with(
     })
 }
 
-/// Production run: real thread/post fetches plus one real Muse Spark call
-/// (paid switch on, online only), paths from the data directory.
-/// `offline` selects fixture mode with the local fallback.
+/// Production run: real thread/post fetches plus up to two real Muse Spark
+/// calls (first try plus one continuation on truncation, paid switch on,
+/// online only), paths from the data directory. `offline` selects fixture
+/// mode with the local fallback.
 pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String> {
     let allow_paid = std::env::var("ANCIENTOS_ALLOW_PAID")
         .map(|v| v == "1")
@@ -810,15 +991,25 @@ pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String>
     let client = ancientos_router::muse::MuseClient::from_env()
         .with_max_completion_tokens(DEEPER_MAX_COMPLETION_TOKENS)
         .with_reasoning_effort(DEEPER_REASONING_EFFORT);
-    let call = |prompt: &str| {
-        client.chat(prompt).map_err(|e| e.to_string()).map(|r| {
-            let model = if r.model.is_empty() {
-                client.model().to_string()
-            } else {
-                r.model
-            };
-            (r.content, model, r.usage)
-        })
+    let call = |prompt: &str, prior: Option<&str>| {
+        let resp = match prior {
+            None => client.chat(prompt),
+            Some(prior_content) => {
+                let messages = serde_json::json!([
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": prior_content},
+                    {"role": "user", "content": DEEPER_CONTINUE_PROMPT},
+                ]);
+                client.chat_messages(messages)
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        let model = if resp.model.is_empty() {
+            client.model().to_string()
+        } else {
+            resp.model
+        };
+        Ok((resp.content, model, resp.usage, resp.finish_reason))
     };
     run_with(
         post_id,
@@ -911,7 +1102,10 @@ mod tests {
         panic!("network post fetch used in offline mode")
     }
 
-    fn no_call(_: &str) -> Result<(String, String, Option<MuseUsage>), String> {
+    fn no_call(
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<(String, String, Option<MuseUsage>, Option<String>), String> {
         panic!("model call used in local mode")
     }
 
@@ -1314,21 +1508,26 @@ mod tests {
             Ok(post("301", "[synthetic] quoted routine"))
         };
         let seen = std::cell::RefCell::new(Vec::new());
-        let call_ok = |prompt: &str| -> Result<(String, String, Option<MuseUsage>), String> {
-            seen.borrow_mut().push(prompt.to_string());
-            assert!(prompt.contains("step-by-step"), "{prompt}");
-            assert!(prompt.contains("[synthetic] Try it now"), "{prompt}");
-            assert!(!prompt.contains("@syn"), "{prompt}");
-            Ok((
-                "## Walkthrough\n1. [synthetic] paid step one".into(),
-                "fake-spark".into(),
-                Some(MuseUsage {
-                    prompt_tokens: Some(40),
-                    completion_tokens: Some(20),
-                    total_tokens: Some(60),
-                }),
-            ))
-        };
+        let call_ok =
+            |prompt: &str,
+             prior: Option<&str>|
+             -> Result<(String, String, Option<MuseUsage>, Option<String>), String> {
+                assert!(prior.is_none(), "no continuation expected");
+                seen.borrow_mut().push(prompt.to_string());
+                assert!(prompt.contains("step-by-step"), "{prompt}");
+                assert!(prompt.contains("[synthetic] Try it now"), "{prompt}");
+                assert!(!prompt.contains("@syn"), "{prompt}");
+                Ok((
+                    "## Walkthrough\n1. [synthetic] paid step one".into(),
+                    "fake-spark".into(),
+                    Some(MuseUsage {
+                        prompt_tokens: Some(40),
+                        completion_tokens: Some(20),
+                        total_tokens: Some(60),
+                    }),
+                    Some("stop".to_string()),
+                ))
+            };
         let res = run_with(
             "300", true, None, &fetch_ok, &post_ok, &call_ok, &log, &out_dir,
         )
@@ -1360,7 +1559,8 @@ mod tests {
         let log = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
         let fetch_ok = |_: &str| Ok(fetch(vec![post("400", "[synthetic] root")]));
-        let call_empty = |_: &str| Ok(("   \n ".to_string(), "m".to_string(), None));
+        let call_empty =
+            |_: &str, _: Option<&str>| Ok(("   \n ".to_string(), "m".to_string(), None, None));
         let err = run_with(
             "400",
             true,
@@ -1438,5 +1638,350 @@ mod tests {
         assert_eq!(file_mode, 0o600, "file mode is {file_mode:o}");
         let dir_mode = std::fs::metadata(&out_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "dir mode is {dir_mode:o}");
+    }
+
+    #[test]
+    fn cap_constant_is_3000_with_continue_prompt() {
+        assert_eq!(DEEPER_MAX_COMPLETION_TOKENS, 3000);
+        assert_eq!(
+            DEEPER_CONTINUE_PROMPT,
+            "Continue exactly where you stopped."
+        );
+        assert_eq!(DEEPER_TRUNCATED_MARKER, "[truncated]");
+    }
+
+    #[test]
+    fn continuation_on_length_concatenates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("d.jsonl");
+        let out_dir = dir.path().join("deeper");
+        let fetch_ok = |_: &str| {
+            Ok(fetch(vec![post(
+                "500",
+                "[synthetic] root for continuation",
+            )]))
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        let call = |prompt: &str, prior: Option<&str>| {
+            calls
+                .borrow_mut()
+                .push((prompt.to_string(), prior.map(str::to_string)));
+            match prior {
+                None => Ok((
+                    "part one ".to_string(),
+                    "fake-spark".to_string(),
+                    Some(MuseUsage {
+                        prompt_tokens: Some(10),
+                        completion_tokens: Some(5),
+                        total_tokens: Some(15),
+                    }),
+                    Some("length".to_string()),
+                )),
+                Some(p) => {
+                    assert_eq!(p, "part one ", "continuation gets prior content");
+                    assert!(prompt.contains("step-by-step"), "{prompt}");
+                    Ok((
+                        "part two".to_string(),
+                        "fake-spark".to_string(),
+                        Some(MuseUsage {
+                            prompt_tokens: Some(12),
+                            completion_tokens: Some(7),
+                            total_tokens: Some(19),
+                        }),
+                        Some("stop".to_string()),
+                    ))
+                }
+            }
+        };
+        let res = run_with(
+            "500",
+            true,
+            None,
+            &fetch_ok,
+            &no_post_fetch,
+            &call,
+            &log,
+            &out_dir,
+        )
+        .unwrap();
+        assert_eq!(calls.borrow().len(), 2, "exactly one continuation");
+        assert!(calls.borrow()[0].1.is_none());
+        assert!(calls.borrow()[1].1.is_some());
+        assert!(
+            res.output.contains("part one part two"),
+            "concatenated:\n{}",
+            res.output
+        );
+        assert!(
+            !res.output.contains(DEEPER_TRUNCATED_MARKER),
+            "no marker when continuation finishes:\n{}",
+            res.output
+        );
+        let usage = res.usage.expect("usage logged");
+        assert_eq!(usage.prompt_tokens, Some(22));
+        assert_eq!(usage.completion_tokens, Some(12));
+        assert_eq!(usage.total_tokens, Some(34));
+        let entries = DecisionLog::open(&log).unwrap().verify().unwrap();
+        assert_eq!(entries[0].payload["total_tokens"], 34);
+    }
+
+    #[test]
+    fn still_truncated_after_continuation_appends_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("d.jsonl");
+        let out_dir = dir.path().join("deeper");
+        let fetch_ok = |_: &str| Ok(fetch(vec![post("501", "[synthetic] root still long")]));
+        let calls = std::cell::Cell::new(0);
+        let call = |_: &str, prior: Option<&str>| {
+            calls.set(calls.get() + 1);
+            match prior {
+                None => Ok((
+                    "aaa ".to_string(),
+                    "m".to_string(),
+                    None,
+                    Some("length".to_string()),
+                )),
+                Some(_) => Ok((
+                    "bbb".to_string(),
+                    "m".to_string(),
+                    None,
+                    Some("length".to_string()),
+                )),
+            }
+        };
+        let res = run_with(
+            "501",
+            true,
+            None,
+            &fetch_ok,
+            &no_post_fetch,
+            &call,
+            &log,
+            &out_dir,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2, "only one continuation, never more");
+        assert!(res.output.contains("aaa bbb"), "kept text:\n{}", res.output);
+        assert!(
+            res.output.contains(DEEPER_TRUNCATED_MARKER),
+            "marker appended:\n{}",
+            res.output
+        );
+    }
+
+    #[test]
+    fn continuation_error_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("d.jsonl");
+        let out_dir = dir.path().join("deeper");
+        let fetch_ok = |_: &str| Ok(fetch(vec![post("502", "[synthetic] root boom")]));
+        let call = |_: &str, prior: Option<&str>| {
+            if prior.is_none() {
+                Ok((
+                    "part one ".to_string(),
+                    "m".to_string(),
+                    None,
+                    Some("length".to_string()),
+                ))
+            } else {
+                Err("synthetic continuation boom".to_string())
+            }
+        };
+        let err = run_with(
+            "502",
+            true,
+            None,
+            &fetch_ok,
+            &no_post_fetch,
+            &call,
+            &log,
+            &out_dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("synthetic continuation boom"), "{err}");
+        assert!(!log.exists(), "log written on continuation error");
+        assert!(
+            !out_dir.join("502.md").exists(),
+            "file written on continuation error"
+        );
+    }
+
+    #[test]
+    fn strips_tco_links_from_steps() {
+        assert_eq!(strip_tco_links("see https://t.co/abc123 now"), "see  now");
+        assert_eq!(clean_step_text("see https://t.co/abc123 now"), "see now");
+        assert_eq!(
+            clean_step_text("a http://t.co/x b https://t.co/y c"),
+            "a b c"
+        );
+        // `/` plus content required, like the regex.
+        assert_eq!(
+            strip_tco_links("see https://t.co/ now"),
+            "see https://t.co/ now"
+        );
+        // Case-sensitive: uppercase passes through.
+        assert!(strip_tco_links("see HTTPS://T.CO/abc now").contains("HTTPS://T.CO/abc"));
+        // Other hosts are not t.co links.
+        assert_eq!(
+            clean_step_text("see https://example.com/x now"),
+            "see https://example.com/x now"
+        );
+    }
+
+    #[test]
+    fn steps_are_plain_without_markdown_or_quotes() {
+        assert_eq!(
+            clean_step_text("[guide](https://example.com) helps"),
+            "guide helps"
+        );
+        assert_eq!(
+            clean_step_text("![alt text](https://example.com/i.jpg)"),
+            "alt text"
+        );
+        assert_eq!(clean_step_text("> quoted line"), "quoted line");
+        assert_eq!(
+            clean_step_text(">> nested > quote kept mid-line"),
+            "nested > quote kept mid-line"
+        );
+        assert_eq!(
+            clean_step_text("  >  [step](https://t.co/x) https://t.co/abc do this "),
+            "step do this"
+        );
+        assert_eq!(clean_step_text("  spaced   out  "), "spaced out");
+    }
+
+    #[test]
+    fn quoted_text_never_becomes_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(
+            &dir,
+            "q.jsonl",
+            &[
+                row(
+                    "600",
+                    "[synthetic] Try it now: 1) thread roll shoulders 10x 2) thread neck tilt 20s",
+                    "syn_author",
+                    "2026-10-20T14:00:00+00:00",
+                    "600",
+                    serde_json::json!({"referenced_tweets": [{"type": "quoted", "id": "601"}]}),
+                ),
+                row(
+                    "601",
+                    "[synthetic] 1) QUOTED_ONLY_MARKER quoted routine 2) quoted second step",
+                    "syn_quoted",
+                    "2026-10-19T10:00:00+00:00",
+                    "601",
+                    serde_json::json!({}),
+                ),
+            ],
+        );
+        let res = run_with(
+            "600",
+            false,
+            Some(&fixture),
+            &no_thread_fetch,
+            &no_post_fetch,
+            &no_call,
+            &dir.path().join("d.jsonl"),
+            &dir.path().join("deeper"),
+        )
+        .unwrap();
+        let steps_pos = res
+            .output
+            .find("## Steps")
+            .expect("try-it output has Steps");
+        let steps_text = &res.output[steps_pos..];
+        assert!(
+            steps_text.contains("thread roll shoulders"),
+            "thread step kept:\n{steps_text}"
+        );
+        assert!(
+            !steps_text.contains("QUOTED_ONLY_MARKER"),
+            "quoted leaked into steps:\n{steps_text}"
+        );
+        assert!(
+            res.output.contains("QUOTED_ONLY_MARKER"),
+            "quoted kept under Quoted section:\n{}",
+            res.output
+        );
+        let quoted_pos = res.output.find("QUOTED_ONLY_MARKER").unwrap();
+        assert!(
+            quoted_pos < steps_pos,
+            "quoted marker must sit in the Quoted section before Steps"
+        );
+        assert!(steps_text.contains("1. "), "numbered:\n{steps_text}");
+        assert!(!steps_text.contains("t.co"), "{steps_text}");
+        assert!(!steps_text.contains("]("), "{steps_text}");
+        for line in steps_text.lines().filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && t.chars().next().is_some_and(|c| c.is_ascii_digit())
+        }) {
+            assert!(
+                !line.trim_start().starts_with('>'),
+                "quote marker in steps: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_it_steps_strip_tco_links_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(
+            &dir,
+            "tco.jsonl",
+            &[row(
+                "700",
+                "[synthetic] Try it now: 1) roll shoulders 10x see https://t.co/abc123 2) neck tilt 20s https://t.co/xyz789 done",
+                "syn_author",
+                "2026-10-20T14:00:00+00:00",
+                "700",
+                serde_json::json!({}),
+            )],
+        );
+        let res = run_with(
+            "700",
+            false,
+            Some(&fixture),
+            &no_thread_fetch,
+            &no_post_fetch,
+            &no_call,
+            &dir.path().join("d.jsonl"),
+            &dir.path().join("deeper"),
+        )
+        .unwrap();
+        let steps_pos = res.output.find("## Steps").expect("Steps present");
+        let steps_text = &res.output[steps_pos..];
+        assert!(steps_text.contains("roll shoulders"), "{steps_text}");
+        assert!(!steps_text.contains("t.co"), "{steps_text}");
+        assert!(!steps_text.contains("abc123"), "{steps_text}");
+    }
+
+    #[test]
+    fn non_try_it_steps_are_plain_numbered_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir, "rich.jsonl", &rich_thread_fixture());
+        let res = run_with(
+            "demo-3001",
+            false,
+            Some(&fixture),
+            &no_thread_fetch,
+            &no_post_fetch,
+            &no_call,
+            &dir.path().join("d.jsonl"),
+            &dir.path().join("deeper"),
+        )
+        .unwrap();
+        let steps_pos = res.output.find("## Steps").expect("Steps present");
+        let after = &res.output[steps_pos..];
+        let end = after.find("## Quoted & linked").unwrap_or(after.len());
+        let steps_text = &after[..end];
+        assert!(steps_text.contains("1. "), "{steps_text}");
+        assert!(!steps_text.contains("- ("), "{steps_text}");
+        assert!(!steps_text.contains("t.co"), "{steps_text}");
+        assert!(!steps_text.contains("]("), "{steps_text}");
+        assert!(
+            !steps_text.lines().any(|l| l.trim_start().starts_with('>')),
+            "{steps_text}"
+        );
     }
 }
