@@ -12,6 +12,7 @@ agent (read-only OAuth2 PKCE, incremental ingest that never infers removals).
 - `crates/core` - scheduler, approval gate, decision log
 - `crates/router` - privacy router and model clients (Muse, local LLM)
 - `crates/bookmarks-agent` - X bookmark ingest, fixture loader, CLI
+- `crates/web-ui` - loopback-only demo web UI (brief voting, ideas, try-it, log viewer)
 - `fixtures/sample_bookmarks.jsonl` - 5 public sample bookmarks
 
 ## Run
@@ -20,3 +21,9 @@ cp .env.example .env   # fill in locally; never commit
 scripts/ci_local.sh    # fmt, clippy, tests
 cargo run -p bookmarks-agent -- load fixtures/sample_bookmarks.jsonl
 ```
+
+## Launch web UI
+```sh
+cargo run -p web-ui -- --demo   # temp data dir seeded with the scripts/demo.sh fixtures
+```
+Then open http://127.0.0.1:8787/ in a browser (loopback only, server-rendered HTML, works without JS). Use `--data DIR` instead of `--demo` to serve your own data dir; `--port` and loopback-only `--host` are optional.

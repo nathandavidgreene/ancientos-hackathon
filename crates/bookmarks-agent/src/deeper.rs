@@ -171,7 +171,10 @@ pub fn build_paid_prompt(
          numbered imperative steps (\"1. Install X\", \"2. Create a page for Y\"), one per post in order, \
          then one per quoted/linked post explaining how it connects. Each step must be a single \
          imperative sentence grounded in the post text, no meta lines (no \"Here is...\", no summaries), \
-         no URLs. Keep each step to two sentences.\n\
+         no URLs. State each step's action in your own words: do not repeat setup titles or headings \
+         as steps. Do not use the word AncientOS inside the steps; after the steps add a short \
+         \"## Mapping\" section (one or two lines) mapping the thread to AncientOS modules. \
+         Keep each step to two sentences.\n\
          \nPublic thread (URLs and @handles stripped):\n\n{body}"
     )
 }
@@ -2461,5 +2464,45 @@ mod tests {
         ] {
             assert!(prompt.contains(want), "{want} missing:\n{prompt}");
         }
+    }
+
+    #[test]
+    fn paid_prompt_keeps_titles_and_ancientos_out_of_steps() {
+        let prompt = build_paid_prompt(
+            &[post("1", "[synthetic] Install WordCraft and open a page")],
+            &[],
+            &[],
+        );
+        for want in [
+            "do not repeat setup titles",
+            "Do not use the word AncientOS inside the steps",
+            "## Mapping",
+        ] {
+            assert!(prompt.contains(want), "{want} missing:\n{prompt}");
+        }
+    }
+
+    #[test]
+    fn local_fallback_steps_stay_post_text_only() {
+        // The local fallback derives steps from post text, so it never
+        // forces "AncientOS" into steps; pin that no section mentions it.
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir, "t.jsonl", &thread_fixture());
+        let res = run_with(
+            "100",
+            false,
+            Some(&fixture),
+            &no_thread_fetch,
+            &no_post_fetch,
+            &no_call,
+            &dir.path().join("d.jsonl"),
+            &dir.path().join("deeper"),
+        )
+        .unwrap();
+        assert!(
+            !res.output.contains("AncientOS"),
+            "fallback leaked mapping word:\n{}",
+            res.output
+        );
     }
 }
