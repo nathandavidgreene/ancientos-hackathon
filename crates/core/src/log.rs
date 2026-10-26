@@ -77,6 +77,15 @@ impl DecisionLog {
         Ok(e)
     }
 
+    /// Like `verify`, but a log file that does not exist yet is empty.
+    pub fn verify_or_empty(&self) -> Result<Vec<Entry>, LogError> {
+        if self.path.exists() {
+            self.verify()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// Read all entries and check the hash chain.
     pub fn verify(&self) -> Result<Vec<Entry>, LogError> {
         let mut prev = GENESIS.to_string();

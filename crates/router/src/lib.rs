@@ -3,6 +3,8 @@
 //! Endpoints and keys come from env vars; paid calls are off by default.
 use serde::Serialize;
 
+pub mod dispatch;
+pub mod modal;
 pub mod muse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
