@@ -1,6 +1,8 @@
 //! `web-ui --data DIR [--port 8787] [--host 127.0.0.1] [--demo]` —
 //! loopback-only demo server. Thin binary: arg parsing plus demo setup;
-//! serving and rendering live in the lib.
+//! serving and rendering live in the lib. `--demo` uses a temp dir that is
+//! removed on normal exit (Drop guard) plus a stale-dir sweep at startup
+//! (covers Ctrl-C/SIGTERM kills, where Drop never runs).
 use std::net::TcpListener;
 use web_ui::{loopback_addr, State, DEFAULT_PORT};
 
@@ -114,12 +116,62 @@ fn setup_demo() -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+/// Removes the `--demo` temp dir on drop (normal exit paths). Signal
+/// kills (Ctrl-C/SIGTERM) never run Drop — std has no signal API without
+/// new deps — so [`cleanup_stale_demo_dirs`] sweeps those at startup.
+struct DemoGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for DemoGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Remove `web-ui-demo-<pid>` temp dirs whose process is gone (killed
+/// demos whose Drop never ran). Aliveness is checked via `/proc/<pid>`;
+/// without `/proc` (non-Linux) nothing is deleted, and unparseable names
+/// are left alone — fail closed, never delete the unknown.
+fn cleanup_stale_demo_dirs() {
+    if !std::path::Path::new("/proc").is_dir() {
+        return;
+    }
+    let entries = match std::fs::read_dir(std::env::temp_dir()) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mine = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("web-ui-demo-") else {
+            continue;
+        };
+        let Ok(pid) = rest.parse::<u32>() else {
+            continue;
+        };
+        if pid == mine {
+            continue;
+        }
+        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let parsed = parse_args(args)?;
-    let dir = if parsed.demo {
+    let dir: std::path::PathBuf = if parsed.demo {
+        cleanup_stale_demo_dirs();
         setup_demo()?
     } else {
         parsed.data.clone().expect("checked in parse_args").into()
+    };
+    let _demo_guard = if parsed.demo {
+        Some(DemoGuard { path: dir.clone() })
+    } else {
+        None
     };
     let state = State::open(&dir)?;
     let addr = loopback_addr(&parsed.host, parsed.port)?;

@@ -91,11 +91,23 @@ pub struct State {
     pub bookmarks: Vec<Bookmark>,
 }
 
+/// `store.jsonl` (demo/tests) if present, else the real synced
+/// `bookmarks.jsonl` (bookmarks-agent's data dir), else `store.jsonl`.
+fn resolve_store(dir: &Path) -> PathBuf {
+    let store = dir.join("store.jsonl");
+    let real = dir.join(bookmarks_agent::ingest::BOOKMARKS_FILE_NAME);
+    if !store.exists() && real.exists() {
+        real
+    } else {
+        store
+    }
+}
+
 impl State {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, String> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| format!("data dir failed: {e}"))?;
-        let mut bookmarks = match std::fs::read_to_string(dir.join("store.jsonl")) {
+        let mut bookmarks = match std::fs::read_to_string(resolve_store(&dir)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(format!("store read failed: {e}")),
             Ok(text) => bookmarks_agent::fixture::parse_jsonl(&text)
@@ -109,7 +121,7 @@ impl State {
     }
 
     pub fn store_path(&self) -> PathBuf {
-        self.data_dir.join("store.jsonl")
+        resolve_store(&self.data_dir)
     }
 
     pub fn log_path(&self) -> PathBuf {
@@ -218,15 +230,30 @@ fn parse_body(body: &[u8]) -> BTreeMap<String, String> {
     parse_pairs(&String::from_utf8_lossy(body))
 }
 
-const CSS: &str = "body{font-family:system-ui,sans-serif;max-width:62em;margin:2em auto;\
-     padding:0 1em;line-height:1.5;color:#111}\
-     nav a{margin-right:1em}\
-     .badge-ok{color:#fff;background:#137333;padding:.2em .6em;border-radius:.3em}\
-     .badge-bad{color:#fff;background:#b3261e;padding:.2em .6em;border-radius:.3em}\
-     .card{border:1px solid #ccc;padding:1em;margin:1em 0}\
-     blockquote{border-left:3px solid #ccc;margin:1em 0;padding:.2em 1em}\
-     img{max-width:100%}table{border-collapse:collapse}td,th{border:1px solid #ccc;\
-     padding:.2em .6em;text-align:left;vertical-align:top}";
+const CSS: &str = ":root{color-scheme:light}\
+     body{font-family:system-ui,-apple-system,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;\
+     max-width:44rem;margin:0 auto;padding:1.5rem 1rem 4rem;line-height:1.6;\
+     color:#1a1a1a;background:#fff}\
+     nav{display:flex;gap:1.25rem;flex-wrap:wrap;margin-bottom:.5rem}\
+     nav a{color:#0b57d0;text-decoration:none;font-weight:600}\
+     nav a:hover{text-decoration:underline}\
+     hr{border:0;border-top:1px solid #e5e5e5;margin:1.25rem 0}\
+     h1{font-size:1.5rem;line-height:1.25;margin:0 0 1rem}\
+     h2{font-size:1.15rem;margin:1.75rem 0 .5rem}\
+     h3{font-size:1rem;margin:1.25rem 0 .4rem}\
+     p{margin:.6em 0}ol,ul{padding-left:1.5rem}li{margin:.35em 0}\
+     a{color:#0b57d0}\
+     .card{border:1px solid #ddd;border-radius:8px;padding:1rem 1.25rem;margin:1rem 0}\
+     .badge-ok{color:#fff;background:#137333;padding:.2em .6em;border-radius:4px}\
+     .badge-bad{color:#fff;background:#b3261e;padding:.2em .6em;border-radius:4px}\
+     blockquote{border-left:3px solid #ddd;margin:1em 0;padding:.2em 1em;color:#333}\
+     img{max-width:100%;height:auto;border-radius:6px}\
+     .media img{max-height:260px;width:auto;border:1px solid #e5e5e5}\
+     button{font:inherit;font-weight:600;color:#fff;background:#111;\
+     border:1px solid #111;border-radius:6px;padding:.45em 1em;cursor:pointer}\
+     button:hover{background:#333}label{margin-right:.75em}input[type=radio]{margin-right:.25em}\
+     table{border-collapse:collapse;width:100%}th{background:#f5f5f5}\
+     td,th{border:1px solid #ddd;padding:.35em .6em;text-align:left;vertical-align:top}";
 
 fn layout(title: &str, body: &str) -> String {
     format!(
@@ -341,7 +368,7 @@ fn media_html(media: &[bookmarks_agent::media::Media]) -> String {
     if items.is_empty() {
         String::new()
     } else {
-        format!("<h2>Media</h2>{items}")
+        format!("<h2>Media</h2><div class=\"media\">{items}</div>")
     }
 }
 
@@ -437,6 +464,11 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
          <label><input type=\"radio\" name=\"verdict\" value=\"never_category\"> never_category</label> \
          <label><input type=\"radio\" name=\"verdict\" value=\"delegate\"> delegate</label> \
          <button type=\"submit\">Vote</button></form>",
+        escape(&bm.post_id),
+    ));
+    body.push_str(&format!(
+        "<h2>Go deeper</h2><form method=\"post\" action=\"/deeper/{}\">\
+         <button type=\"submit\">Go deeper</button></form>",
         escape(&bm.post_id),
     ));
     if idx + 1 < state.bookmarks.len() {
@@ -637,6 +669,145 @@ fn page_log(state: &State) -> Response {
     Response::ok(layout("Decision log", &body))
 }
 
+/// Fail-closed id check for `/deeper/<id>`: non-empty ASCII word chars
+/// only, so the id is safe as a file name (no separators, no dot
+/// segments). The deeper flow further requires digits/`demo-<digits>`.
+fn valid_deeper_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Minimal markdown renderer for walkthrough files (`#`/`##`/`###`
+/// headings, `- ` bullets, `N. ` steps, paragraphs). Every line is
+/// HTML-escaped before wrapping, so output is safe by construction.
+fn markdown_html(md: &str) -> String {
+    fn numbered(line: &str) -> Option<&str> {
+        let (n, rest) = line.split_once('.')?;
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        rest.strip_prefix(' ')
+    }
+    let mut out = String::new();
+    let mut list: Option<&str> = None; // "ol" or "ul"
+    let close_list = |out: &mut String, list: &mut Option<&str>| {
+        if let Some(tag) = list.take() {
+            out.push_str(&format!("</{tag}>"));
+        }
+    };
+    for raw in md.lines() {
+        let line = raw.trim_end();
+        if line.trim().is_empty() {
+            close_list(&mut out, &mut list);
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("### ") {
+            close_list(&mut out, &mut list);
+            out.push_str(&format!("<h3>{}</h3>", escape(body)));
+        } else if let Some(body) = line.strip_prefix("## ") {
+            close_list(&mut out, &mut list);
+            out.push_str(&format!("<h2>{}</h2>", escape(body)));
+        } else if let Some(body) = line.strip_prefix("# ") {
+            close_list(&mut out, &mut list);
+            out.push_str(&format!("<h1>{}</h1>", escape(body)));
+        } else if let Some(body) = numbered(line) {
+            if list != Some("ol") {
+                close_list(&mut out, &mut list);
+                out.push_str("<ol>");
+                list = Some("ol");
+            }
+            out.push_str(&format!("<li>{}</li>", escape(body)));
+        } else if let Some(body) = line.strip_prefix("- ") {
+            if list != Some("ul") {
+                close_list(&mut out, &mut list);
+                out.push_str("<ul>");
+                list = Some("ul");
+            }
+            out.push_str(&format!("<li>{}</li>", escape(body)));
+        } else {
+            close_list(&mut out, &mut list);
+            out.push_str(&format!("<p>{}</p>", escape(line)));
+        }
+    }
+    close_list(&mut out, &mut list);
+    out
+}
+
+fn page_deeper(state: &State, post_id: &str) -> Response {
+    if !valid_deeper_id(post_id) {
+        return Response::status(400, error_page("Bad id", "Invalid post id."));
+    }
+    let path = state
+        .data_dir
+        .join(bookmarks_agent::deeper::DEEPER_DIR_NAME)
+        .join(format!("{post_id}.md"));
+    let md = match std::fs::read_to_string(&path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Response::status(
+                404,
+                error_page("Not found", "No walkthrough yet — use Go deeper first."),
+            )
+        }
+        Err(e) => return Response::status(500, error_page("Walkthrough failed", &e.to_string())),
+    };
+    let mut body = format!(
+        "<p><a href=\"/\">Back to brief</a></p><h1>Go deeper — {}</h1>",
+        escape(post_id)
+    );
+    body.push_str(&markdown_html(&md));
+    Response::ok(layout(&format!("Go deeper — {post_id}"), &body))
+}
+
+/// Run the existing deeper flow offline against this data dir's store
+/// (local fallback, no network; paid switch on still stays offline
+/// because a fixture is given) and redirect to the walkthrough page.
+/// Any failure closes without redirecting.
+fn do_deeper(state: &State, post_id: &str) -> Response {
+    if !valid_deeper_id(post_id) {
+        return Response::status(400, error_page("Bad id", "Invalid post id."));
+    }
+    if !state.bookmarks.iter().any(|b| b.post_id == post_id) {
+        return Response::status(404, error_page("Not found", "No post with that id."));
+    }
+    if let Err(e) = bookmarks_agent::deeper::validate_post_id(post_id) {
+        return Response::status(400, error_page("Bad id", &e));
+    }
+    // Offline mode never calls these (no thread lookups, no model call);
+    // they fail closed if that ever changes.
+    let fetch_thread = |_id: &str| -> Result<bookmarks_agent::x_api::ThreadFetch, String> {
+        Err("offline mode: thread fetch disabled".to_string())
+    };
+    let fetch_post = |_id: &str| -> Result<bookmarks_agent::unroll::ThreadPost, String> {
+        Err("offline mode: post fetch disabled".to_string())
+    };
+    let store = state.store_path();
+    let out_dir = state
+        .data_dir
+        .join(bookmarks_agent::deeper::DEEPER_DIR_NAME);
+    let allow_paid = std::env::var("ANCIENTOS_ALLOW_PAID")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let err_model =
+        |_prompt: &str, _prior: Option<&str>| Err("offline mode: model call disabled".to_string());
+    match bookmarks_agent::deeper::run_with(
+        post_id,
+        allow_paid,
+        Some(&store),
+        &fetch_thread,
+        &fetch_post,
+        &err_model,
+        &state.log_path(),
+        &out_dir,
+    ) {
+        Ok(_) => Response::redirect(format!("/deeper/{post_id}")),
+        Err(e) => Response::status(500, error_page("Go deeper failed", &e)),
+    }
+}
+
 /// Route one request. Pure over `(Request, &State)` apart from the file
 /// appends that votes, triage and follow-ups require by design.
 pub fn handle(req: &Request, state: &State) -> Response {
@@ -651,6 +822,12 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("GET", "/try") => page_try(state),
         ("POST", "/try") => do_try(state, &req.body),
         ("GET", "/log") => page_log(state),
+        ("GET", path) if path.starts_with("/deeper/") => {
+            page_deeper(state, &path["/deeper/".len()..])
+        }
+        ("POST", path) if path.starts_with("/deeper/") => {
+            do_deeper(state, &path["/deeper/".len()..])
+        }
         ("GET", _) | ("POST", _) => not_found(),
         _ => Response::status(
             405,
@@ -786,17 +963,51 @@ fn serve_one(stream: &mut std::net::TcpStream, state: &State) {
     let _ = stream.write_all(resp.body.as_bytes());
 }
 
-/// Accept connections sequentially until `max_connections` is reached
-/// (`None` serves forever). Single-threaded; fine for a local demo UI.
+/// Worker threads in the pool (bounded, std only).
+pub const POOL_WORKERS: usize = 6;
+/// Bounded accept queue: the accept loop blocks when all workers are busy
+/// (backpressure instead of unbounded buffering).
+pub const POOL_QUEUE: usize = 32;
+
+/// Accept connections until `max_connections` is reached (`None` serves
+/// forever). A bounded pool of [`POOL_WORKERS`] threads serves requests
+/// concurrently; state is shared behind `Arc` (read-only clone) and the
+/// `sync_channel` queue plus `Mutex` receiver are the only sync points.
 pub fn serve(listener: std::net::TcpListener, state: &State, max_connections: Option<usize>) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::net::TcpStream>(POOL_QUEUE);
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    let state = std::sync::Arc::new(state.clone());
+    let mut workers = Vec::with_capacity(POOL_WORKERS);
+    for _ in 0..POOL_WORKERS {
+        let rx = std::sync::Arc::clone(&rx);
+        let state = std::sync::Arc::clone(&state);
+        workers.push(std::thread::spawn(move || loop {
+            let next = {
+                let guard = rx.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.recv()
+            };
+            match next {
+                Ok(mut s) => serve_one(&mut s, &state),
+                Err(_) => break, // sender dropped: shutdown
+            }
+        }));
+    }
     for (served, stream) in listener.incoming().enumerate() {
         match stream {
-            Ok(mut s) => serve_one(&mut s, state),
+            Ok(s) => {
+                if tx.send(s).is_err() {
+                    break;
+                }
+            }
             Err(e) => eprintln!("accept failed: {e}"),
         }
         if max_connections.is_some_and(|m| served + 1 >= m) {
             break;
         }
+    }
+    drop(tx);
+    for worker in workers {
+        let _ = worker.join();
     }
 }
 
@@ -1248,6 +1459,183 @@ mod tests {
         assert!(post.contains("Location: /?i=0"), "{post}");
         let missing = http_roundtrip(&addr, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "{missing}");
+        server.join().unwrap();
+    }
+
+    /// Temp data dir with deeper-valid ids (`demo-<digits>`) plus one
+    /// non-digit id the deeper flow must refuse.
+    fn deeper_state() -> (tempfile::TempDir, State) {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            bookmark(
+                "demo-9001",
+                "[synthetic] Morning reset: 1. Stand up slowly 2. Stretch arms wide 3. Breathe deeply",
+                Some("Health & Wellness"),
+                Vec::new(),
+            ),
+            bookmark(
+                "demo-9002",
+                "[synthetic] <script>alert('x')</script> Just a plain note",
+                Some("Rust & Systems"),
+                Vec::new(),
+            ),
+            bookmark(
+                "zz9",
+                "[synthetic] Non-digit id",
+                Some("Rust & Systems"),
+                Vec::new(),
+            ),
+        ];
+        std::fs::write(dir.path().join("store.jsonl"), rows.join("\n") + "\n").unwrap();
+        let state = State::open(dir.path()).unwrap();
+        (dir, state)
+    }
+
+    #[test]
+    fn brief_has_go_deeper_button() {
+        let (_dir, state) = test_state();
+        let resp = handle(&Request::get("/"), &state);
+        assert!(
+            resp.body
+                .contains("<form method=\"post\" action=\"/deeper/p1\">"),
+            "{}",
+            resp.body
+        );
+        assert!(resp.body.contains(">Go deeper</button>"), "{}", resp.body);
+    }
+
+    #[test]
+    fn deeper_post_runs_offline_and_redirects_to_walkthrough() {
+        let (_dir, state) = deeper_state();
+        let resp = handle(&Request::post("/deeper/demo-9001", ""), &state);
+        assert_eq!(resp.status, 303);
+        assert_eq!(resp.location.as_deref(), Some("/deeper/demo-9001"));
+        let md = state.data_dir.join("deeper").join("demo-9001.md");
+        assert!(md.is_file(), "walkthrough file missing");
+        let entries = log_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "deeper.write");
+        assert_eq!(entries[0].payload["mode"], "local");
+        assert_eq!(entries[0].payload["post_id"], "demo-9001");
+        let page = handle(&Request::get("/deeper/demo-9001"), &state);
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("Back to brief"), "{}", page.body);
+        assert!(
+            page.body.contains("Thread summary") || page.body.contains("Steps"),
+            "{}",
+            page.body
+        );
+    }
+
+    #[test]
+    fn deeper_rejects_bad_unknown_and_missing() {
+        let (_dir, state) = deeper_state();
+        // Valid shape but not in the store.
+        assert_eq!(
+            handle(&Request::post("/deeper/demo-9999", ""), &state).status,
+            404
+        );
+        // In the store but not digits/demo-digits: the deeper flow refuses.
+        assert_eq!(
+            handle(&Request::post("/deeper/zz9", ""), &state).status,
+            400
+        );
+        // Traversal and empty ids never reach the filesystem.
+        assert_eq!(handle(&Request::post("/deeper/..", ""), &state).status, 400);
+        assert_eq!(
+            handle(&Request::post("/deeper/a/b", ""), &state).status,
+            400
+        );
+        assert_eq!(handle(&Request::get("/deeper/.."), &state).status, 400);
+        // Known post with no walkthrough yet.
+        assert_eq!(
+            handle(&Request::get("/deeper/demo-9002"), &state).status,
+            404
+        );
+        // Nothing written, nothing logged.
+        assert!(!state.data_dir.join("deeper").exists());
+        assert!(!state.log_path().exists());
+    }
+
+    #[test]
+    fn walkthrough_markdown_renders_readably_and_escaped() {
+        let html = markdown_html(
+            "# Title\n\n## Steps\n1. Do the thing\n2. Rest\n\n- note one\n\n<script>alert(1)</script>\n",
+        );
+        assert!(html.contains("<h1>Title</h1>"), "{html}");
+        assert!(html.contains("<h2>Steps</h2>"), "{html}");
+        assert!(
+            html.contains("<ol><li>Do the thing</li><li>Rest</li></ol>"),
+            "{html}"
+        );
+        assert!(html.contains("<ul><li>note one</li></ul>"), "{html}");
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        assert!(!html.contains("<script>"), "{html}");
+    }
+
+    #[test]
+    fn deeper_page_escapes_walkthrough_html() {
+        let (_dir, state) = deeper_state();
+        let dir = state.data_dir.join("deeper");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("demo-9002.md"),
+            "# T\n<script>alert('x')</script>\n",
+        )
+        .unwrap();
+        let resp = handle(&Request::get("/deeper/demo-9002"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(
+            resp.body
+                .contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"),
+            "{}",
+            resp.body
+        );
+        assert!(!resp.body.contains("<script>"), "{}", resp.body);
+    }
+
+    #[test]
+    fn deeper_end_to_end_never_leaks_raw_html() {
+        let (_dir, state) = deeper_state();
+        assert_eq!(
+            handle(&Request::post("/deeper/demo-9002", ""), &state).status,
+            303
+        );
+        let page = handle(&Request::get("/deeper/demo-9002"), &state);
+        assert_eq!(page.status, 200);
+        assert!(!page.body.contains("<script>"), "{}", page.body);
+    }
+
+    #[test]
+    fn real_data_dir_bookmarks_jsonl_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bookmarks.jsonl"),
+            "{\"post_id\":\"42\",\"url\":\"https://x.com/a/status/42\",\"text\":\"hello real\"}\n",
+        )
+        .unwrap();
+        let state = State::open(dir.path()).unwrap();
+        assert_eq!(state.bookmarks.len(), 1);
+    }
+
+    #[test]
+    fn pool_serves_two_concurrent_requests() {
+        let (_dir, state) = deeper_state();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || serve(listener, &state, Some(2)));
+        let other = std::thread::spawn(move || {
+            http_roundtrip(&addr, "GET /?i=2 HTTP/1.1\r\nHost: x\r\n\r\n")
+        });
+        let first = http_roundtrip(&addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let second = other.join().unwrap();
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+        assert!(first.contains("post 1 of 3"), "{first}");
+        assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
+        assert!(second.contains("post 3 of 3"), "{second}");
         server.join().unwrap();
     }
 }
