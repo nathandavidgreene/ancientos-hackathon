@@ -99,7 +99,7 @@ shot10() {
 
 shot11() {
   echo "==== Shot 11/12: Built with Meta ===="
-  RUNS=$(grep -cE '^\| [0-9]' docs/muse-code-log.md)
+  RUNS=$(grep -E '^\| [0-9]+[a-z]? ' docs/muse-code-log.md | grep -vc 'Not used')
   echo "Muse Code runs: $RUNS (from docs/muse-code-log.md)"
   echo "Muse Spark writes the briefs; tokens per brief: ~1.6k"
   cat docs/muse-code-log.md

@@ -1,6 +1,7 @@
 //! X bookmarks agent: read-only OAuth2 PKCE, incremental ingest, JSONL fixtures.
 pub mod brief;
 pub mod callback;
+pub mod deeper;
 pub mod delegate;
 pub mod fixture;
 pub mod idea_card;

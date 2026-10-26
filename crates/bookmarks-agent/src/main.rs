@@ -1,25 +1,29 @@
 //! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`
 //! | `brief [--fixture PATH] [--out PATH]`
 //! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
-//! | `delegate <post_id>` | `ideas` | `triage <id> <adopt|park|drop>`
+//! | `delegate <post_id>` | `deeper <post_id> [--offline <fixture.jsonl>]`
+//! | `ideas` | `triage <id> <adopt|park|drop>`
 //! | `tried <post_id> <yes|no|later> [note]` | `try-pending`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
 //! merges the live store with a fixture and prints a daily brief. `vote`
 //! records a feedback verdict; `delegate` summarizes one thread with Muse
-//! Spark into inspiration.md (paid, off by default). `ideas` lists idea
-//! cards due for triage; `triage` records an adopt/park/drop decision.
+//! Spark into inspiration.md (paid, off by default); `deeper` writes a
+//! step-by-step walkthrough of one thread plus its quoted/linked posts to
+//! deeper/<post_id>.md (one paid call at most, offline fixture supported).
+//! `ideas` lists idea cards due for triage; `triage` records an
+//! adopt/park/drop decision.
 //! `tried` records a try-it follow-up; `try-pending` lists tagged posts
 //! without a yes/no follow-up yet.
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    brief, callback, delegate, fixture, idea_card, ingest, merge, oauth, token_store, try_it, vote,
-    x_api,
+    brief, callback, deeper, delegate, fixture, idea_card, ingest, merge, oauth, token_store,
+    try_it, vote, x_api,
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -242,6 +246,50 @@ fn cmd_vote(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_deeper_args(args: &[String]) -> Result<(String, Option<String>), String> {
+    if args.is_empty() || args[0].is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let post_id = args[0].clone();
+    let mut offline: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(v) = arg.strip_prefix("--offline=") {
+            if v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            offline = Some(v.to_string());
+            i += 1;
+        } else if arg == "--offline" {
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            if v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            offline = Some(v.clone());
+            i += 1;
+        } else {
+            return Err(USAGE.to_string());
+        }
+    }
+    Ok((post_id, offline))
+}
+
+fn cmd_deeper(args: &[String]) -> Result<(), String> {
+    let (post_id, offline) = parse_deeper_args(args)?;
+    let res = deeper::run(&post_id, offline.as_deref())?;
+    print!("{}", res.output);
+    if !res.output.ends_with('\n') {
+        println!();
+    }
+    println!("\nSaved: {}", res.path.display());
+    if res.mode == "paid" {
+        println!("Tokens: {}", res.usage.unwrap_or_default());
+    }
+    Ok(())
+}
+
 fn cmd_delegate(args: &[String]) -> Result<(), String> {
     if args.len() != 1 || args[0].is_empty() {
         return Err(USAGE.to_string());
@@ -371,6 +419,7 @@ fn main() {
         Some("brief") => cmd_brief(&args[1..]),
         Some("vote") => cmd_vote(&args[1..]),
         Some("delegate") => cmd_delegate(&args[1..]),
+        Some("deeper") => cmd_deeper(&args[1..]),
         Some("ideas") => cmd_ideas(&args[1..]),
         Some("triage") => cmd_triage(&args[1..]),
         Some("tried") => cmd_tried(&args[1..]),

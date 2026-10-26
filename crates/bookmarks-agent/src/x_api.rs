@@ -593,6 +593,14 @@ pub fn fetch_thread(id: &str) -> Result<ThreadFetch, String> {
     source_from_store()?.fetch_thread(id)
 }
 
+/// Fetch one post read-only by id (the single-tweet endpoint with full
+/// text, `note_tweet` preferred). Fails closed without the paid switch.
+/// Used by `deeper` for quoted/linked posts.
+pub fn fetch_post(id: &str) -> Result<ThreadPost, String> {
+    let (post, _) = source_from_store()?.fetch_root(id)?;
+    Ok(post)
+}
+
 /// Fetch the unrolled thread for `id`, but only when `id` is a thread root
 /// (`conversation_id` equals the post id) with at least one self-reply.
 /// Returns `Ok(None)` for non-roots, single posts, and search failures, so
