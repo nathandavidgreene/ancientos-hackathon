@@ -1,13 +1,19 @@
 //! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`
-//! | `brief [--fixture PATH] [--out PATH]`.
+//! | `brief [--fixture PATH] [--out PATH]`
+//! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
+//! | `delegate <post_id>`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
-//! merges the live store with a fixture and prints a daily brief. Tokens,
-//! codes, and verifiers are never printed.
-use bookmarks_agent::{brief, callback, fixture, ingest, merge, oauth, token_store, x_api};
+//! merges the live store with a fixture and prints a daily brief. `vote`
+//! records a feedback verdict; `delegate` summarizes one thread with Muse
+//! Spark into inspiration.md (paid, off by default). Tokens, codes, and
+//! verifiers are never printed.
+use bookmarks_agent::{
+    brief, callback, delegate, fixture, ingest, merge, oauth, token_store, vote, x_api,
+};
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH]";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id>";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -165,6 +171,84 @@ fn cmd_brief(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_vote_args(
+    args: &[String],
+) -> Result<(String, String, Vec<String>, Option<String>), String> {
+    if args.len() < 2 {
+        return Err(USAGE.to_string());
+    }
+    let post_id = args[0].clone();
+    let verdict = args[1].clone();
+    if post_id.is_empty() || verdict.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let mut tags: Vec<String> = Vec::new();
+    let mut fixture: Option<String> = None;
+    let mut i = 2;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(v) = arg.strip_prefix("--tag=") {
+            if v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            tags.push(v.to_string());
+            i += 1;
+        } else if arg == "--tag" {
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            if v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            tags.push(v.clone());
+            i += 1;
+        } else if let Some(v) = arg.strip_prefix("--fixture=") {
+            if v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            fixture = Some(v.to_string());
+            i += 1;
+        } else if arg == "--fixture" {
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            fixture = Some(v.clone());
+            i += 1;
+        } else {
+            return Err(USAGE.to_string());
+        }
+    }
+    Ok((post_id, verdict, tags, fixture))
+}
+
+fn cmd_vote(args: &[String]) -> Result<(), String> {
+    let (post_id, verdict_s, tags, fixture) = parse_vote_args(args)?;
+    let verdict: ancientos_core::feedback::Verdict = verdict_s.parse().map_err(|e: String| e)?;
+    let log_path = brief::decision_log_path()?;
+    let res = vote::run_vote(&post_id, verdict, &tags, fixture.as_deref(), &log_path)?;
+    println!(
+        "recorded {} for {} ({})",
+        res.verdict.as_str(),
+        res.post_id,
+        res.category
+    );
+    if res.queued_delegate {
+        println!("delegate queued for {}", res.post_id);
+    }
+    Ok(())
+}
+
+fn cmd_delegate(args: &[String]) -> Result<(), String> {
+    if args.len() != 1 || args[0].is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let res = delegate::run(&args[0])?;
+    print!("{}", res.output);
+    if !res.output.ends_with('\n') {
+        println!();
+    }
+    println!("\nTokens: {}", res.usage.unwrap_or_default());
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -173,6 +257,8 @@ fn main() {
         Some("load") => cmd_load(&args[1..]),
         Some("auth-url") if args.len() == 1 => cmd_auth_url(),
         Some("brief") => cmd_brief(&args[1..]),
+        Some("vote") => cmd_vote(&args[1..]),
+        Some("delegate") => cmd_delegate(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {

@@ -1,0 +1,156 @@
+//! `vote` command: record a feedback verdict for one post.
+//!
+//! The post's category is looked up from the merged store (live bookmarks
+//! plus the optional fixture); posts not found there get category
+//! `"unknown"` rather than failing. A `delegate` verdict also queues the
+//! post for deeper research with a `delegate.queued` log entry.
+use ancientos_core::feedback::{self, FeedbackRecord, ThresholdPolicy, Verdict};
+use ancientos_core::log::DecisionLog;
+use std::path::Path;
+
+pub const DELEGATE_QUEUED_KIND: &str = "delegate.queued";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoteResult {
+    pub post_id: String,
+    pub category: String,
+    pub verdict: Verdict,
+    pub queued_delegate: bool,
+}
+
+/// Category for a post id from the merged store, `"unknown"` when absent.
+pub fn category_for(merged: &crate::merge::MergeOutput, post_id: &str) -> String {
+    merged
+        .rows
+        .iter()
+        .find(|b| b.post_id == post_id)
+        .map(crate::brief::topic_of)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Record one verdict in the decision log. `cli_fixture` overrides
+/// `ANCIENTOS_FIXTURE` for the category lookup, exactly like `brief`.
+pub fn run_vote(
+    post_id: &str,
+    verdict: Verdict,
+    tags: &[String],
+    cli_fixture: Option<&str>,
+    log_path: &Path,
+) -> Result<VoteResult, String> {
+    if post_id.is_empty() {
+        return Err("post id must be non-empty".to_string());
+    }
+    let merged = crate::merge::load_merged(cli_fixture)?;
+    let category = category_for(&merged, post_id);
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            crate::token_store::ensure_dir_0700(parent)
+                .map_err(|e| format!("log dir failed: {e}"))?;
+        }
+    }
+    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    feedback::record(
+        &mut log,
+        FeedbackRecord {
+            pick_id: post_id.to_string(),
+            category: category.clone(),
+            verdict,
+            tags: tags.to_vec(),
+        },
+        ThresholdPolicy::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    let queued_delegate = verdict == Verdict::Delegate;
+    if queued_delegate {
+        log.append(
+            DELEGATE_QUEUED_KIND,
+            serde_json::json!({"post_id": post_id, "category": category}),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(VoteResult {
+        post_id: post_id.to_string(),
+        category,
+        verdict,
+        queued_delegate,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_with_labeled_post(dir: &Path) -> String {
+        let path = dir.join("fix.jsonl");
+        std::fs::write(
+            &path,
+            "{\"post_id\":\"p1\",\"url\":\"https://x.com/i/status/p1\",\
+             \"text\":\"synthetic labeled post\",\
+             \"label\":{\"parent_label\":\"Rust\",\"confidence\":0.9}}\n",
+        )
+        .unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn records_verdict_with_category_and_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture_with_labeled_post(dir.path());
+        let log_path = dir.path().join("sub").join("d.jsonl");
+        let res = run_vote(
+            "p1",
+            Verdict::Approve,
+            &["syn-tag".to_string()],
+            Some(&fix),
+            &log_path,
+        )
+        .unwrap();
+        assert_eq!(res.category, "Rust");
+        assert!(!res.queued_delegate);
+        let log = DecisionLog::open(&log_path).unwrap();
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "feedback");
+        assert_eq!(entries[0].payload["pick_id"], "p1");
+        assert_eq!(entries[0].payload["category"], "Rust");
+        assert_eq!(entries[0].payload["verdict"], "approve");
+        assert_eq!(entries[0].payload["tags"], serde_json::json!(["syn-tag"]));
+    }
+
+    #[test]
+    fn unknown_post_gets_unknown_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture_with_labeled_post(dir.path());
+        let log_path = dir.path().join("d.jsonl");
+        let res = run_vote("missing", Verdict::Skip, &[], Some(&fix), &log_path).unwrap();
+        assert_eq!(res.category, "unknown");
+        let log = DecisionLog::open(&log_path).unwrap();
+        let entries = log.verify().unwrap();
+        assert_eq!(entries[0].payload["category"], "unknown");
+    }
+
+    #[test]
+    fn delegate_verdict_queues_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture_with_labeled_post(dir.path());
+        let log_path = dir.path().join("d.jsonl");
+        let res = run_vote("p1", Verdict::Delegate, &[], Some(&fix), &log_path).unwrap();
+        assert!(res.queued_delegate);
+        let log = DecisionLog::open(&log_path).unwrap();
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, "feedback");
+        assert_eq!(entries[0].payload["verdict"], "delegate");
+        assert_eq!(entries[1].kind, DELEGATE_QUEUED_KIND);
+        assert_eq!(entries[1].payload["post_id"], "p1");
+        assert_eq!(entries[1].payload["category"], "Rust");
+    }
+
+    #[test]
+    fn empty_post_id_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            run_vote("", Verdict::Approve, &[], None, &dir.path().join("d.jsonl")).unwrap_err();
+        assert!(err.contains("non-empty"), "{err}");
+    }
+}

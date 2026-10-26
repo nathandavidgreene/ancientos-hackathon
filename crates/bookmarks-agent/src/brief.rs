@@ -7,6 +7,7 @@
 //! candidate list, model call, and picks are appended to the decision log.
 use crate::fixture::Bookmark;
 use crate::merge::{MergeCounts, MergeOutput};
+use ancientos_core::feedback;
 use ancientos_core::gate::{Gate, Proposal, Risk, Verdict};
 use ancientos_core::log::DecisionLog;
 use ancientos_router::muse::{MuseClient, MuseUsage};
@@ -75,6 +76,12 @@ pub trait BriefModel {
 /// Full-text hydrator: post ids -> post_id to full text. Called at most once
 /// per brief; failures keep stored text.
 pub type Hydrator<'a> = dyn Fn(&[String]) -> Result<HashMap<String, String>, String> + 'a;
+
+/// Thread expander: a post id -> the unrolled thread when the post is a
+/// thread root with self-replies, `None` otherwise. Called at most once per
+/// brief (first pick only); failures and `None` keep the root text.
+pub type ThreadExpander<'a> =
+    dyn Fn(&str) -> Result<Option<Vec<crate::unroll::ThreadPost>>, String> + 'a;
 
 impl BriefModel for MuseClient {
     fn model_id(&self) -> String {
@@ -444,20 +451,27 @@ pub fn render_markdown(
 }
 
 /// Run the brief: select candidates, make at most one model call, gate every
-/// pick, hydrate truncated full text (display only), append to the decision
-/// log, and render markdown.
+/// pick, hydrate truncated full text (display only), expand one thread root
+/// (display only), append to the decision log, and render markdown.
 pub fn run(
     merged: &MergeOutput,
     model: &dyn BriefModel,
     log_path: &Path,
     date: &str,
 ) -> Result<BriefResult, String> {
-    run_with_hydrator(merged, model, log_path, date, Some(&crate::x_api::hydrate))
+    run_full(
+        merged,
+        model,
+        log_path,
+        date,
+        Some(&crate::x_api::hydrate),
+        Some(&crate::x_api::fetch_thread_if_root),
+    )
 }
 
 /// Same as [`run`] but with an injectable hydrator for tests. The hydrator is
 /// called at most once per brief with the truncated pick ids; on failure the
-/// stored text is kept. `None` skips hydration entirely.
+/// stored text is kept. `None` skips hydration entirely. No thread expansion.
 pub fn run_with_hydrator(
     merged: &MergeOutput,
     model: &dyn BriefModel,
@@ -465,10 +479,38 @@ pub fn run_with_hydrator(
     date: &str,
     hydrator: Option<&Hydrator<'_>>,
 ) -> Result<BriefResult, String> {
+    run_full(merged, model, log_path, date, hydrator, None)
+}
+
+/// Same as [`run`] with injectable hydrator and thread expander for tests.
+/// The expander is called at most once per brief with the first pick's id;
+/// on failure or `None` the root text is kept. `None` skips expansion.
+pub fn run_full(
+    merged: &MergeOutput,
+    model: &dyn BriefModel,
+    log_path: &Path,
+    date: &str,
+    hydrator: Option<&Hydrator<'_>>,
+    thread_expander: Option<&ThreadExpander<'_>>,
+) -> Result<BriefResult, String> {
     if merged.rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
-    let candidates = select_candidates(&merged.rows, &merged.live_ids);
+    // Posts hidden by a never_post verdict never become candidates.
+    let hidden = {
+        let log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+        feedback::hidden_posts(&feedback::records_from_log(&log).map_err(|e| e.to_string())?)
+    };
+    let rows: Vec<Bookmark> = merged
+        .rows
+        .iter()
+        .filter(|b| !hidden.contains(&b.post_id))
+        .cloned()
+        .collect();
+    if rows.is_empty() {
+        return Err("no bookmarks to brief".to_string());
+    }
+    let candidates = select_candidates(&rows, &merged.live_ids);
     if candidates.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
@@ -489,11 +531,7 @@ pub fn run_with_hydrator(
         (local_picks(&candidates), "local".to_string(), None, true)
     };
 
-    let stored: HashMap<&str, &Bookmark> = merged
-        .rows
-        .iter()
-        .map(|b| (b.post_id.as_str(), b))
-        .collect();
+    let stored: HashMap<&str, &Bookmark> = rows.iter().map(|b| (b.post_id.as_str(), b)).collect();
     let mut gate = Gate::new();
     gate.register(BRIEF_ACTION, Risk::Low);
     let mut evaluated: Vec<(BriefPick, Verdict, String)> = Vec::new();
@@ -550,6 +588,45 @@ pub fn run_with_hydrator(
                             hydrated += 1;
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Expand the first pick when it is a thread root (display only).
+    // At most one expander call per brief; anything but a multi-post
+    // thread keeps the root text. Quoted posts render one level deeper:
+    // `> ...` here becomes `> > ...` in the blockquote.
+    if let (Some(expand), Some(first_id)) =
+        (thread_expander, picks.first().map(|p| p.post_id.clone()))
+    {
+        if let Ok(Some(posts)) = expand(&first_id) {
+            if posts.len() > 1 {
+                let mut texts: Vec<String> = Vec::new();
+                for p in &posts {
+                    let body = p.text.trim();
+                    if !body.is_empty() {
+                        texts.push(body.to_string());
+                    }
+                    if let Some((_, quoted_text)) = &p.quoted {
+                        if !quoted_text.trim().is_empty() {
+                            let nested = quoted_text
+                                .lines()
+                                .map(|l| {
+                                    if l.trim().is_empty() {
+                                        ">".to_string()
+                                    } else {
+                                        format!("> {l}")
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            texts.push(nested);
+                        }
+                    }
+                }
+                if !texts.is_empty() {
+                    picks[0].full_text = texts.join("\n\n");
                 }
             }
         }
@@ -1137,5 +1214,191 @@ mod tests {
         );
         assert!(prompt.contains("synthetic stored"), "{prompt}");
         assert_eq!(res.picks[0].full_text, "synthetic HYDRATED-ONLY full text");
+    }
+
+    fn seed_hidden(log_path: &Path, post_id: &str) {
+        use ancientos_core::feedback::{
+            record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict,
+        };
+        let mut log = DecisionLog::open(log_path).unwrap();
+        record(
+            &mut log,
+            FeedbackRecord {
+                pick_id: post_id.into(),
+                category: "TopicA".into(),
+                verdict: FbVerdict::NeverPost,
+                tags: Vec::new(),
+            },
+            ThresholdPolicy::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hidden_posts_are_excluded_from_candidates() {
+        let rows: Vec<Bookmark> = (0..4)
+            .map(|i| bm(&format!("id{i}"), None, Some("TopicA"), Some(0.9)))
+            .collect();
+        let merged = merged_of(rows, &["id0", "id1", "id2", "id3"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        seed_hidden(&log_path, "id1");
+        let res = run_with_hydrator(
+            &merged,
+            &FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#),
+            &log_path,
+            "2026-10-26",
+            None,
+        )
+        .unwrap();
+        assert!(!res.candidates.iter().any(|c| c.post_id == "id1"));
+        assert!(!res.picks.iter().any(|p| p.post_id == "id1"));
+        assert!(!res.markdown.contains("status/id1"), "{}", res.markdown);
+        let log = DecisionLog::open(&log_path).unwrap();
+        let entries = log.verify().unwrap();
+        let cands = entries
+            .iter()
+            .find(|e| e.kind == "brief.candidates")
+            .unwrap();
+        assert_eq!(cands.payload["count"], 3);
+    }
+
+    #[test]
+    fn all_hidden_is_no_brief() {
+        let merged = merged_of(vec![bm("only", None, Some("T"), None)], &["only"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        seed_hidden(&log_path, "only");
+        let err = run_with_hydrator(
+            &merged,
+            &FakeModel::failing(),
+            &log_path,
+            "2026-10-26",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("no bookmarks to brief"), "{err}");
+    }
+
+    fn thread_post(id: &str, text: &str) -> crate::unroll::ThreadPost {
+        crate::unroll::ThreadPost {
+            id: id.into(),
+            author_id: "u1".into(),
+            text: text.into(),
+            created_at: None,
+            conversation_id: Some("id0".into()),
+            referenced_tweets: Vec::new(),
+            quoted: None,
+        }
+    }
+
+    #[test]
+    fn thread_root_expands_first_pick_only() {
+        let rows: Vec<Bookmark> = (0..3)
+            .map(|i| bm(&format!("id{i}"), None, Some("T"), Some(0.9)))
+            .collect();
+        let merged = merged_of(rows, &["id0", "id1", "id2"]);
+        let dir = tempfile::tempdir().unwrap();
+        let calls = RefCell::new(Vec::new());
+        let expander = |id: &str| -> Result<Option<Vec<crate::unroll::ThreadPost>>, String> {
+            calls.borrow_mut().push(id.to_string());
+            Ok(Some(vec![
+                thread_post("id0", "synthetic root post"),
+                thread_post("id0-r1", "synthetic reply one"),
+                thread_post("id0-r2", "synthetic reply two"),
+            ]))
+        };
+        let res = run_full(
+            &merged,
+            &FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#),
+            &dir.path().join("d.jsonl"),
+            "2026-10-26",
+            None,
+            Some(&expander),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["id0".to_string()]);
+        assert_eq!(
+            res.picks[0].full_text,
+            "synthetic root post\n\nsynthetic reply one\n\nsynthetic reply two"
+        );
+        assert!(
+            res.markdown.contains("> synthetic reply two"),
+            "{}",
+            res.markdown
+        );
+        // Other picks keep stored text.
+        assert_eq!(res.picks[1].full_text, "synthetic text for id1");
+    }
+
+    #[test]
+    fn thread_expansion_nests_quoted_text_in_blockquote() {
+        let merged = merged_of(vec![bm("id0", None, Some("T"), None)], &["id0"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut reply = thread_post("id0-r1", "synthetic reply one");
+        reply.quoted = Some(("syn_quoted".into(), "synthetic quoted real content".into()));
+        let expander = |_: &str| -> Result<Option<Vec<crate::unroll::ThreadPost>>, String> {
+            Ok(Some(vec![
+                thread_post("id0", "synthetic root post"),
+                reply.clone(),
+            ]))
+        };
+        let res = run_full(
+            &merged,
+            &FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#),
+            &dir.path().join("d.jsonl"),
+            "2026-10-26",
+            None,
+            Some(&expander),
+        )
+        .unwrap();
+        assert_eq!(
+            res.picks[0].full_text,
+            "synthetic root post\n\nsynthetic reply one\n\n> synthetic quoted real content"
+        );
+        assert!(
+            res.markdown.contains("> > synthetic quoted real content"),
+            "{}",
+            res.markdown
+        );
+        assert!(
+            res.markdown.contains("> synthetic reply one"),
+            "{}",
+            res.markdown
+        );
+    }
+
+    #[test]
+    fn thread_expansion_failures_keep_root_only() {
+        let merged = merged_of(vec![bm("id0", None, Some("T"), None)], &["id0"]);
+        let dir = tempfile::tempdir().unwrap();
+        for (name, expander) in [
+            (
+                "none",
+                &(|_: &str| Ok(None))
+                    as &dyn Fn(&str) -> Result<Option<Vec<crate::unroll::ThreadPost>>, String>,
+            ),
+            (
+                "err",
+                &(|_: &str| Err("synthetic search failure".into()))
+                    as &dyn Fn(&str) -> Result<Option<Vec<crate::unroll::ThreadPost>>, String>,
+            ),
+            (
+                "single",
+                &(|_: &str| Ok(Some(vec![thread_post("id0", "synthetic root post")])))
+                    as &dyn Fn(&str) -> Result<Option<Vec<crate::unroll::ThreadPost>>, String>,
+            ),
+        ] {
+            let res = run_full(
+                &merged,
+                &FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#),
+                &dir.path().join(format!("{name}.jsonl")),
+                "2026-10-26",
+                None,
+                Some(expander),
+            )
+            .unwrap();
+            assert_eq!(res.picks[0].full_text, "synthetic text for id0", "{name}");
+        }
     }
 }

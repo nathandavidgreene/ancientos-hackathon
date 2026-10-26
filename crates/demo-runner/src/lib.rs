@@ -191,6 +191,7 @@ impl Workspace {
                 pick_id: pick.pick_id.clone(),
                 category: pick.category.clone(),
                 verdict,
+                tags: Vec::new(),
             },
             policy,
         )

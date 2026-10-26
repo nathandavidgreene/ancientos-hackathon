@@ -136,12 +136,20 @@ fn truncate_chars(text: &str, max: usize) -> String {
     out.trim_end().to_string()
 }
 
-/// Sanitize free text for hosted models.
-pub fn sanitize(text: &str) -> String {
+/// Sanitize free text for hosted models, without truncating.
+/// Same pipeline as [`sanitize`] (strip URLs, emails, @handles, phone-like
+/// numbers, collapse whitespace) but keeps the full length: for thread
+/// summaries where every post matters.
+pub fn sanitize_uncapped(text: &str) -> String {
     let no_urls = strip_url_and_email_tokens(text);
     let no_handles = strip_handles(&no_urls);
     let no_phones = strip_phones(&no_handles);
-    truncate_chars(&collapse_whitespace(&no_phones), MAX_CHARS)
+    collapse_whitespace(&no_phones)
+}
+
+/// Sanitize free text for hosted models.
+pub fn sanitize(text: &str) -> String {
+    truncate_chars(&sanitize_uncapped(text), MAX_CHARS)
 }
 
 #[cfg(test)]
@@ -208,5 +216,24 @@ mod tests {
     fn combined_pii_is_removed() {
         let raw = "Hi @syn_user, see https://t.co/x or mail me@example.org or call 555-123-4567!";
         assert_eq!(sanitize(raw), "Hi , see or mail or call !");
+    }
+
+    #[test]
+    fn uncapped_strips_without_truncating() {
+        let raw = format!("Hi @syn_user, see https://t.co/x {}", "word ".repeat(100));
+        let out = sanitize_uncapped(&raw);
+        assert!(!out.contains("@syn_user"), "{out}");
+        assert!(!out.contains("https://t.co/x"), "{out}");
+        assert!(out.contains("Hi , see"), "{out}");
+        assert!(
+            out.chars().count() > MAX_CHARS,
+            "uncapped keeps full length: {} chars",
+            out.chars().count()
+        );
+        // Capped is exactly the truncated uncapped form.
+        assert_eq!(
+            sanitize(&raw),
+            out.chars().take(MAX_CHARS).collect::<String>().trim_end()
+        );
     }
 }

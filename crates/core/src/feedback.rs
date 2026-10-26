@@ -1,11 +1,15 @@
-//! Feedback on brief picks: approve / skip / never, recorded in the
-//! append-only decision log, plus a deterministic learning threshold that
-//! decides which pick categories may be auto-approved.
+//! Feedback on brief picks, recorded in the append-only decision log, plus
+//! a deterministic learning threshold that decides which pick categories
+//! may be auto-approved.
 //!
 //! Rules (fail closed):
 //! - A category is auto-approved only after `min_votes` verdicts and an
 //!   approval share of at least `approve_pct` percent.
-//! - Any `Never` verdict blocks auto-approval for that category.
+//! - Any `NeverCategory` verdict blocks auto-approval for that category.
+//! - `NeverPost` hides one post forever and is excluded from category
+//!   stats entirely (it neither approves nor counts against the category).
+//! - `Delegate` is neutral: it counts toward the vote total (like `Skip`)
+//!   but is neither an approval nor a block.
 //! - Unknown or empty categories are never auto-approved.
 use crate::log::{DecisionLog, Entry, LogError};
 use serde::{Deserialize, Serialize};
@@ -15,11 +19,27 @@ pub const FEEDBACK_KIND: &str = "feedback";
 pub const THRESHOLD_KIND: &str = "threshold_change";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Approve,
     Skip,
-    Never,
+    NeverPost,
+    #[serde(alias = "never")]
+    NeverCategory,
+    Delegate,
+}
+
+impl Verdict {
+    /// Canonical snake_case spelling, matching serde.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Skip => "skip",
+            Self::NeverPost => "never_post",
+            Self::NeverCategory => "never_category",
+            Self::Delegate => "delegate",
+        }
+    }
 }
 
 impl std::str::FromStr for Verdict {
@@ -28,7 +48,9 @@ impl std::str::FromStr for Verdict {
         match s {
             "approve" => Ok(Self::Approve),
             "skip" => Ok(Self::Skip),
-            "never" => Ok(Self::Never),
+            "never_post" => Ok(Self::NeverPost),
+            "never_category" | "never" => Ok(Self::NeverCategory),
+            "delegate" => Ok(Self::Delegate),
             other => Err(format!("unknown verdict: {other}")),
         }
     }
@@ -39,6 +61,9 @@ pub struct FeedbackRecord {
     pub pick_id: String,
     pub category: String,
     pub verdict: Verdict,
+    /// Free-form tags from `vote --tag` (absent in old log entries).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,12 +85,13 @@ impl Default for ThresholdPolicy {
 pub struct CategoryStats {
     pub approve: u32,
     pub skip: u32,
-    pub never: u32,
+    pub never_category: u32,
+    pub delegate: u32,
 }
 
 impl CategoryStats {
     pub fn total(&self) -> u32 {
-        self.approve + self.skip + self.never
+        self.approve + self.skip + self.never_category + self.delegate
     }
 }
 
@@ -75,17 +101,34 @@ fn valid_category(c: &str) -> bool {
 }
 
 /// Tally verdicts per category (BTreeMap for deterministic order).
+/// `NeverPost` verdicts are excluded: they hide one post but say nothing
+/// about the category. `Delegate` verdicts count as neutral.
 pub fn tally(records: &[FeedbackRecord]) -> BTreeMap<String, CategoryStats> {
     let mut m: BTreeMap<String, CategoryStats> = BTreeMap::new();
     for r in records {
+        if r.verdict == Verdict::NeverPost {
+            continue;
+        }
         let s = m.entry(r.category.clone()).or_default();
         match r.verdict {
             Verdict::Approve => s.approve += 1,
             Verdict::Skip => s.skip += 1,
-            Verdict::Never => s.never += 1,
+            Verdict::NeverCategory => s.never_category += 1,
+            Verdict::Delegate => s.delegate += 1,
+            Verdict::NeverPost => {}
         }
     }
     m
+}
+
+/// Post ids hidden forever by a `NeverPost` verdict. Once hidden, a post
+/// stays hidden: later verdicts do not un-hide it.
+pub fn hidden_posts(records: &[FeedbackRecord]) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter(|r| r.verdict == Verdict::NeverPost)
+        .map(|r| r.pick_id.clone())
+        .collect()
 }
 
 /// Categories that may be auto-approved under `policy`.
@@ -94,7 +137,7 @@ pub fn auto_approved(records: &[FeedbackRecord], policy: ThresholdPolicy) -> BTr
         .into_iter()
         .filter(|(cat, s)| {
             valid_category(cat)
-                && s.never == 0
+                && s.never_category == 0
                 && s.total() >= policy.min_votes
                 && s.total() > 0
                 && u64::from(s.approve) * 100
@@ -171,6 +214,7 @@ mod tests {
             pick_id: format!("{cat}-{v:?}"),
             category: cat.into(),
             verdict: v,
+            tags: Vec::new(),
         }
     }
     const P: ThresholdPolicy = ThresholdPolicy {
@@ -203,10 +247,62 @@ mod tests {
     }
 
     #[test]
-    fn never_blocks_category() {
+    fn never_category_blocks_category() {
         let mut recs = vec![r("A", Verdict::Approve); 10];
-        recs.push(r("A", Verdict::Never));
+        recs.push(r("A", Verdict::NeverCategory));
         assert!(auto_approved(&recs, P).is_empty());
+    }
+
+    #[test]
+    fn never_post_is_excluded_from_stats_and_blocking() {
+        // NeverPost alone: no votes counted, nothing auto-approved.
+        let recs = vec![r("A", Verdict::NeverPost); 5];
+        assert!(auto_approved(&recs, P).is_empty());
+        assert!(!tally(&recs).contains_key("A"));
+        // NeverPost alongside approvals: approvals still carry the category.
+        let mut recs = vec![r("A", Verdict::Approve); 3];
+        recs.push(r("A", Verdict::NeverPost));
+        assert_eq!(auto_approved(&recs, P), BTreeSet::from(["A".to_string()]));
+        let stats = tally(&recs);
+        assert_eq!(stats["A"].total(), 3);
+    }
+
+    #[test]
+    fn delegate_is_neutral_not_approval_or_block() {
+        // Delegates alone never approve.
+        let recs = vec![r("A", Verdict::Delegate); 3];
+        assert!(auto_approved(&recs, P).is_empty());
+        // A delegate counts toward the total but never vetoes: 4 approvals
+        // plus 1 delegate still clears 80%.
+        let mut recs = vec![r("A", Verdict::Approve); 4];
+        recs.push(r("A", Verdict::Delegate));
+        assert_eq!(auto_approved(&recs, P), BTreeSet::from(["A".to_string()]));
+        assert_eq!(tally(&recs)["A"].delegate, 1);
+    }
+
+    #[test]
+    fn hidden_posts_collects_only_never_post_ids() {
+        let recs = vec![
+            r("A", Verdict::Approve),
+            FeedbackRecord {
+                pick_id: "hidden-1".into(),
+                category: "A".into(),
+                verdict: Verdict::NeverPost,
+                tags: Vec::new(),
+            },
+            r("A", Verdict::NeverCategory),
+            r("A", Verdict::Delegate),
+            FeedbackRecord {
+                pick_id: "hidden-2".into(),
+                category: "B".into(),
+                verdict: Verdict::NeverPost,
+                tags: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            hidden_posts(&recs),
+            BTreeSet::from(["hidden-1".to_string(), "hidden-2".to_string()])
+        );
     }
 
     #[test]
@@ -233,9 +329,54 @@ mod tests {
     }
 
     #[test]
-    fn verdict_parses() {
-        assert_eq!("never".parse::<Verdict>().unwrap(), Verdict::Never);
+    fn verdict_parses_snake_case_with_never_alias() {
+        assert_eq!("approve".parse::<Verdict>().unwrap(), Verdict::Approve);
+        assert_eq!("skip".parse::<Verdict>().unwrap(), Verdict::Skip);
+        assert_eq!("never_post".parse::<Verdict>().unwrap(), Verdict::NeverPost);
+        assert_eq!(
+            "never_category".parse::<Verdict>().unwrap(),
+            Verdict::NeverCategory
+        );
+        assert_eq!("delegate".parse::<Verdict>().unwrap(), Verdict::Delegate);
+        // Backward compat with old log entries / CLI input.
+        assert_eq!("never".parse::<Verdict>().unwrap(), Verdict::NeverCategory);
         assert!("maybe".parse::<Verdict>().is_err());
+        assert!("Never".parse::<Verdict>().is_err());
+    }
+
+    #[test]
+    fn verdict_serde_roundtrips_and_reads_old_never() {
+        for (v, s) in [
+            (Verdict::Approve, "approve"),
+            (Verdict::Skip, "skip"),
+            (Verdict::NeverPost, "never_post"),
+            (Verdict::NeverCategory, "never_category"),
+            (Verdict::Delegate, "delegate"),
+        ] {
+            assert_eq!(serde_json::to_value(v).unwrap(), serde_json::json!(s));
+            assert_eq!(v.as_str(), s);
+            assert_eq!(
+                serde_json::from_value::<Verdict>(serde_json::json!(s)).unwrap(),
+                v
+            );
+        }
+        // Old log entries stored plain "never".
+        assert_eq!(
+            serde_json::from_value::<Verdict>(serde_json::json!("never")).unwrap(),
+            Verdict::NeverCategory
+        );
+    }
+
+    #[test]
+    fn old_records_without_tags_still_parse() {
+        let rec: FeedbackRecord = serde_json::from_value(serde_json::json!({
+            "pick_id": "p1",
+            "category": "Rust",
+            "verdict": "never",
+        }))
+        .unwrap();
+        assert_eq!(rec.verdict, Verdict::NeverCategory);
+        assert!(rec.tags.is_empty());
     }
 
     #[test]
@@ -249,7 +390,7 @@ mod tests {
         }
         let (_, s) = record(&mut log, r("Rust", Verdict::Approve), P).unwrap();
         assert_eq!(s.added, vec!["Rust"]);
-        let (_, s) = record(&mut log, r("Rust", Verdict::Never), P).unwrap();
+        let (_, s) = record(&mut log, r("Rust", Verdict::NeverCategory), P).unwrap();
         assert_eq!(s.removed, vec!["Rust"]);
         let entries = log.verify().unwrap();
         let kinds: Vec<_> = entries.iter().map(|e| e.kind.as_str()).collect();

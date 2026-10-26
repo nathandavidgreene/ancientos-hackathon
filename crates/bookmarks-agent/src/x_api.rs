@@ -6,6 +6,7 @@
 use crate::fixture::Bookmark;
 use crate::ingest::{BookmarkSource, Page};
 use crate::token_store::{StoredTokens, TokenStoreError};
+use crate::unroll::ThreadPost;
 use std::collections::HashMap;
 
 pub const ME_URL: &str = "https://api.x.com/2/users/me";
@@ -18,6 +19,17 @@ pub fn bookmarks_url(user_id: &str) -> String {
     )
 }
 
+/// Reject post ids that are empty or could break out of a query string.
+fn validate_post_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("post id must be non-empty".to_string());
+    }
+    if id.contains([',', '&', '=', '?', '#', ' ', '\t', '\n']) {
+        return Err("invalid post id".to_string());
+    }
+    Ok(())
+}
+
 /// Batched tweets endpoint for full-text hydration (max 100 ids).
 pub fn hydrate_url(ids: &[String]) -> Result<String, String> {
     if ids.is_empty() {
@@ -27,17 +39,81 @@ pub fn hydrate_url(ids: &[String]) -> Result<String, String> {
         return Err("too many ids to hydrate (max 100)".to_string());
     }
     for id in ids {
-        if id.is_empty() {
-            return Err("cannot hydrate an empty post id".to_string());
-        }
-        if id.contains([',', '&', '=', '?', '#', ' ', '\t', '\n']) {
-            return Err("invalid post id for hydrate".to_string());
-        }
+        validate_post_id(id)?;
     }
     Ok(format!(
         "https://api.x.com/2/tweets?ids={}&tweet.fields=note_tweet,text",
         ids.join(",")
     ))
+}
+
+/// Tweet fields for thread reconstruction: full text, timestamps,
+/// authorship, reply linkage, conversation id, and quote references.
+pub const THREAD_TWEET_FIELDS: &str =
+    "note_tweet,text,created_at,author_id,referenced_tweets,conversation_id,in_reply_to_user_id";
+/// Expansions for thread reconstruction: quoted posts plus authors.
+pub const THREAD_EXPANSIONS: &str = "referenced_tweets.id,author_id";
+
+/// Single-tweet endpoint for thread reconstruction: conversation id,
+/// full text, authorship, and reply linkage, plus the author's username
+/// and any quoted post.
+pub fn thread_root_url(id: &str) -> Result<String, String> {
+    validate_post_id(id)?;
+    Ok(format!(
+        "https://api.x.com/2/tweets/{id}?\
+         tweet.fields={THREAD_TWEET_FIELDS}\
+         &expansions={THREAD_EXPANSIONS}&user.fields=username"
+    ))
+}
+
+fn search_query(conversation_id: &str, author_username: &str) -> Result<String, String> {
+    validate_post_id(conversation_id).map_err(|_| "invalid conversation id".to_string())?;
+    if author_username.is_empty()
+        || !author_username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err("invalid author username".to_string());
+    }
+    Ok(crate::oauth::url_encode(&format!(
+        "conversation_id:{conversation_id} from:{author_username}"
+    )))
+}
+
+/// Recent-search endpoint for one author's posts in a conversation.
+/// Recent search only covers the last 7 days; see [`thread_search_all_url`]
+/// for the archive fallback. At most two search calls per thread.
+pub fn thread_search_url(conversation_id: &str, author_username: &str) -> Result<String, String> {
+    let query = search_query(conversation_id, author_username)?;
+    Ok(format!(
+        "https://api.x.com/2/tweets/search/recent?query={query}&max_results=100\
+         &tweet.fields={THREAD_TWEET_FIELDS}\
+         &expansions={THREAD_EXPANSIONS}&user.fields=username"
+    ))
+}
+
+/// Full-archive search endpoint with the same query, fields, and expansions
+/// as [`thread_search_url`]. Used ONCE per thread when recent search returns
+/// zero matches (e.g. a root older than 7 days). May fail with 403 on access
+/// tiers without archive search; callers treat that as search unavailable.
+pub fn thread_search_all_url(
+    conversation_id: &str,
+    author_username: &str,
+) -> Result<String, String> {
+    let query = search_query(conversation_id, author_username)?;
+    Ok(format!(
+        "https://api.x.com/2/tweets/search/all?query={query}&max_results=100\
+         &tweet.fields={THREAD_TWEET_FIELDS}\
+         &expansions={THREAD_EXPANSIONS}&user.fields=username"
+    ))
+}
+
+/// True when a recent-search response yielded zero usable candidates, so the
+/// caller should try the full-archive search once. Zero matches for an older
+/// root mean "unknown" (outside the 7-day window), not "no replies".
+/// Pure, for tests.
+pub fn needs_archive_fallback(candidate_count: usize) -> bool {
+    candidate_count == 0
 }
 
 /// Full post text: `note_tweet.text` (untruncated long-post text) wins,
@@ -89,6 +165,110 @@ pub fn parse_hydrate_response(value: &serde_json::Value) -> HashMap<String, Stri
         }
     }
     out
+}
+
+/// Resolve the quoted post `(author_username, text)` for `post` from a
+/// thread response's `includes`. Returns `None` unless the post has a
+/// `referenced_tweets` entry of type `quoted` whose tweet (in
+/// `includes.tweets`) and author (in `includes.users`) both resolve to
+/// non-empty values. Pure, for tests.
+fn quoted_from_includes(post: &ThreadPost, value: &serde_json::Value) -> Option<(String, String)> {
+    let quoted_id = post
+        .referenced_tweets
+        .iter()
+        .find(|r| r.kind == "quoted")
+        .map(|r| r.id.as_str())?;
+    let tweets = value.get("includes")?.get("tweets")?.as_array()?;
+    let quoted = tweets
+        .iter()
+        .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(quoted_id))?;
+    let text = full_text_of(quoted);
+    if text.is_empty() {
+        return None;
+    }
+    let author_id = quoted
+        .get("author_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let users = value.get("includes")?.get("users")?.as_array()?;
+    let username = users
+        .iter()
+        .find(|u| u.get("id").and_then(|v| v.as_str()) == Some(author_id))?
+        .get("username")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some((username.to_string(), text))
+}
+
+/// Parse a single-tweet response into the thread root plus the author's
+/// username (matched by `author_id` against `includes.users`). Attaches the
+/// root's quoted post from `includes`, when present. Pure, for tests.
+pub fn parse_thread_root(
+    value: &serde_json::Value,
+) -> Result<(ThreadPost, Option<String>), String> {
+    let data = value
+        .get("data")
+        .ok_or_else(|| "tweet response has no data".to_string())?;
+    let mut root = crate::unroll::parse_post(data)
+        .ok_or_else(|| "tweet response data is not a usable tweet".to_string())?;
+    root.quoted = quoted_from_includes(&root, value);
+    let mut username = None;
+    if let Some(users) = value
+        .get("includes")
+        .and_then(|i| i.get("users"))
+        .and_then(|u| u.as_array())
+    {
+        for u in users {
+            let id_match = u
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id == root.author_id);
+            if id_match {
+                if let Some(name) = u
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    username = Some(name.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    Ok((root, username))
+}
+
+/// Parse a search response (recent or archive) into candidate thread posts,
+/// skipping entries without an id or author. Attaches each post's quoted
+/// post from `includes`, when present. Pure, for tests.
+pub fn parse_thread_search(value: &serde_json::Value) -> Vec<ThreadPost> {
+    value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|tweets| {
+            tweets
+                .iter()
+                .filter_map(crate::unroll::parse_post)
+                .map(|mut p| {
+                    p.quoted = quoted_from_includes(&p, value);
+                    p
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One fetched thread: the unrolled author chain (`posts[0]` is the root).
+/// `search_ok` is false when the conversation search failed or was
+/// impossible and only the root post is present; `search_note` then holds
+/// the failure (HTTP status, never tokens) for the decision log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadFetch {
+    pub root: ThreadPost,
+    pub username: Option<String>,
+    pub posts: Vec<ThreadPost>,
+    pub search_ok: bool,
+    pub search_note: Option<String>,
 }
 
 fn paid_error() -> String {
@@ -272,6 +452,108 @@ impl XApiSource {
         let raw = get_json(&url, &self.tokens.access_token.clone())?;
         Ok(parse_hydrate_response(&raw))
     }
+
+    /// Fetch one tweet as a thread root plus the author's username.
+    pub fn fetch_root(&mut self, id: &str) -> Result<(ThreadPost, Option<String>), String> {
+        require_paid()?;
+        let url = thread_root_url(id)?;
+        self.ensure_fresh_token()?;
+        let raw = get_json(&url, &self.tokens.access_token.clone())?;
+        parse_thread_root(&raw)
+    }
+
+    /// Run one conversation search at `url`: fetch, parse candidates (with
+    /// quoted posts), and unroll the author's self-reply chain. Returns the
+    /// chain plus the raw candidate count, so callers can tell "zero
+    /// matches" from "matches that did not chain".
+    fn run_search(
+        &mut self,
+        url: &str,
+        root: &ThreadPost,
+    ) -> Result<(Vec<ThreadPost>, usize), String> {
+        self.ensure_fresh_token()?;
+        let raw = get_json(url, &self.tokens.access_token.clone())?;
+        let candidates = parse_thread_search(&raw);
+        let count = candidates.len();
+        Ok((crate::unroll::unroll(root, &candidates), count))
+    }
+
+    /// Search one author's posts in the root's conversation (recent search
+    /// only) and unroll the self-reply chain. Prefer [`fetch_thread`](Self::fetch_thread),
+    /// which retries zero-match searches against the full archive.
+    pub fn search_replies(
+        &mut self,
+        root: &ThreadPost,
+        username: &str,
+    ) -> Result<Vec<ThreadPost>, String> {
+        require_paid()?;
+        let cid = root
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| "root post has no conversation_id".to_string())?;
+        let url = thread_search_url(cid, username)?;
+        Ok(self.run_search(&url, root)?.0)
+    }
+
+    /// Recent search plus ONE full-archive fallback when recent returns zero
+    /// matches. Never more than 2 search calls. Any search failure yields the
+    /// root post only with `search_ok` false and the error (HTTP status,
+    /// never tokens) in `search_note`.
+    fn search_with_fallback(
+        &mut self,
+        root: &ThreadPost,
+        username: &str,
+    ) -> (Vec<ThreadPost>, bool, Option<String>) {
+        let root_only = |note: String| (vec![root.clone()], false, Some(note));
+        let cid = match root.conversation_id.as_deref() {
+            Some(c) => c,
+            None => return root_only("root post has no conversation_id".to_string()),
+        };
+        let recent_url = match thread_search_url(cid, username) {
+            Ok(u) => u,
+            Err(e) => return root_only(e),
+        };
+        let (posts, count) = match self.run_search(&recent_url, root) {
+            Ok(r) => r,
+            Err(e) => return root_only(e),
+        };
+        if !needs_archive_fallback(count) {
+            return (posts, true, None);
+        }
+        // Zero matches: recent search only covers 7 days, so try the full
+        // archive once with the same query.
+        let all_url = match thread_search_all_url(cid, username) {
+            Ok(u) => u,
+            Err(e) => return root_only(e),
+        };
+        match self.run_search(&all_url, root) {
+            Ok((posts, _)) => (posts, true, None),
+            Err(e) => root_only(e),
+        }
+    }
+
+    /// Fetch one thread: the root tweet, then up to TWO conversation
+    /// searches (recent plus one full-archive fallback on zero matches).
+    /// The root fetch failing is an error; the search failing yields the
+    /// root post only with `search_ok` false and `search_note` set.
+    pub fn fetch_thread(&mut self, id: &str) -> Result<ThreadFetch, String> {
+        let (root, username) = self.fetch_root(id)?;
+        let (posts, search_ok, search_note) = match username.clone() {
+            Some(user) => self.search_with_fallback(&root, &user),
+            None => (
+                vec![root.clone()],
+                false,
+                Some("root author username unknown; search skipped".to_string()),
+            ),
+        };
+        Ok(ThreadFetch {
+            root,
+            username,
+            posts,
+            search_ok,
+            search_note,
+        })
+    }
 }
 
 /// Fetch full post text for up to 100 ids with ONE batched GET to
@@ -287,6 +569,45 @@ pub fn hydrate(ids: &[String]) -> Result<HashMap<String, String>, String> {
         .ok_or_else(|| "X_CLIENT_ID not set".to_string())?;
     let mut src = XApiSource::load_from_store(client_id)?;
     src.hydrate(ids)
+}
+
+fn source_from_store() -> Result<XApiSource, String> {
+    require_paid()?;
+    let client_id = std::env::var("X_CLIENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "X_CLIENT_ID not set".to_string())?;
+    XApiSource::load_from_store(client_id)
+}
+
+/// Fetch one thread (root tweet plus up to TWO conversation searches:
+/// recent plus one full-archive fallback on zero matches) using tokens
+/// from the store. Fails closed without the paid switch. Never logs tokens.
+pub fn fetch_thread(id: &str) -> Result<ThreadFetch, String> {
+    source_from_store()?.fetch_thread(id)
+}
+
+/// Fetch the unrolled thread for `id`, but only when `id` is a thread root
+/// (`conversation_id` equals the post id) with at least one self-reply.
+/// Returns `Ok(None)` for non-roots, single posts, and search failures, so
+/// callers show the root post only. At most two search calls per invocation
+/// (recent plus one full-archive fallback on zero matches).
+pub fn fetch_thread_if_root(id: &str) -> Result<Option<Vec<ThreadPost>>, String> {
+    let mut src = source_from_store()?;
+    let (root, username) = src.fetch_root(id)?;
+    let is_root = root.conversation_id.as_deref() == Some(root.id.as_str());
+    if !is_root {
+        return Ok(None);
+    }
+    let Some(user) = username else {
+        return Ok(None);
+    };
+    let (posts, search_ok, _) = src.search_with_fallback(&root, &user);
+    if search_ok && posts.len() > 1 {
+        Ok(Some(posts))
+    } else {
+        Ok(None)
+    }
 }
 
 impl BookmarkSource for XApiSource {
@@ -471,6 +792,286 @@ mod tests {
         assert_eq!(map.len(), 2);
         let empty = parse_hydrate_response(&serde_json::json!({"meta": {}}));
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn thread_urls_have_required_params() {
+        let u = thread_root_url("123").unwrap();
+        assert!(u.starts_with("https://api.x.com/2/tweets/123?"), "{u}");
+        for field in [
+            "conversation_id",
+            "note_tweet",
+            "text",
+            "author_id",
+            "in_reply_to_user_id",
+            "referenced_tweets",
+        ] {
+            assert!(u.contains(field), "{field} missing in {u}");
+        }
+        assert!(
+            u.contains("expansions=referenced_tweets.id,author_id"),
+            "{u}"
+        );
+        assert!(u.contains("user.fields=username"), "{u}");
+        assert!(thread_root_url("").is_err());
+        assert!(thread_root_url("a b").is_err());
+        assert!(thread_root_url("a&b").is_err());
+
+        let s = thread_search_url("123", "syn_user").unwrap();
+        assert!(
+            s.starts_with("https://api.x.com/2/tweets/search/recent?"),
+            "{s}"
+        );
+        assert!(s.contains("max_results=100"), "{s}");
+        assert!(
+            s.contains("query=conversation_id%3A123%20from%3Asyn_user"),
+            "{s}"
+        );
+        for field in [
+            "note_tweet",
+            "text",
+            "created_at",
+            "in_reply_to_user_id",
+            "referenced_tweets",
+            "author_id",
+            "conversation_id",
+        ] {
+            assert!(s.contains(field), "{field} missing in {s}");
+        }
+        assert!(
+            s.contains("expansions=referenced_tweets.id,author_id"),
+            "{s}"
+        );
+        assert!(s.contains("user.fields=username"), "{s}");
+        assert!(thread_search_url("", "syn_user").is_err());
+        assert!(thread_search_url("123", "").is_err());
+        assert!(thread_search_url("123", "not a user").is_err());
+        assert!(thread_search_url("12&3", "syn_user").is_err());
+    }
+
+    #[test]
+    fn archive_search_url_shares_query_fields_and_expansions() {
+        let recent = thread_search_url("123", "syn_user").unwrap();
+        let all = thread_search_all_url("123", "syn_user").unwrap();
+        assert!(
+            all.starts_with("https://api.x.com/2/tweets/search/all?"),
+            "{all}"
+        );
+        assert!(all.contains("max_results=100"), "{all}");
+        assert!(
+            all.contains("query=conversation_id%3A123%20from%3Asyn_user"),
+            "{all}"
+        );
+        // Same fields and expansions as recent search.
+        for part in [
+            "tweet.fields=",
+            "note_tweet",
+            "text",
+            "created_at",
+            "author_id",
+            "referenced_tweets",
+            "conversation_id",
+            "in_reply_to_user_id",
+            "expansions=referenced_tweets.id,author_id",
+            "user.fields=username",
+        ] {
+            assert!(all.contains(part), "{part} missing in {all}");
+            assert!(recent.contains(part), "{part} missing in {recent}");
+        }
+        assert!(thread_search_all_url("", "syn_user").is_err());
+        assert!(thread_search_all_url("123", "").is_err());
+        assert!(thread_search_all_url("123", "not a user").is_err());
+    }
+
+    #[test]
+    fn archive_fallback_triggers_on_zero_matches_only() {
+        assert!(needs_archive_fallback(0));
+        assert!(!needs_archive_fallback(1));
+        assert!(!needs_archive_fallback(100));
+    }
+
+    #[test]
+    fn parses_thread_root_with_matched_username() {
+        let raw = serde_json::json!({
+            "data": {
+                "id": "100", "author_id": "u1", "conversation_id": "100",
+                "text": "synthetic thread root",
+                "referenced_tweets": [],
+            },
+            "includes": {"users": [
+                {"id": "u9", "username": "syn_other"},
+                {"id": "u1", "username": "syn_author"},
+            ]},
+        });
+        let (root, username) = parse_thread_root(&raw).unwrap();
+        assert_eq!(root.id, "100");
+        assert_eq!(root.author_id, "u1");
+        assert_eq!(root.conversation_id.as_deref(), Some("100"));
+        assert_eq!(username.as_deref(), Some("syn_author"));
+        // No username match: still usable, search is skipped later.
+        let raw = serde_json::json!({
+            "data": {"id": "100", "author_id": "u1", "text": "synthetic"},
+            "includes": {"users": [{"id": "u9", "username": "syn_other"}]},
+        });
+        let (_, username) = parse_thread_root(&raw).unwrap();
+        assert_eq!(username, None);
+        assert!(parse_thread_root(&serde_json::json!({"meta": {}})).is_err());
+        assert!(parse_thread_root(&serde_json::json!({"data": {"text": "x"}})).is_err());
+    }
+
+    #[test]
+    fn parses_thread_search_skipping_invalid_entries() {
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "101", "author_id": "u1", "text": "synthetic reply",
+                 "referenced_tweets": [{"type": "replied_to", "id": "100"}]},
+                {"id": "102", "text": "missing author skipped"},
+                {"text": "missing id skipped"},
+            ],
+            "meta": {"result_count": 3},
+        });
+        let posts = parse_thread_search(&raw);
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].id, "101");
+        assert!(parse_thread_search(&serde_json::json!({"meta": {}})).is_empty());
+    }
+
+    #[test]
+    fn parses_quoted_posts_from_includes() {
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "101", "author_id": "u1", "text": "synthetic setup 1",
+                 "conversation_id": "100",
+                 "referenced_tweets": [
+                    {"type": "replied_to", "id": "100"},
+                    {"type": "quoted", "id": "q1"},
+                 ]},
+                {"id": "102", "author_id": "u1", "text": "synthetic setup 2",
+                 "conversation_id": "100",
+                 "referenced_tweets": [{"type": "replied_to", "id": "101"}]},
+            ],
+            "includes": {
+                "tweets": [
+                    {"id": "q1", "author_id": "u9",
+                     "text": "truncated… https://t.co/q",
+                     "note_tweet": {"text": "synthetic quoted real content"}},
+                ],
+                "users": [
+                    {"id": "u1", "username": "syn_author"},
+                    {"id": "u9", "username": "syn_quoted"},
+                ],
+            },
+            "meta": {"result_count": 2},
+        });
+        let posts = parse_thread_search(&raw);
+        assert_eq!(posts.len(), 2);
+        // Quoted text prefers note_tweet.text; username resolves via users.
+        assert_eq!(
+            posts[0].quoted,
+            Some((
+                "syn_quoted".to_string(),
+                "synthetic quoted real content".to_string()
+            ))
+        );
+        // No quote reference: nothing attached.
+        assert_eq!(posts[1].quoted, None);
+    }
+
+    #[test]
+    fn quoted_posts_fail_closed_on_missing_includes() {
+        // Quote reference but no includes at all.
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "101", "author_id": "u1", "text": "synthetic",
+                 "referenced_tweets": [{"type": "quoted", "id": "q1"}]},
+            ],
+        });
+        assert_eq!(parse_thread_search(&raw)[0].quoted, None);
+        // Quoted tweet id not in includes.tweets.
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "101", "author_id": "u1", "text": "synthetic",
+                 "referenced_tweets": [{"type": "quoted", "id": "missing"}]},
+            ],
+            "includes": {
+                "tweets": [{"id": "q1", "author_id": "u9", "text": "synthetic"}],
+                "users": [{"id": "u9", "username": "syn_quoted"}],
+            },
+        });
+        assert_eq!(parse_thread_search(&raw)[0].quoted, None);
+        // Quoted author not in includes.users: username is never guessed.
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "101", "author_id": "u1", "text": "synthetic",
+                 "referenced_tweets": [{"type": "quoted", "id": "q1"}]},
+            ],
+            "includes": {
+                "tweets": [{"id": "q1", "author_id": "u9", "text": "synthetic"}],
+                "users": [{"id": "u1", "username": "syn_author"}],
+            },
+        });
+        assert_eq!(parse_thread_search(&raw)[0].quoted, None);
+        // Empty quoted text: nothing useful to attach.
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "101", "author_id": "u1", "text": "synthetic",
+                 "referenced_tweets": [{"type": "quoted", "id": "q1"}]},
+            ],
+            "includes": {
+                "tweets": [{"id": "q1", "author_id": "u9", "text": ""}],
+                "users": [{"id": "u9", "username": "syn_quoted"}],
+            },
+        });
+        assert_eq!(parse_thread_search(&raw)[0].quoted, None);
+    }
+
+    #[test]
+    fn parses_root_quoted_post_from_includes() {
+        let raw = serde_json::json!({
+            "data": {
+                "id": "100", "author_id": "u1", "conversation_id": "100",
+                "text": "synthetic thread root",
+                "referenced_tweets": [{"type": "quoted", "id": "q1"}],
+            },
+            "includes": {
+                "tweets": [
+                    {"id": "q1", "author_id": "u9",
+                     "text": "synthetic quoted root content"},
+                ],
+                "users": [
+                    {"id": "u1", "username": "syn_author"},
+                    {"id": "u9", "username": "syn_quoted"},
+                ],
+            },
+        });
+        let (root, username) = parse_thread_root(&raw).unwrap();
+        assert_eq!(username.as_deref(), Some("syn_author"));
+        assert_eq!(
+            root.quoted,
+            Some((
+                "syn_quoted".to_string(),
+                "synthetic quoted root content".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn thread_free_fns_fail_closed_without_paid_switch() {
+        let _guard = env_lock();
+        let saved_paid = std::env::var("ANCIENTOS_ALLOW_PAID").ok();
+        let saved_client = std::env::var("X_CLIENT_ID").ok();
+        std::env::remove_var("ANCIENTOS_ALLOW_PAID");
+        std::env::set_var("X_CLIENT_ID", "synthetic-client");
+        assert!(fetch_thread("123").is_err());
+        assert!(fetch_thread_if_root("123").is_err());
+        match saved_paid {
+            Some(v) => std::env::set_var("ANCIENTOS_ALLOW_PAID", v),
+            None => std::env::remove_var("ANCIENTOS_ALLOW_PAID"),
+        }
+        match saved_client {
+            Some(v) => std::env::set_var("X_CLIENT_ID", v),
+            None => std::env::remove_var("X_CLIENT_ID"),
+        }
     }
 
     #[test]

@@ -19,3 +19,5 @@ Rule: demo only what is built and tested. Live segments use `scripts/demo.sh`
 - Wire Modal Llama endpoint (stub today; fails closed with paid switch off).
 - Swap mock brief writer for the real Muse brief from `flint/muse-x-auth`.
 - Decide whether any live paid call appears on screen (needs approval).
+- Verdicts are now approve / skip / never_post / never_category / delegate; consider showing a delegate run (thread unroll -> inspiration notes).
+- Backlog (media, "Try it", "go deeper", feed ranking): see `docs/backlog.md`; mention on roadmap slide only.
