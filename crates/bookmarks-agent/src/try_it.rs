@@ -598,6 +598,12 @@ fn word_key(word: &str) -> String {
         .to_lowercase()
 }
 
+/// True when the sentence starts with an instruction verb ("Roll 10x").
+/// Exposed for the deeper local fallback's step extraction.
+pub(crate) fn is_imperative_sentence(sentence: &str) -> bool {
+    is_imperative(sentence)
+}
+
 /// True when the fragment starts with an imperative verb (a leading
 /// "please" is skipped).
 fn is_imperative(fragment: &str) -> bool {

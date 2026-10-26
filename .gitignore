@@ -6,3 +6,6 @@
 *.jsonl
 !fixtures/sample_bookmarks.jsonl
 !fixtures/demo/synthetic_bookmarks.jsonl
+!fixtures/demo/try_it_and_thread_bookmarks.jsonl
+!fixtures/demo/expected_idea_cards.jsonl
+!fixtures/demo/deeper_thread_bookmarks.jsonl

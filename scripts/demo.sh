@@ -26,7 +26,7 @@ if [ $# -eq 2 ]; then
   esac
 fi
 export CARGO_HOME="${CARGO_HOME:-/tmp/cargo-home}"
-cargo build -q -p demo-runner
+cargo build -q -p demo-runner -p bookmarks-agent
 export ANCIENTOS_HOME="$DATA/home"
 export HOME="$DATA/home"
 export DECISION_LOG_PATH="$DATA/decision_log.jsonl"
@@ -38,6 +38,7 @@ run() { ./target/debug/demo-runner --data "$DATA" "$@"; }
 
 FIX1="fixtures/demo/synthetic_bookmarks.jsonl"
 FIX2="fixtures/demo/try_it_and_thread_bookmarks.jsonl"
+FIX3="fixtures/demo/deeper_thread_bookmarks.jsonl"
 
 shot1() {
   echo "==== Shot 1/12: Saved != read ===="
@@ -109,6 +110,9 @@ shot12() {
   echo "==== Shot 12/12: Roadmap ===="
   echo "Roadmap: more agents on core, custom X feed ranking, go-deeper sessions."
   echo "Bookmarks is the first agent; the rest of AncientOS plugs into the same core."
+  echo "Go deeper (offline, quoted + linked):"
+  # "Saved:" carries the temp dir path, so filter it to stay byte-identical.
+  ./target/debug/bookmarks-agent deeper demo-3001 --offline "$FIX3" | grep -v '^Saved: '
 }
 
 setup_sync_silent() {

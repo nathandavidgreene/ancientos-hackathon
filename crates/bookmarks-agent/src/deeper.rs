@@ -184,6 +184,244 @@ fn try_it_appendix(joined: &str, media: &[crate::media::Media], is_try_it: bool)
     out
 }
 
+/// Max items per fallback section; thread order wins, deterministic.
+const MAX_FALLBACK_ITEMS: usize = 8;
+/// Max characters per emitted fallback item (suffix-truncated).
+const MAX_FALLBACK_ITEM_CHARS: usize = 280;
+
+/// Collapse whitespace; truncate suffix-only to [`MAX_FALLBACK_ITEM_CHARS`].
+/// Pure, deterministic.
+fn truncate_item(s: &str) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_FALLBACK_ITEM_CHARS {
+        return collapsed;
+    }
+    let mut out: String = collapsed.chars().take(MAX_FALLBACK_ITEM_CHARS).collect();
+    out.push('…');
+    out
+}
+
+/// Split text into sentences on `.`/`!`/`?`/`;`/newlines. Empty fragments
+/// are dropped. Pure.
+fn fallback_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        for part in line.split(['.', '!', '?', ';']) {
+            let collapsed = part.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.chars().count() >= 2 {
+                out.push(collapsed);
+            }
+        }
+    }
+    out
+}
+
+/// True when lowercase `word` appears with non-alphanumeric boundaries in
+/// lowercase `hay`. Pure.
+fn contains_word(hay: &str, word: &str) -> bool {
+    let h = hay.as_bytes();
+    let p = word.as_bytes();
+    if p.is_empty() || h.len() < p.len() {
+        return false;
+    }
+    for i in 0..=(h.len() - p.len()) {
+        if h[i..i + p.len()] == p[..] {
+            let left_ok = i == 0 || !h[i - 1].is_ascii_alphanumeric();
+            let right_ok = i + p.len() == h.len() || !h[i + p.len()].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Assertion words marking a sentence as a claim (any digit also counts).
+/// Whole-word, case-insensitive. Pure.
+const CLAIM_WORDS: &[&str] = &[
+    "is",
+    "are",
+    "was",
+    "were",
+    "has",
+    "have",
+    "had",
+    "makes",
+    "make",
+    "made",
+    "means",
+    "mean",
+    "shows",
+    "show",
+    "proves",
+    "cuts",
+    "cut",
+    "reduces",
+    "improves",
+    "increases",
+    "takes",
+    "take",
+    "needs",
+    "need",
+    "requires",
+    "keeps",
+    "keep",
+    "drains",
+    "covers",
+    "will",
+    "can",
+    "should",
+    "never",
+    "always",
+    "faster",
+    "slower",
+    "better",
+    "half",
+    "every",
+];
+
+/// True for sentences carrying an assertion or a number: at least four
+/// words plus a digit or a whole-word assertion cue. Pure.
+fn is_claim_sentence(sentence: &str) -> bool {
+    if sentence.split_whitespace().count() < 4 {
+        return false;
+    }
+    if sentence.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let lower = sentence.to_lowercase();
+    CLAIM_WORDS.iter().any(|w| contains_word(&lower, w))
+}
+
+/// `(post_id, sentence)` claims in thread order: assertion/number
+/// sentences first, then one representative sentence per uncovered post so
+/// every post is quoted in its own words. Deterministic, capped. Pure.
+fn fallback_claims(thread: &[ThreadPost]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in thread {
+        let clean = crate::sanitize::sanitize_uncapped(&p.text);
+        for s in fallback_sentences(&clean) {
+            if is_claim_sentence(&s) && seen.insert(s.clone()) {
+                out.push((p.id.clone(), truncate_item(&s)));
+                if out.len() >= MAX_FALLBACK_ITEMS {
+                    return out;
+                }
+            }
+        }
+    }
+    if out.len() < MAX_FALLBACK_ITEMS {
+        let covered: std::collections::HashSet<String> =
+            out.iter().map(|(id, _)| id.clone()).collect();
+        for p in thread {
+            if covered.contains(&p.id) {
+                continue;
+            }
+            let clean = crate::sanitize::sanitize_uncapped(&p.text);
+            if let Some(first) = fallback_sentences(&clean).into_iter().next() {
+                if seen.insert(first.clone()) {
+                    out.push((p.id.clone(), truncate_item(&first)));
+                }
+            }
+            if out.len() >= MAX_FALLBACK_ITEMS {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Strip a leading `1) `/`1. `/`1: `/`(1) `/`Step 1: ` marker. `1/3`
+/// counters, decimals, and clock times are not steps. Pure.
+fn strip_step_marker(line: &str) -> Option<&str> {
+    let mut rest = line.trim();
+    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("step ") {
+        rest = rest[5..].trim_start();
+    }
+    if let Some(after) = rest.strip_prefix('(') {
+        let close = after.find(')')?;
+        if after[..close].is_empty() || !after[..close].chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        rest = after[close + 1..].trim_start();
+        return if rest.is_empty() { None } else { Some(rest) };
+    }
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || digits == rest.len() {
+        return None;
+    }
+    let marker = rest.as_bytes()[digits];
+    if !matches!(marker, b')' | b'.' | b':') {
+        return None;
+    }
+    let tail = &rest[digits + 1..];
+    if tail.starts_with(|c: char| c.is_ascii_digit()) {
+        return None; // decimal (`v2.0`) or clock time (`12:30`)
+    }
+    let body = tail.trim_start();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body)
+    }
+}
+
+/// Strip a leading `- `/`* `/`• ` bullet. Pure.
+fn strip_bullet(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    for marker in ["- ", "* ", "• "] {
+        if let Some(rest) = t.strip_prefix(marker) {
+            return if rest.trim().is_empty() {
+                None
+            } else {
+                Some(rest.trim())
+            };
+        }
+    }
+    None
+}
+
+/// Sequence words marking a sentence as a procedure step. Pure.
+const ORDER_MARKERS: &[&str] = &["first", "then", "next", "finally", "after that", "lastly"];
+
+fn has_order_marker(lower: &str) -> bool {
+    ORDER_MARKERS.iter().any(|m| contains_word(lower, m))
+}
+
+/// `(post_id, step)` in thread order: numbered/bulleted lines first, then
+/// imperative or first/then/next sentences. Empty when nothing actionable
+/// is found. Deterministic, capped. Pure.
+fn fallback_steps(thread: &[ThreadPost]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |id: &str, raw: &str| {
+        let item = truncate_item(raw);
+        if item.chars().count() >= 2 && seen.insert(item.clone()) && out.len() < MAX_FALLBACK_ITEMS
+        {
+            out.push((id.to_string(), item));
+        }
+    };
+    for p in thread {
+        // Raw lines: sanitizing collapses newlines, so markers are found
+        // first and each extracted item is sanitized on its own.
+        for line in p.text.lines() {
+            if let Some(body) = strip_step_marker(line).or_else(|| strip_bullet(line)) {
+                push(&p.id, &crate::sanitize::sanitize_uncapped(body));
+            }
+        }
+    }
+    for p in thread {
+        let clean = crate::sanitize::sanitize_uncapped(&p.text);
+        for s in fallback_sentences(&clean) {
+            let lower = s.to_lowercase();
+            if crate::try_it::is_imperative_sentence(&s) || has_order_marker(&lower) {
+                push(&p.id, &s);
+            }
+        }
+    }
+    out
+}
+
 /// Deterministic local fallback walkthrough with fixed sections.
 #[allow(clippy::too_many_arguments)]
 fn local_walkthrough(
@@ -215,36 +453,51 @@ fn local_walkthrough(
         }
         out.push('\n');
     }
-    out.push_str("## Quoted/linked posts\n");
-    if quoted.is_empty() && linked.is_empty() {
-        out.push_str("(none)\n\n");
-    } else {
-        for q in quoted {
-            let clean = crate::sanitize::sanitize_uncapped(&q.text);
-            out.push_str(&format!("### Quoted {}\n{clean}\n\n", q.id));
-        }
-        for l in linked {
-            let clean = crate::sanitize::sanitize_uncapped(&l.text);
-            out.push_str(&format!("### Linked {}\n{clean}\n\n", l.id));
-        }
-    }
     if is_try_it {
+        out.push_str("## Quoted/linked posts\n");
+        if quoted.is_empty() && linked.is_empty() {
+            out.push_str("(none)\n\n");
+        } else {
+            for q in quoted {
+                let clean = crate::sanitize::sanitize_uncapped(&q.text);
+                out.push_str(&format!("### Quoted {}\n{clean}\n\n", q.id));
+            }
+            for l in linked {
+                let clean = crate::sanitize::sanitize_uncapped(&l.text);
+                out.push_str(&format!("### Linked {}\n{clean}\n\n", l.id));
+            }
+        }
         out.push_str(&try_it_appendix(joined, media, true));
     } else {
-        out.push_str("## Steps\n");
-        for (i, p) in thread.iter().enumerate() {
-            out.push_str(&format!(
-                "{}. Re-read post {} and write down its one key move.\n",
-                i + 1,
-                p.id
-            ));
+        // Non-Try-it threads: quote real thread content (claims, steps,
+        // quoted/linked posts) with the post each item came from. No
+        // generic placeholder lines.
+        out.push_str("## Key claims\n");
+        for (id, claim) in fallback_claims(thread) {
+            out.push_str(&format!("- ({id}) {claim}\n"));
         }
-        for (j, q) in quoted.iter().chain(linked.iter()).enumerate() {
-            out.push_str(&format!(
-                "{}. Check post {} for context on the step above.\n",
-                thread.len() + j + 1,
-                q.id
-            ));
+        out.push('\n');
+        let steps = fallback_steps(thread);
+        if !steps.is_empty() {
+            out.push_str("## Steps\n");
+            for (id, step) in &steps {
+                out.push_str(&format!("- ({id}) {step}\n"));
+            }
+            out.push('\n');
+        }
+        out.push_str("## Quoted & linked\n");
+        if quoted.is_empty() && linked.is_empty() {
+            out.push_str("(none)\n\n");
+        } else {
+            for q in quoted {
+                let clean = crate::sanitize::sanitize_uncapped(&q.text);
+                out.push_str(&format!("- (quoted {}) {}\n", q.id, truncate_item(&clean)));
+            }
+            for l in linked {
+                let clean = crate::sanitize::sanitize_uncapped(&l.text);
+                out.push_str(&format!("- (linked {}) {}\n", l.id, truncate_item(&clean)));
+            }
+            out.push('\n');
         }
     }
     if !out.ends_with('\n') {
@@ -739,10 +992,26 @@ mod tests {
         for section in [
             "## Source",
             "## Thread summary per post",
-            "## Quoted/linked posts",
-            "## Steps",
+            "## Key claims",
+            "## Quoted & linked",
         ] {
             assert!(first.output.contains(section), "{section} missing");
+        }
+        // The plain thread fixture has no numbered/bulleted/imperative or
+        // first/then/next steps, so the Steps section is omitted.
+        assert!(
+            !first.output.contains("## Steps"),
+            "Steps must be omitted when none found:\n{}",
+            first.output
+        );
+        for generic in [
+            "write down its one key move",
+            "for context on the step above",
+        ] {
+            assert!(
+                !first.output.contains(generic),
+                "generic line leaked: {generic}"
+            );
         }
         assert_eq!(first.mode, "local");
         assert_eq!(first.model, "local");
@@ -784,6 +1053,137 @@ mod tests {
         );
         let body = std::fs::read_to_string(&res.path).unwrap();
         assert_eq!(body, res.output);
+    }
+
+    /// Rich non-Try-it thread: claims with numbers, numbered + sequenced
+    /// steps, one quoted and one linked post.
+    fn rich_thread_fixture() -> Vec<serde_json::Value> {
+        vec![
+            row(
+                "demo-3001",
+                "[synthetic] Kanban review: our queue drains 40% faster when agents pick cards in batches of 5.\n1) Batch size is 5 cards per run\n2) Friday audits cover 30 cards, so the log is the source of truth.\nFirst, the agent lists due cards.\nThen it writes results back as a comment.\nSee background https://x.com/demo_archivist/status/demo-3004 for the earlier measurement.",
+                "demo_threadsmith",
+                "2026-10-20T14:00:00+00:00",
+                "demo-3001",
+                serde_json::json!({"referenced_tweets": [{"type": "quoted", "id": "demo-3003"}]}),
+            ),
+            row(
+                "demo-3002",
+                "[synthetic] Friday follow-up: audits take time across 30 cards, so the log stays the source of truth.",
+                "demo_threadsmith",
+                "2026-10-20T14:01:00+00:00",
+                "demo-3001",
+                serde_json::json!({"in_reply_to_post_id": "demo-3001"}),
+            ),
+            row(
+                "demo-3003",
+                "[synthetic] Quoted context: shared logs cut review time by half across 12 teams.",
+                "demo_archivist",
+                "2026-10-19T10:00:00+00:00",
+                "demo-3003",
+                serde_json::json!({}),
+            ),
+            row(
+                "demo-3004",
+                "[synthetic] Linked background: batching in groups of 5 keeps latency under the weekly budget.",
+                "demo_archivist",
+                "2026-10-19T11:00:00+00:00",
+                "demo-3004",
+                serde_json::json!({}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn non_try_it_fallback_quotes_real_text_without_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir, "rich.jsonl", &rich_thread_fixture());
+        let run_once = || {
+            run_with(
+                "demo-3001",
+                false,
+                Some(&fixture),
+                &no_thread_fetch,
+                &no_post_fetch,
+                &no_call,
+                &dir.path().join("d.jsonl"),
+                &dir.path().join("deeper"),
+            )
+            .unwrap()
+        };
+        let res = run_once();
+        assert_eq!(res.mode, "local");
+        // Deterministic across runs.
+        assert_eq!(res.output, run_once().output);
+        for section in ["## Key claims", "## Steps", "## Quoted & linked"] {
+            assert!(
+                res.output.contains(section),
+                "{section} missing:\n{}",
+                res.output
+            );
+        }
+        // Extracted thread content appears with the post it came from.
+        for want in [
+            "40% faster",
+            "Batch size is 5 cards per run",
+            "Friday audits cover 30 cards",
+            "First, the agent lists due cards",
+            "Then it writes results back as a comment",
+            "demo-3001",
+            "demo-3002",
+        ] {
+            assert!(res.output.contains(want), "{want} missing:\n{}", res.output);
+        }
+        // Quoted and linked posts appear with their ids.
+        for want in [
+            "(quoted demo-3003)",
+            "cut review time by half across 12 teams",
+            "(linked demo-3004)",
+            "batching in groups of 5",
+        ] {
+            assert!(res.output.contains(want), "{want} missing:\n{}", res.output);
+        }
+        // No generic placeholder lines.
+        for generic in [
+            "Re-read post",
+            "write down its one key move",
+            "Check post",
+            "for context on the step above",
+        ] {
+            assert!(
+                !res.output.contains(generic),
+                "generic line leaked: {generic}\n{}",
+                res.output
+            );
+        }
+    }
+
+    #[test]
+    fn non_try_it_fallback_lists_claims_per_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir, "rich.jsonl", &rich_thread_fixture());
+        let res = run_with(
+            "demo-3001",
+            false,
+            Some(&fixture),
+            &no_thread_fetch,
+            &no_post_fetch,
+            &no_call,
+            &dir.path().join("d.jsonl"),
+            &dir.path().join("deeper"),
+        )
+        .unwrap();
+        // Both thread posts contribute claim lines naming their own id.
+        assert!(
+            res.output.contains("- (demo-3001)"),
+            "demo-3001 claim missing:\n{}",
+            res.output
+        );
+        assert!(
+            res.output.contains("- (demo-3002)"),
+            "demo-3002 claim missing:\n{}",
+            res.output
+        );
     }
 
     #[test]

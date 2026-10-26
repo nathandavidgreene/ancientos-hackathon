@@ -58,6 +58,32 @@ fn storyboard_quotes() -> Vec<String> {
     quotes
 }
 
+/// Same rule as `scripts/demo.sh` shot 11: log rows matching
+/// `^\| [0-9]+[a-z]? `, excluding rows marked `Not used`.
+fn muse_code_runs_from_log() -> usize {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/muse-code-log.md");
+    let text = std::fs::read_to_string(path).expect("read docs/muse-code-log.md");
+    text.lines()
+        .filter(|line| {
+            if line.contains("Not used") {
+                return false;
+            }
+            let Some(after) = line.strip_prefix("| ") else {
+                return false;
+            };
+            let digits = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+            if digits == 0 {
+                return false;
+            }
+            let mut rest = &after[digits..];
+            if let Some(tail) = rest.strip_prefix(|c: char| c.is_ascii_lowercase()) {
+                rest = tail;
+            }
+            rest.starts_with(' ')
+        })
+        .count()
+}
+
 fn has_15plus_digits(s: &str) -> bool {
     let mut run = 0usize;
     for c in s.chars() {
@@ -170,11 +196,33 @@ fn demo_runs_all_shots_deterministically_without_private_data() {
         );
     }
     for q in &quotes {
+        if q.starts_with("Muse Code runs:") {
+            // The storyboard quotes the `N` placeholder form; the concrete
+            // count is checked against the derived value below.
+            continue;
+        }
         assert!(
             out1.contains(q),
             "storyboard quote missing from demo output: {q:?}"
         );
     }
+    // Shot 11 derives N from the log with the same rule as scripts/demo.sh.
+    let expected_runs = muse_code_runs_from_log();
+    assert!(
+        out1.contains(&format!(
+            "Muse Code runs: {expected_runs} (from docs/muse-code-log.md)"
+        )),
+        "demo output must show the derived run count {expected_runs}"
+    );
+    let storyboard = std::fs::read_to_string(storyboard_path()).expect("read demo-storyboard.md");
+    assert!(
+        storyboard.contains("Muse Code runs: N (from docs/muse-code-log.md)"),
+        "storyboard must quote the N placeholder form"
+    );
+    assert!(
+        storyboard.contains("derived from"),
+        "storyboard must note that N is derived from the log"
+    );
 }
 
 #[test]
