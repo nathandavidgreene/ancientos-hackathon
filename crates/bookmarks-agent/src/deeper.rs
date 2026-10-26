@@ -168,10 +168,47 @@ pub fn build_paid_prompt(
         "Instructions: walk through the public post thread below step by step for AncientOS, a personal agent OS \
          with a scheduler, approval gate, append-only decision log, privacy router, and agents \
          like a bookmarks curator. Reply in markdown with a numbered step-by-step walkthrough: \
-         one numbered step per post in order, then one step per quoted/linked post explaining \
-         how it connects. Keep each step to two sentences.\n\
+         numbered imperative steps (\"1. Install X\", \"2. Create a page for Y\"), one per post in order, \
+         then one per quoted/linked post explaining how it connects. Each step must be a single \
+         imperative sentence grounded in the post text, no meta lines (no \"Here is...\", no summaries), \
+         no URLs. Keep each step to two sentences.\n\
          \nPublic thread (URLs and @handles stripped):\n\n{body}"
     )
+}
+
+/// Max chars for the derived `# title` line.
+const MAX_TITLE_CHARS: usize = 60;
+
+/// Short title from the first post's first non-empty line: sanitized,
+/// truncated at a word boundary with `…`. Falls back to `Post <id>` when
+/// the first post has no text. Pure.
+pub fn short_title(thread: &[ThreadPost]) -> String {
+    let first = thread.first();
+    let raw_line = first
+        .map(|p| {
+            p.text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+        })
+        .unwrap_or("");
+    let clean = crate::sanitize::sanitize_uncapped(raw_line);
+    let clean = clean.trim();
+    if clean.is_empty() {
+        return first
+            .map(|p| format!("Post {}", p.id))
+            .unwrap_or_else(|| "Untitled".to_string());
+    }
+    if clean.chars().count() <= MAX_TITLE_CHARS {
+        return clean.to_string();
+    }
+    let mut out: String = clean.chars().take(MAX_TITLE_CHARS).collect();
+    if let Some(pos) = out.rfind(' ') {
+        out.truncate(pos);
+    }
+    out.push('…');
+    out
 }
 
 /// Remove `https?://t.co/\S+` matches (case-sensitive, `/` plus at least
@@ -270,20 +307,216 @@ fn clean_step_text(s: &str) -> String {
     no_quote.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Strip all `http(s)://…` and `www.…` tokens. Pure.
+fn strip_all_urls(s: &str) -> String {
+    s.split_whitespace()
+        .filter(|t| {
+            let lower = t.to_lowercase();
+            let trimmed = lower.trim_start_matches(|c: char| {
+                c == '(' || c == '[' || c == '{' || c == '"' || c == '\'' || c == '<'
+            });
+            !(trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || trimmed.starts_with("www."))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Sequence words stripped when converting to imperative form.
+const IMPERATIVE_STRIP_LEADERS: &[&str] = &[
+    "first", "then", "next", "finally", "lastly", "also", "just", "now", "please",
+];
+/// Pronouns stripped with an optional following modal ("I can …", "you should …").
+const IMPERATIVE_STRIP_PRONOUNS: &[&str] = &["i", "we", "you", "he", "she", "they", "it"];
+const IMPERATIVE_STRIP_MODALS: &[&str] = &[
+    "can", "could", "should", "will", "would", "may", "might", "must", "shall",
+];
+
+/// Trim leading separators left after stripping a word.
+fn trim_seps(s: &str) -> &str {
+    s.trim_start_matches(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ':')
+        .trim_start()
+}
+
+/// Convert a step candidate to imperative form: strip a leading
+/// `[synthetic]` marker, sequence words ("then", "next", …), pronouns with
+/// an optional modal ("I can", "you should"), and "please"; capitalize the
+/// verb. Pure.
+fn to_imperative_form(s: &str) -> String {
+    let mut rest = s.trim();
+    if rest.len() >= 11 && rest[..11].eq_ignore_ascii_case("[synthetic]") {
+        rest = rest[11..].trim_start();
+    }
+    loop {
+        if rest.is_empty() {
+            break;
+        }
+        let lower = rest.to_lowercase();
+        if lower.starts_with("after that")
+            && rest["after that".len()..]
+                .starts_with(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ':')
+        {
+            rest = trim_seps(&rest["after that".len()..]);
+            continue;
+        }
+        let first_end = rest
+            .find(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ':')
+            .unwrap_or(rest.len());
+        let key = rest[..first_end]
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        if IMPERATIVE_STRIP_LEADERS.contains(&key.as_str()) {
+            rest = trim_seps(&rest[first_end..]);
+            continue;
+        }
+        if IMPERATIVE_STRIP_PRONOUNS.contains(&key.as_str()) {
+            let mut tail = trim_seps(&rest[first_end..]);
+            let m_end = tail
+                .find(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ':')
+                .unwrap_or(tail.len());
+            let m_key = tail[..m_end]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            if IMPERATIVE_STRIP_MODALS.contains(&m_key.as_str()) {
+                tail = trim_seps(&tail[m_end..]);
+            }
+            rest = tail;
+            continue;
+        }
+        break;
+    }
+    let mut chars = rest.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// First words that never start an imperative step (pronouns, articles,
+/// demonstratives, meta openers). Compared lowercased.
+const NON_IMPERATIVE_STARTERS: &[&str] = &[
+    "i", "we", "you", "he", "she", "it", "they", "this", "that", "these", "those", "the", "a",
+    "an", "there", "here", "my", "our", "your", "his", "her", "its", "their", "in", "on", "at",
+    "for", "with", "from", "about", "as", "if", "when", "while", "because", "overall", "summary",
+    "note", "below", "above",
+];
+
+/// True when the cleaned step reads as an imperative how-to action: at
+/// least two words, first word capitalized and not a pronoun/article/meta
+/// starter, no URLs. Pure.
+fn is_imperative_step(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let lower_all = t.to_lowercase();
+    if lower_all.contains("http://") || lower_all.contains("https://") || lower_all.contains("www.")
+    {
+        return false;
+    }
+    let words: Vec<&str> = t.split_whitespace().collect();
+    if words.len() < 2 {
+        return false;
+    }
+    let first = words[0].trim_matches(|c: char| !c.is_alphanumeric());
+    if first.is_empty() || !first.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return false;
+    }
+    if NON_IMPERATIVE_STARTERS.contains(&first.to_lowercase().as_str()) {
+        return false;
+    }
+    if lower_all.starts_with("here is")
+        || lower_all.starts_with("here are")
+        || lower_all.starts_with("in summary")
+    {
+        return false;
+    }
+    true
+}
+
+/// Clean, convert to imperative, and filter step candidates: drops empty,
+/// URL-only, non-imperative, and duplicate (case-insensitive) lines.
+/// Returns imperative-form steps in order. Pure.
+fn filter_steps(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for r in raw {
+        let cleaned = strip_all_urls(&clean_step_text(r));
+        if cleaned.trim().is_empty() {
+            continue;
+        }
+        let imp = to_imperative_form(&cleaned);
+        if !is_imperative_step(&imp) {
+            continue;
+        }
+        if seen.insert(imp.to_lowercase()) {
+            out.push(imp);
+        }
+    }
+    out
+}
+
+/// Filter numbered step lines in paid model output: drops non-imperative /
+/// empty / URL-only / duplicate steps and renumbers survivors. Non-step
+/// lines pass through unchanged. Pure.
+fn filter_model_steps(content: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Per-line plan: None = pass through, Some(None) = dropped step,
+    // Some(Some(idx)) = kept step with index into `kept`.
+    let mut plan: Vec<Option<Option<usize>>> = Vec::new();
+    for line in content.lines() {
+        if let Some(body) = strip_step_marker(line).or_else(|| strip_bullet(line)) {
+            let cleaned = strip_all_urls(&clean_step_text(body));
+            let imp = to_imperative_form(&cleaned);
+            if cleaned.trim().is_empty() || !is_imperative_step(&imp) {
+                plan.push(Some(None));
+                continue;
+            }
+            if seen.insert(imp.to_lowercase()) {
+                kept.push(imp);
+                plan.push(Some(Some(kept.len() - 1)));
+            } else {
+                plan.push(Some(None));
+            }
+        } else {
+            plan.push(None);
+        }
+    }
+    let mut out = String::new();
+    let mut n = 0usize;
+    for (line, p) in content.lines().zip(plan) {
+        match p {
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+            Some(None) => {}
+            Some(Some(idx)) => {
+                n += 1;
+                out.push_str(&format!("{n}. {}\n", kept[idx]));
+            }
+        }
+    }
+    if content.ends_with('\n') || out.is_empty() {
+        out
+    } else {
+        out.trim_end().to_string() + "\n"
+    }
+}
+
 /// Try-it appendix for both paid and local output: extracted practice steps
 /// (thread text only; quoted/linked posts never become steps) plus rendered
 /// media, only when the classifier fires. Empty otherwise. Steps are plain
-/// numbered lines with no t.co links, markdown links, or quote markers.
+/// numbered imperative lines with no URLs, markdown links, or quote markers.
 fn try_it_appendix(thread_joined: &str, media: &[crate::media::Media], is_try_it: bool) -> String {
     if !is_try_it {
         return String::new();
     }
     let mut out = String::from("\n## Steps\n");
-    let steps: Vec<String> = crate::try_it::extract_steps(thread_joined)
-        .iter()
-        .map(|s| clean_step_text(s))
-        .filter(|s| !s.is_empty())
-        .collect();
+    let candidates: Vec<String> = crate::try_it::extract_steps(thread_joined);
+    let steps = filter_steps(&candidates);
     if steps.is_empty() {
         out.push_str("_No explicit steps found._\n");
     } else {
@@ -505,17 +738,24 @@ fn has_order_marker(lower: &str) -> bool {
 
 /// `(post_id, step)` in thread order: numbered/bulleted lines first, then
 /// imperative or first/then/next sentences. Thread posts only; quoted and
-/// linked posts never become steps. Each step is cleaned plain text (no t.co
-/// links, markdown links, or quote markers). Empty when nothing actionable
-/// is found. Deterministic, capped. Pure.
+/// linked posts never become steps. Each step is cleaned plain imperative
+/// text (no URLs, markdown links, or quote markers); non-imperative,
+/// empty, URL-only, and duplicate candidates are dropped. Empty when
+/// nothing actionable is found. Deterministic, capped. Pure.
 fn fallback_steps(thread: &[ThreadPost]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |id: &str, raw: &str| {
-        let item = clean_step_text(&truncate_item(raw));
-        if item.chars().count() >= 2 && seen.insert(item.clone()) && out.len() < MAX_FALLBACK_ITEMS
-        {
-            out.push((id.to_string(), item));
+        let cleaned = strip_all_urls(&clean_step_text(&truncate_item(raw)));
+        if cleaned.trim().is_empty() {
+            return;
+        }
+        let imp = to_imperative_form(&cleaned);
+        if !is_imperative_step(&imp) {
+            return;
+        }
+        if seen.insert(imp.to_lowercase()) && out.len() < MAX_FALLBACK_ITEMS {
+            out.push((id.to_string(), imp));
         }
     };
     for p in thread {
@@ -557,7 +797,8 @@ fn local_walkthrough(
     is_try_it: bool,
 ) -> String {
     let url = crate::delegate::post_url(post_id, username);
-    let mut out = format!("# Go deeper — {url}\n\n## Source\n- Post: {url}\n");
+    let title = short_title(thread);
+    let mut out = format!("# {title}\n\n## Source\n- Post: {url}\n");
     out.push_str(&format!(
         "- Thread posts: {} · Quoted: {} · Linked: {}\n\n",
         thread.len(),
@@ -576,7 +817,7 @@ fn local_walkthrough(
         out.push('\n');
     }
     if is_try_it {
-        out.push_str("## Quoted/linked posts\n");
+        out.push_str("## Quoted & linked\n");
         if quoted.is_empty() && linked.is_empty() {
             out.push_str("(none)\n\n");
         } else {
@@ -920,7 +1161,12 @@ pub fn run_with(
         if content.trim().is_empty() {
             return Err("model returned an empty walkthrough".to_string());
         }
-        let mut out = format!("{}\n", content.trim_end());
+        let filtered = filter_model_steps(content.trim_end());
+        if filtered.trim().is_empty() {
+            return Err("model returned no usable steps after filtering".to_string());
+        }
+        let title = short_title(&thread);
+        let mut out = format!("# {title}\n\n{}\n", filtered.trim_end());
         out.push_str(&try_it_appendix(&thread_joined, &media, is_try_it));
         (out, model, usage, "paid".to_string())
     } else {
@@ -1515,6 +1761,10 @@ mod tests {
                 assert!(prior.is_none(), "no continuation expected");
                 seen.borrow_mut().push(prompt.to_string());
                 assert!(prompt.contains("step-by-step"), "{prompt}");
+                assert!(prompt.contains("imperative"), "{prompt}");
+                assert!(prompt.contains("grounded"), "{prompt}");
+                assert!(prompt.contains("no meta"), "{prompt}");
+                assert!(prompt.contains("no URLs"), "{prompt}");
                 assert!(prompt.contains("[synthetic] Try it now"), "{prompt}");
                 assert!(!prompt.contains("@syn"), "{prompt}");
                 Ok((
@@ -1535,8 +1785,13 @@ mod tests {
         assert_eq!(seen.borrow().len(), 1, "exactly one Muse call");
         assert_eq!(res.mode, "paid");
         assert_eq!(res.model, "fake-spark");
-        assert!(res.output.contains("paid step one"), "{}", res.output);
+        assert!(res.output.contains("Paid step one"), "{}", res.output);
         assert!(res.output.contains("## Steps"), "{}", res.output);
+        assert!(
+            res.output.starts_with("# [synthetic] Try it now"),
+            "paid output starts with title:\n{}",
+            res.output
+        );
         assert_eq!(res.thread_posts, 2);
         assert_eq!(res.quoted_posts, 1);
         let log_file = DecisionLog::open(&log).unwrap();
@@ -1550,7 +1805,7 @@ mod tests {
         assert_eq!(entries[0].payload["quoted_posts"], 1);
         let logged = entries[0].payload.to_string();
         assert!(!logged.contains("[synthetic]"), "{logged}");
-        assert!(!logged.contains("paid step one"), "{logged}");
+        assert!(!logged.contains("Paid step one"), "{logged}");
     }
 
     #[test]
@@ -1892,7 +2147,7 @@ mod tests {
             .expect("try-it output has Steps");
         let steps_text = &res.output[steps_pos..];
         assert!(
-            steps_text.contains("thread roll shoulders"),
+            steps_text.contains("Thread roll shoulders 10x"),
             "thread step kept:\n{steps_text}"
         );
         assert!(
@@ -1951,7 +2206,7 @@ mod tests {
         .unwrap();
         let steps_pos = res.output.find("## Steps").expect("Steps present");
         let steps_text = &res.output[steps_pos..];
-        assert!(steps_text.contains("roll shoulders"), "{steps_text}");
+        assert!(steps_text.contains("Roll shoulders"), "{steps_text}");
         assert!(!steps_text.contains("t.co"), "{steps_text}");
         assert!(!steps_text.contains("abc123"), "{steps_text}");
     }
@@ -1983,5 +2238,194 @@ mod tests {
             !steps_text.lines().any(|l| l.trim_start().starts_with('>')),
             "{steps_text}"
         );
+    }
+
+    #[test]
+    fn title_comes_from_first_post_line() {
+        let t = short_title(&[post("1", "[synthetic] Install WordCraft and open a page")]);
+        assert_eq!(t, "[synthetic] Install WordCraft and open a page");
+        // First non-empty line wins; handles and URLs are stripped.
+        let t = short_title(&[post(
+            "2",
+            "\nHello @syn_user see https://example.com/x now\nsecond line",
+        )]);
+        assert_eq!(t, "Hello see now");
+        // Long titles truncate at a word boundary with an ellipsis.
+        let long = "word ".repeat(30);
+        let t = short_title(&[post("3", &long)]);
+        assert!(t.ends_with('…'), "{t}");
+        assert!(t.chars().count() <= MAX_TITLE_CHARS + 1, "{t}");
+        // Empty text falls back to the post id.
+        assert_eq!(short_title(&[post("9", "   ")]), "Post 9");
+        assert_eq!(short_title(&[]), "Untitled");
+    }
+
+    #[test]
+    fn saved_file_starts_with_title_and_quoted_ampersand_heading() {
+        for (id, fixture_fn) in [
+            ("100", thread_fixture()),
+            ("demo-3001", rich_thread_fixture()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = write_fixture(&dir, "t.jsonl", &fixture_fn);
+            let res = run_with(
+                id,
+                false,
+                Some(&fixture),
+                &no_thread_fetch,
+                &no_post_fetch,
+                &no_call,
+                &dir.path().join("d.jsonl"),
+                &dir.path().join("deeper"),
+            )
+            .unwrap();
+            let first_line = res.output.lines().next().unwrap_or("");
+            assert!(
+                first_line.starts_with("# ") && first_line.len() > 2,
+                "title line missing: {first_line:?}"
+            );
+            assert!(
+                !res.output.contains("# Go deeper"),
+                "old title leaked:\n{}",
+                res.output
+            );
+            assert!(
+                res.output.contains("## Quoted & linked"),
+                "heading missing:\n{}",
+                res.output
+            );
+            assert!(
+                !res.output.contains("## Quoted/linked"),
+                "old heading leaked:\n{}",
+                res.output
+            );
+        }
+        // Try-it output uses the same heading.
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(
+            &dir,
+            "t.jsonl",
+            &[row(
+                "200",
+                "[synthetic] Desk stretch: Try it now. 1) roll shoulders 10x 2) neck tilt 20s each side.",
+                "syn_mobility",
+                "2026-10-21T15:00:00+00:00",
+                "200",
+                serde_json::json!({}),
+            )],
+        );
+        let res = run_with(
+            "200",
+            false,
+            Some(&fixture),
+            &no_thread_fetch,
+            &no_post_fetch,
+            &no_call,
+            &dir.path().join("d.jsonl"),
+            &dir.path().join("deeper"),
+        )
+        .unwrap();
+        assert!(
+            res.output.lines().next().unwrap_or("").starts_with("# "),
+            "title missing:\n{}",
+            res.output
+        );
+        assert!(
+            res.output.contains("## Quoted & linked"),
+            "try-it heading missing:\n{}",
+            res.output
+        );
+    }
+
+    #[test]
+    fn imperative_conversion_strips_leaders_and_capitalizes() {
+        assert_eq!(
+            to_imperative_form("Install WordCraft now"),
+            "Install WordCraft now"
+        );
+        assert_eq!(
+            to_imperative_form("I can install WordCraft now"),
+            "Install WordCraft now"
+        );
+        assert_eq!(
+            to_imperative_form("you should create a page for notes"),
+            "Create a page for notes"
+        );
+        assert_eq!(
+            to_imperative_form("Then, install the agent"),
+            "Install the agent"
+        );
+        assert_eq!(to_imperative_form("Next create a page"), "Create a page");
+        assert_eq!(
+            to_imperative_form("First, you can open the board"),
+            "Open the board"
+        );
+        assert_eq!(
+            to_imperative_form("[synthetic] roll shoulders 10x"),
+            "Roll shoulders 10x"
+        );
+        assert_eq!(
+            to_imperative_form("please hold for 20 seconds"),
+            "Hold for 20 seconds"
+        );
+    }
+
+    #[test]
+    fn step_filter_drops_non_imperative_empty_url_and_duplicates() {
+        let raw = vec![
+            "Install WordCraft now".to_string(),
+            "install wordcraft now".to_string(), // duplicate (case-insensitive)
+            "This is a very interesting post".to_string(), // non-imperative
+            "The agent lists due cards here".to_string(), // article starter
+            "Here is my summary of things".to_string(), // meta line
+            "https://example.com/only-a-link".to_string(), // URL-only
+            "   ".to_string(),                   // empty
+            "Create a page for notes".to_string(),
+            "Then create a page for notes".to_string(), // duplicate after conversion
+            "Run".to_string(),                          // single word
+        ];
+        assert_eq!(
+            filter_steps(&raw),
+            vec![
+                "Install WordCraft now".to_string(),
+                "Create a page for notes".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_steps_filter_and_renumber() {
+        let content = "## Walkthrough\n1. Install WordCraft now\n2. This is a very interesting post\n3. https://example.com/x\n4. Create a page for notes\n5. create a page for notes\n";
+        let out = filter_model_steps(content);
+        assert_eq!(
+            out,
+            "## Walkthrough\n1. Install WordCraft now\n2. Create a page for notes\n"
+        );
+        // Non-step lines pass through; bullets are normalized to numbered steps.
+        let content = "Intro line\n- Install WordCraft now\nOutro\n";
+        assert_eq!(
+            filter_model_steps(content),
+            "Intro line\n1. Install WordCraft now\nOutro\n"
+        );
+    }
+
+    #[test]
+    fn paid_prompt_requires_imperative_grounded_steps() {
+        let prompt = build_paid_prompt(
+            &[post("1", "[synthetic] Install WordCraft and open a page")],
+            &[],
+            &[],
+        );
+        for want in [
+            "step-by-step",
+            "imperative",
+            "grounded",
+            "no meta",
+            "no URLs",
+            "Install X",
+            "Create a page",
+        ] {
+            assert!(prompt.contains(want), "{want} missing:\n{prompt}");
+        }
     }
 }

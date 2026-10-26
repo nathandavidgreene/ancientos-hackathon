@@ -37,4 +37,4 @@ same core governs any future agent, so the pattern generalizes beyond X.
 - Full AncientOS rebuild on this core (more agents on the same gate and log).
 - Custom X feed ranking from accumulated verdicts.
 - "Go deeper" scheduled walkthroughs.
-- Local Llama endpoint on Modal fully wired.
+- Local Llama backend live via Ollama/llama.cpp; Modal stays an optional future target.

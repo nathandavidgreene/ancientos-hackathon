@@ -1,6 +1,9 @@
 //! Route-then-call: pick a destination with [`crate::route`] and call only
 //! the client for that destination. Fails closed if a client's declared
-//! destination does not match where the data is allowed to go.
+//! destination does not match where the data is allowed to go. Sensitive
+//! content routes to the local slot: wire it with
+//! [`crate::local_llm::LocalLlmClient`] (default); [`crate::modal`] is an
+//! optional future target, never a silent fallback to Muse.
 use crate::{route, Destination, ModelClient, RouterError, Sensitivity};
 
 pub struct Backends<'a> {

@@ -29,10 +29,10 @@ Every backticked string in the On-screen action column is quoted verbatim from
 - Run `bash scripts/demo.sh` from a clean clone with `ANCIENTOS_ALLOW_PAID` unset; confirm exit 0 and byte-identical output across two runs, and `--shot N` exits 0 for N 1..12.
 - Every on-screen string in the shot table is quoted verbatim from `scripts/demo.sh` output; `crates/demo-runner/tests/demo_script.rs` fails if any quoted string drifts.
 - Media, Try it, and idea-card shots are built on synthetic fixtures and covered by tests.
-- Modal Llama is still a stub: sensitive traffic stays on local Llama, and cloud calls fail closed with the paid switch off.
+- Sensitive traffic stays on the local Llama backend (Ollama/llama.cpp via `ANCIENTOS_LOCAL_LLM_URL`); cloud calls fail closed with the paid switch off. Modal remains an optional future target.
 - Pre-record any live-API clip only with Nathan's approval and with handles/tokens hidden.
 - Keep total ≤ 3:00; shots 9 and 12 are the first to trim.
 
 ## Open items before recording
-- Wire Modal Llama endpoint (stub today; fails closed with paid switch off).
+- Local Llama backend wired (Ollama/llama.cpp); Modal stays an optional future target.
 - Storyboard locked by Oct 30 gate.

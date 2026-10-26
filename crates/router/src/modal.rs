@@ -1,4 +1,5 @@
-//! Modal-hosted Llama client stub for sensitive data.
+//! Modal-hosted Llama client stub: an optional future target, not used by
+//! default dispatch (sensitive data routes to [`crate::local_llm`]).
 //!
 //! Config comes only from `MODAL_*` env vars (`MODAL_LLAMA_URL`,
 //! `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`) plus the paid switch

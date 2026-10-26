@@ -1,10 +1,29 @@
 //! `demo-runner --data DIR <cmd>` — offline demo commands on synthetic fixtures.
+//! `route` is the exception: it sends one real prompt to the configured
+//! backend (sensitive -> local LLM, sanitized -> Muse) for live demos.
 use ancientos_core::feedback::{ThresholdPolicy, Verdict};
 use ancientos_core::log::DecisionLog;
+use ancientos_router::dispatch::{dispatch, Backends};
+use ancientos_router::Sensitivity;
 use demo_runner::{demo_date, demo_now_secs, routing_demo, Workspace};
 use std::path::Path;
 
-const USAGE: &str = "usage: demo-runner --data DIR <sync FIXTURE | brief DAY | brief-rich DAY | feedback PICK VERDICT | thresholds | log | count FIXTURE... | routing | vote-demo | delegate-demo POST_ID | try-demo | tamper-demo>";
+const USAGE: &str = "usage: demo-runner --data DIR <sync FIXTURE | brief DAY | brief-rich DAY | feedback PICK VERDICT | thresholds | log | count FIXTURE... | routing | route [--sensitive|--sanitized] TEXT | vote-demo | delegate-demo POST_ID | try-demo | tamper-demo>";
+
+/// Parse `route` args: `--sensitive TEXT` (default) or `--sanitized TEXT`.
+/// A bare `route TEXT` is treated as sensitive (fail closed).
+fn parse_route_args(args: &[String]) -> Result<(bool, String), String> {
+    let (sensitive, text) = match args {
+        [flag, text] if flag == "--sensitive" => (true, text.clone()),
+        [flag, text] if flag == "--sanitized" => (false, text.clone()),
+        [text] => (true, text.clone()),
+        _ => return Err(USAGE.into()),
+    };
+    if text.trim().is_empty() {
+        return Err("route text must be non-empty".to_string());
+    }
+    Ok((sensitive, text))
+}
 
 fn run(args: &[String]) -> Result<(), String> {
     let (dir, rest) = match args {
@@ -119,6 +138,39 @@ fn run(args: &[String]) -> Result<(), String> {
                 println!("  {cat:<18} -> {dest:?}");
             }
             println!("test sensitive_data_never_reaches_muse ... ok");
+        }
+        [c, rest @ ..] if c == "route" => {
+            let (sensitive, text) = parse_route_args(rest)?;
+            let local = ancientos_router::local_llm::LocalLlmClient::from_env();
+            let spark = ancientos_router::muse::MuseClient::from_env();
+            let wonder = ancientos_router::MockClient(ancientos_router::Destination::MuseWonder);
+            let backends = Backends {
+                local: &local,
+                muse_spark: &spark,
+                muse_wonder: &wonder,
+            };
+            let sens = if sensitive {
+                Sensitivity::Sensitive
+            } else {
+                Sensitivity::Sanitized
+            };
+            let (dest, reply) =
+                dispatch(&backends, sens, false, &text).map_err(|e| e.to_string())?;
+            // Log the routing decision (metadata only, never the prompt text).
+            DecisionLog::open(ws.log_path())
+                .and_then(|mut l| {
+                    l.append(
+                        "route",
+                        serde_json::json!({
+                            "sensitivity": if sensitive { "sensitive" } else { "sanitized" },
+                            "to": dest,
+                            "prompt_chars": text.chars().count(),
+                        }),
+                    )
+                })
+                .map_err(|e| e.to_string())?;
+            println!("routed to {dest:?}");
+            println!("{reply}");
         }
         [c] if c == "vote-demo" => {
             let demo = ws.vote_demo(p)?;

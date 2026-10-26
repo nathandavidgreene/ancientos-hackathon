@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 unset ANCIENTOS_ALLOW_PAID
-unset META_API_KEY MODAL_LLAMA_URL X_CLIENT_ID || true
+unset META_API_KEY MODAL_LLAMA_URL ANCIENTOS_LOCAL_LLM_URL ANCIENTOS_LOCAL_LLM_MODEL X_CLIENT_ID || true
 DATA="$(mktemp -d)"
 trap 'rm -rf "$DATA"' EXIT
 usage() {

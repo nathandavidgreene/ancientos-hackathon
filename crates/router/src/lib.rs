@@ -1,9 +1,11 @@
-//! Privacy router: sensitive data stays on local Llama (Modal); only
-//! sanitized data may reach hosted Muse models via the Meta Model API.
-//! Endpoints and keys come from env vars; paid calls are off by default.
+//! Privacy router: sensitive data stays on the local Llama backend
+//! (Ollama / llama.cpp via `ANCIENTOS_LOCAL_LLM_URL`); only sanitized data
+//! may reach hosted Muse models via the Meta Model API. Endpoints and keys
+//! come from env vars; paid calls are off by default.
 use serde::Serialize;
 
 pub mod dispatch;
+pub mod local_llm;
 pub mod modal;
 pub mod muse;
 
