@@ -1,7 +1,9 @@
 //! Privacy router: sensitive data stays on local Llama (Modal); only
 //! sanitized data may reach hosted Muse models via the Meta Model API.
-//! Network clients are stubs for now; endpoints come from env vars.
+//! Endpoints and keys come from env vars; paid calls are off by default.
 use serde::Serialize;
+
+pub mod muse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Sensitivity {
@@ -23,6 +25,12 @@ pub enum RouterError {
     MissingEnv(&'static str),
     #[error("backend not implemented: {0:?}")]
     NotImplemented(Destination),
+    #[error("paid calls are disabled (set ANCIENTOS_ALLOW_PAID=1 to enable)")]
+    PaidCallsDisabled,
+    #[error("http error: {0}")]
+    Http(String),
+    #[error("bad response: {0}")]
+    BadResponse(String),
 }
 
 pub trait ModelClient {
@@ -30,12 +38,14 @@ pub trait ModelClient {
     fn complete(&self, prompt: &str) -> Result<String, RouterError>;
 }
 
-/// Config read from env: MODAL_LLAMA_URL, META_API_KEY, MUSE_MODEL.
+/// Config read from env: MODAL_LLAMA_URL, META_API_KEY, MUSE_MODEL,
+/// ANCIENTOS_ALLOW_PAID. Never holds the key itself, only whether it is set.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     pub modal_llama_url: Option<String>,
     pub meta_api_key_set: bool,
     pub muse_model: String,
+    pub allow_paid: bool,
 }
 
 impl RouterConfig {
@@ -44,7 +54,10 @@ impl RouterConfig {
         Self {
             modal_llama_url: get("MODAL_LLAMA_URL"),
             meta_api_key_set: get("META_API_KEY").is_some(),
-            muse_model: get("MUSE_MODEL").unwrap_or_else(|| "muse-spark".into()),
+            muse_model: get("MUSE_MODEL").unwrap_or_else(|| muse::DEFAULT_MODEL.into()),
+            allow_paid: std::env::var("ANCIENTOS_ALLOW_PAID")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         }
     }
 }
