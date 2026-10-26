@@ -138,6 +138,7 @@ mod tests {
             folders: None,
             label: None,
             had_note_tweet: false,
+            media: Vec::new(),
         }
     }
 

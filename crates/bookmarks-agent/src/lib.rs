@@ -4,6 +4,7 @@ pub mod callback;
 pub mod delegate;
 pub mod fixture;
 pub mod ingest;
+pub mod media;
 pub mod merge;
 pub mod oauth;
 pub mod sanitize;

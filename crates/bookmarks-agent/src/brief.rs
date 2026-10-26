@@ -46,6 +46,8 @@ pub struct BriefPick {
     /// Full post text for display only (hydrated when truncated).
     /// Never sent to the model; the prompt uses sanitized excerpts.
     pub full_text: String,
+    /// Attached media, rendered as links/thumbnails under the full text.
+    pub media: Vec<crate::media::Media>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +434,11 @@ pub fn render_markdown(
                 p.url,
                 render_blockquote(&p.full_text)
             ));
+            let media_md = crate::media::render_markdown(&p.media);
+            if !media_md.is_empty() {
+                md.push_str(&media_md);
+                md.push('\n');
+            }
         }
     }
     let (pt, ct, tt) = tokens_opt(usage);
@@ -547,6 +554,10 @@ pub fn run_full(
             .get(c.post_id.as_str())
             .map(|b| b.text.clone())
             .unwrap_or_default();
+        let media = stored
+            .get(c.post_id.as_str())
+            .map(|b| b.media.clone())
+            .unwrap_or_default();
         let pick = BriefPick {
             index: c.index,
             post_id: c.post_id.clone(),
@@ -555,6 +566,7 @@ pub fn run_full(
             topic: c.topic.clone(),
             why: why.clone(),
             full_text,
+            media,
         };
         evaluated.push((pick, verdict, why.clone()));
     }
@@ -710,6 +722,7 @@ mod tests {
                 is_foldered: None,
             }),
             had_note_tweet: false,
+            media: Vec::new(),
         }
     }
 
@@ -1097,6 +1110,66 @@ mod tests {
             "> synthetic one\n>\n> synthetic three"
         );
         assert_eq!(render_blockquote(""), ">");
+    }
+
+    #[test]
+    fn render_markdown_shows_media_block_only_for_picks_with_media() {
+        let counts = MergeCounts {
+            live: 2,
+            fixture: 0,
+            overlap: 0,
+            total: 2,
+            high_confidence: 0,
+        };
+        let with_media = BriefPick {
+            index: 1,
+            post_id: "m1".into(),
+            author: Some("syn_user".into()),
+            url: "https://x.com/i/status/m1".into(),
+            topic: "Synthetic".into(),
+            why: "synthetic why".into(),
+            full_text: "synthetic full text".into(),
+            media: vec![crate::media::Media {
+                kind: "photo".into(),
+                url: Some("https://pbs.twimg.com/media/synthetic.jpg".into()),
+                preview_url: None,
+                video_url: None,
+                alt_text: Some("synthetic alt".into()),
+            }],
+        };
+        let without_media = BriefPick {
+            index: 2,
+            post_id: "m2".into(),
+            author: None,
+            url: "https://x.com/i/status/m2".into(),
+            topic: "Synthetic".into(),
+            why: "synthetic why two".into(),
+            full_text: "synthetic plain".into(),
+            media: Vec::new(),
+        };
+        let md = render_markdown(
+            "2026-10-26",
+            std::slice::from_ref(&with_media),
+            &counts,
+            "local",
+            None,
+        );
+        let quote_pos = md.find("> synthetic full text").expect("blockquote: {md}");
+        let media_pos = md.find("**Media**").expect("media block: {md}");
+        assert!(media_pos > quote_pos, "media under blockquote: {md}");
+        assert!(
+            md.contains("https://pbs.twimg.com/media/synthetic.jpg"),
+            "{md}"
+        );
+
+        let plain = render_markdown(
+            "2026-10-26",
+            std::slice::from_ref(&without_media),
+            &counts,
+            "local",
+            None,
+        );
+        assert!(!plain.contains("**Media**"), "{plain}");
     }
 
     #[test]

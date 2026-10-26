@@ -90,6 +90,9 @@ fn merge_pair(live: &Bookmark, fixture: &Bookmark) -> Bookmark {
     let mut merged = live.clone();
     merged.label = better_label(live.label.as_ref(), fixture.label.as_ref());
     merged.folders = union_folders(live.folders.as_ref(), fixture.folders.as_ref());
+    if merged.media.is_empty() {
+        merged.media = fixture.media.clone();
+    }
     merged
 }
 
@@ -196,6 +199,7 @@ mod tests {
             folders: None,
             label: None,
             had_note_tweet: false,
+            media: Vec::new(),
         }
     }
 
@@ -329,6 +333,36 @@ mod tests {
         ];
         let out = merge(&rows, &[]);
         assert_eq!(out.counts.high_confidence, 2);
+    }
+
+    #[test]
+    fn keeps_fixture_media_when_live_has_none() {
+        let live = bm("s", "live text");
+        let mut fixture = bm("s", "fixture text");
+        fixture.media = vec![crate::media::Media {
+            kind: "photo".into(),
+            url: Some("https://pbs.twimg.com/media/synthetic.jpg".into()),
+            preview_url: None,
+            video_url: None,
+            alt_text: Some("synthetic".into()),
+        }];
+        let out = merge(std::slice::from_ref(&live), std::slice::from_ref(&fixture));
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].media, fixture.media);
+        // Live media wins when present.
+        let mut live_with = bm("s", "live text");
+        live_with.media = vec![crate::media::Media {
+            kind: "photo".into(),
+            url: Some("https://pbs.twimg.com/media/synthetic_live.jpg".into()),
+            preview_url: None,
+            video_url: None,
+            alt_text: None,
+        }];
+        let out = merge(
+            std::slice::from_ref(&live_with),
+            std::slice::from_ref(&fixture),
+        );
+        assert_eq!(out.rows[0].media, live_with.media);
     }
 
     #[test]

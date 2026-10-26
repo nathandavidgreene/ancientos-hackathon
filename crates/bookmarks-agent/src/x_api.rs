@@ -14,8 +14,12 @@ pub const ME_URL: &str = "https://api.x.com/2/users/me";
 /// Bookmarks endpoint for a user id with the fields we map.
 pub fn bookmarks_url(user_id: &str) -> String {
     format!(
-        "https://api.x.com/2/users/{user_id}/bookmarks?max_results=100\
-         &tweet.fields=note_tweet,text,created_at,author_id&expansions=author_id&user.fields=username"
+        "https://api.x.com/2/users/{}/bookmarks?max_results=100\
+         &tweet.fields=note_tweet,text,created_at,author_id,attachments&expansions=author_id,{}\
+         &media.fields={}&user.fields=username",
+        crate::oauth::url_encode(user_id),
+        crate::media::MEDIA_EXPANSION,
+        crate::media::MEDIA_FIELDS,
     )
 }
 
@@ -310,6 +314,7 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
             }
         }
     }
+    let media_index = crate::media::index_includes(value);
     let mut items = Vec::new();
     if let Some(tweets) = value.get("data").and_then(|d| d.as_array()) {
         for t in tweets {
@@ -338,6 +343,7 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
                 folders: None,
                 label: None,
                 had_note_tweet: had_note_tweet(t),
+                media: crate::media::for_tweet(t, &media_index),
             });
         }
     }
@@ -658,6 +664,27 @@ mod tests {
     }
 
     #[test]
+    fn bookmarks_url_requests_media_expansion_and_fields() {
+        let u = bookmarks_url("123");
+        assert!(u.contains(crate::media::MEDIA_EXPANSION), "{u}");
+        assert!(
+            u.contains(&format!(
+                "expansions=author_id,{}",
+                crate::media::MEDIA_EXPANSION
+            )),
+            "{u}"
+        );
+        assert!(
+            u.contains(&format!("media.fields={}", crate::media::MEDIA_FIELDS)),
+            "{u}"
+        );
+        for field in ["type", "url", "preview_image_url", "variants", "alt_text"] {
+            assert!(u.contains(field), "{field} missing in {u}");
+        }
+        assert!(u.contains("attachments"), "{u}");
+    }
+
+    #[test]
     fn parses_user_id() {
         let raw = serde_json::json!({"data": {"id": "42", "username": "me"}});
         assert_eq!(parse_user_id(&raw).unwrap(), "42");
@@ -695,6 +722,47 @@ mod tests {
         let page = parse_bookmarks_page(&serde_json::json!({"meta": {}})).unwrap();
         assert!(page.items.is_empty());
         assert_eq!(page.next_token, None);
+    }
+
+    #[test]
+    fn parses_bookmarks_page_attaches_media() {
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "m1", "text": "synthetic with media", "author_id": "u1",
+                 "attachments": {"media_keys": ["3_photo", "7_video"]}},
+                {"id": "m2", "text": "synthetic without media", "author_id": "u1"}
+            ],
+            "includes": {
+                "users": [{"id": "u1", "username": "syn_user"}],
+                "media": [
+                    {"media_key": "3_photo", "type": "photo",
+                     "url": "https://pbs.twimg.com/media/synthetic_a.jpg",
+                     "alt_text": "synthetic alt"},
+                    {"media_key": "7_video", "type": "video",
+                     "preview_image_url": "https://pbs.twimg.com/media/synthetic_thumb.jpg",
+                     "variants": [
+                        {"content_type": "video/mp4", "bit_rate": 100, "url": "https://video.twimg.com/synthetic_low.mp4"},
+                        {"content_type": "video/mp4", "bit_rate": 500, "url": "https://video.twimg.com/synthetic_high.mp4"}
+                     ]}
+                ]
+            },
+            "meta": {}
+        });
+        let page = parse_bookmarks_page(&raw).unwrap();
+        assert_eq!(page.items.len(), 2);
+        let media = &page.items[0].media;
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0].kind, "photo");
+        assert_eq!(
+            media[0].url.as_deref(),
+            Some("https://pbs.twimg.com/media/synthetic_a.jpg")
+        );
+        assert_eq!(media[1].kind, "video");
+        assert_eq!(
+            media[1].video_url.as_deref(),
+            Some("https://video.twimg.com/synthetic_high.mp4")
+        );
+        assert!(page.items[1].media.is_empty());
     }
 
     #[test]

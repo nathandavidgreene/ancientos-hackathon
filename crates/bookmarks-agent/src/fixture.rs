@@ -31,6 +31,10 @@ pub struct Bookmark {
     /// text, never truncated). Defaults to false for fixtures and old stores.
     #[serde(default)]
     pub had_note_tweet: bool,
+    /// Attached photos/videos (safe X media URLs only). Optional; absent in
+    /// older fixtures and stores.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<crate::media::Media>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -91,5 +95,16 @@ mod tests {
         let err =
             parse_jsonl("{\"post_id\":\"1\",\"url\":\"u\",\"text\":\"t\"}\nnot json").unwrap_err();
         assert!(matches!(err, FixtureError::Parse { line: 2, .. }));
+    }
+
+    #[test]
+    fn old_lines_without_media_round_trip_without_media_key() {
+        let line =
+            r#"{"post_id":"old1","url":"https://x.com/i/status/old1","text":"synthetic old"}"#;
+        let rows = parse_jsonl(line).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].media.is_empty());
+        let back = serde_json::to_string(&rows[0]).unwrap();
+        assert!(!back.contains("media"), "{back}");
     }
 }
