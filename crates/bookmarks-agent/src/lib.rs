@@ -10,6 +10,7 @@ pub mod merge;
 pub mod oauth;
 pub mod sanitize;
 pub mod token_store;
+pub mod try_it;
 pub mod unroll;
 pub mod vote;
 pub mod x_api;

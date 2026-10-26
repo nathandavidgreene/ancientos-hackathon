@@ -1,7 +1,8 @@
 //! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`
 //! | `brief [--fixture PATH] [--out PATH]`
 //! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
-//! | `delegate <post_id>` | `ideas` | `triage <id> <adopt|park|drop>`.
+//! | `delegate <post_id>` | `ideas` | `triage <id> <adopt|park|drop>`
+//! | `tried <post_id> <yes|no|later> [note]` | `try-pending`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
@@ -9,13 +10,16 @@
 //! records a feedback verdict; `delegate` summarizes one thread with Muse
 //! Spark into inspiration.md (paid, off by default). `ideas` lists idea
 //! cards due for triage; `triage` records an adopt/park/drop decision.
+//! `tried` records a try-it follow-up; `try-pending` lists tagged posts
+//! without a yes/no follow-up yet.
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    brief, callback, delegate, fixture, idea_card, ingest, merge, oauth, token_store, vote, x_api,
+    brief, callback, delegate, fixture, idea_card, ingest, merge, oauth, token_store, try_it, vote,
+    x_api,
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | ideas | triage <id> <adopt|park|drop>";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -324,6 +328,39 @@ fn cmd_triage(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_tried(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let tried: try_it::Tried = args[1].parse()?;
+    let note = if args.len() > 2 {
+        let joined = args[2..].join(" ");
+        if joined.trim().is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    } else {
+        None
+    };
+    let log_path = brief::decision_log_path()?;
+    try_it::run_tried(&args[0], tried, note.as_deref(), &log_path)?;
+    println!("recorded {} for {}", tried.as_str(), args[0]);
+    Ok(())
+}
+
+fn cmd_try_pending(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    for id in try_it::pending_followups(&log) {
+        println!("{id}");
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -336,6 +373,8 @@ fn main() {
         Some("delegate") => cmd_delegate(&args[1..]),
         Some("ideas") => cmd_ideas(&args[1..]),
         Some("triage") => cmd_triage(&args[1..]),
+        Some("tried") => cmd_tried(&args[1..]),
+        Some("try-pending") => cmd_try_pending(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {

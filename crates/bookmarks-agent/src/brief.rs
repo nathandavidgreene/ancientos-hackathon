@@ -425,8 +425,10 @@ pub fn render_markdown(
                 .as_deref()
                 .map(|a| format!("@{a}"))
                 .unwrap_or_else(|| "unknown".to_string());
+            let tagged = crate::try_it::classify_text(&p.topic, &p.full_text).is_some();
+            let marker = if tagged { " [TRY IT]" } else { "" };
             md.push_str(&format!(
-                "## {}. **{}**\n- Author: {}\n- Topic: {}\n- Link: {}\n\n{}\n\n",
+                "## {}. **{}**{marker}\n- Author: {}\n- Topic: {}\n- Link: {}\n\n{}\n\n",
                 i + 1,
                 p.why,
                 author,
@@ -434,6 +436,16 @@ pub fn render_markdown(
                 p.url,
                 render_blockquote(&p.full_text)
             ));
+            if tagged {
+                let steps = crate::try_it::extract_steps(&p.full_text);
+                if !steps.is_empty() {
+                    md.push_str("**Steps**\n");
+                    for (n, step) in steps.iter().enumerate() {
+                        md.push_str(&format!("{}. {step}\n", n + 1));
+                    }
+                    md.push('\n');
+                }
+            }
             let media_md = crate::media::render_markdown(&p.media);
             if !media_md.is_empty() {
                 md.push_str(&media_md);
@@ -689,6 +701,17 @@ pub fn run_full(
         serde_json::json!({"requested": requested, "hydrated": hydrated}),
     )
     .map_err(|e| e.to_string())?;
+    // Tag hands-on picks for follow-up: one `try_it.shown` entry per
+    // rendered tagged pick (post id only, never text).
+    for p in &picks {
+        if crate::try_it::classify_text(&p.topic, &p.full_text).is_some() {
+            log.append(
+                crate::try_it::SHOWN_KIND,
+                serde_json::json!({"post_id": p.post_id}),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
 
     let markdown = render_markdown(date, &picks, &merged.counts, &model_id, usage.as_ref());
     Ok(BriefResult {
