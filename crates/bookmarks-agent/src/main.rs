@@ -1,11 +1,13 @@
-//! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`.
+//! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`
+//! | `brief [--fixture PATH] [--out PATH]`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
-//! bookmarks into the local JSONL store (paid, off by default). Tokens, codes,
-//! and verifiers are never printed.
-use bookmarks_agent::{callback, fixture, ingest, oauth, token_store, x_api};
+//! bookmarks into the local JSONL store (paid, off by default). `brief`
+//! merges the live store with a fixture and prints a daily brief. Tokens,
+//! codes, and verifiers are never printed.
+use bookmarks_agent::{brief, callback, fixture, ingest, merge, oauth, token_store, x_api};
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH]";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -111,6 +113,58 @@ fn cmd_load(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn parse_brief_args(args: &[String]) -> Result<(Option<String>, Option<String>), String> {
+    let mut fixture: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(v) = arg.strip_prefix("--fixture=") {
+            if v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            fixture = Some(v.to_string());
+            i += 1;
+        } else if arg == "--fixture" {
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            fixture = Some(v.clone());
+            i += 1;
+        } else if let Some(v) = arg.strip_prefix("--out=") {
+            if v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            out = Some(v.to_string());
+            i += 1;
+        } else if arg == "--out" {
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            out = Some(v.clone());
+            i += 1;
+        } else {
+            return Err(USAGE.to_string());
+        }
+    }
+    Ok((fixture, out))
+}
+
+fn cmd_brief(args: &[String]) -> Result<(), String> {
+    let (fixture, out) = parse_brief_args(args)?;
+    let merged = merge::load_merged(fixture.as_deref())?;
+    let client = ancientos_router::muse::MuseClient::from_env()
+        .with_max_completion_tokens(700)
+        .with_reasoning_effort("low");
+    let log_path = brief::decision_log_path()?;
+    let date = brief::current_date();
+    let result = brief::run(&merged, &client, &log_path, &date)?;
+    print!("{}", result.markdown);
+    if let Some(path) = out {
+        std::fs::write(&path, &result.markdown)
+            .map_err(|e| format!("brief write failed for {path}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -118,6 +172,7 @@ fn main() {
         Some("sync") => cmd_sync(&args[1..]),
         Some("load") => cmd_load(&args[1..]),
         Some("auth-url") if args.len() == 1 => cmd_auth_url(),
+        Some("brief") => cmd_brief(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {
