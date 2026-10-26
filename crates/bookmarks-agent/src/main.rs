@@ -4,7 +4,7 @@
 //! | `delegate <post_id>` | `deeper <post_id> [--offline <fixture.jsonl>]`
 //! | `ideas` | `triage <id> <adopt|park|drop>`
 //! | `tried <post_id> <yes|no|later> [note]` | `try-pending`
-//! | `digest [--now SECS]`.
+//! | `digest [--now SECS] [--dry-run]`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
@@ -17,7 +17,8 @@
 //! adopt/park/drop decision.
 //! `tried` records a try-it follow-up; `try-pending` lists tagged posts
 //! without a yes/no follow-up yet. `digest` prints the weekly idea-card
-//! triage digest plus "did you try it?" nudges (read-only).
+//! triage digest plus "did you try it?" nudges, recording the showing
+//! unless `--dry-run` or `--now` is given.
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
     brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, merge, oauth,
@@ -25,7 +26,7 @@ use bookmarks_agent::{
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS]";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run]";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -411,40 +412,77 @@ fn cmd_try_pending(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `--now` override (unix secs) for tests/demo; `None` means system clock.
-fn parse_digest_args(args: &[String]) -> Result<Option<u64>, String> {
-    if args.is_empty() {
-        return Ok(None);
-    }
-    if args.len() == 2 && args[0] == "--now" {
-        return args[1]
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| "invalid --now value (want unix secs)".to_string());
-    }
-    if args.len() == 1 {
-        if let Some(v) = args[0].strip_prefix("--now=") {
-            return v
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| "invalid --now value (want unix secs)".to_string());
+/// Parsed `digest` args: `--now` override (unix secs) plus `--dry-run`.
+#[derive(Debug)]
+struct DigestArgs {
+    now: Option<u64>,
+    dry_run: bool,
+}
+
+/// `--now` override (unix secs) for tests/demo plus `--dry-run`, in any
+/// order; `now: None` means the system clock. Duplicate `--now`/`--dry-run`
+/// or unknown args are usage errors.
+fn parse_digest_args(args: &[String]) -> Result<DigestArgs, String> {
+    let mut now: Option<u64> = None;
+    let mut now_seen = false;
+    let mut dry_run = false;
+    let mut dry_seen = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(v) = arg.strip_prefix("--now=") {
+            if now_seen {
+                return Err(USAGE.to_string());
+            }
+            now_seen = true;
+            now = Some(
+                v.parse::<u64>()
+                    .map_err(|_| "invalid --now value (want unix secs)".to_string())?,
+            );
+            i += 1;
+        } else if arg == "--now" {
+            if now_seen {
+                return Err(USAGE.to_string());
+            }
+            now_seen = true;
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            now = Some(
+                v.parse::<u64>()
+                    .map_err(|_| "invalid --now value (want unix secs)".to_string())?,
+            );
+            i += 1;
+        } else if arg == "--dry-run" {
+            if dry_seen {
+                return Err(USAGE.to_string());
+            }
+            dry_seen = true;
+            dry_run = true;
+            i += 1;
+        } else {
+            return Err(USAGE.to_string());
         }
     }
-    Err(USAGE.to_string())
+    Ok(DigestArgs { now, dry_run })
 }
 
 fn cmd_digest(args: &[String]) -> Result<(), String> {
-    let now = match parse_digest_args(args)? {
+    let parsed = parse_digest_args(args)?;
+    let now_override = parsed.now.is_some();
+    let now = match parsed.now {
         Some(n) => n,
         None => idea_card::now_secs(),
     };
     let cards = idea_card::load(&idea_card::idea_cards_path()?)?;
     let log_path = brief::decision_log_path()?;
-    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let pending = try_it::pending_followups(&log);
     let d = digest::weekly_digest(&cards, &pending, &entries, now);
     print!("{}", digest::render(&d));
+    if digest::should_record(parsed.dry_run, now_override) {
+        digest::record_shown(&mut log, now)?;
+    }
     Ok(())
 }
 
@@ -543,20 +581,77 @@ mod tests {
     #[test]
     fn digest_now_parses_space_and_equals_forms() {
         let none: Vec<String> = vec![];
-        assert_eq!(parse_digest_args(&none).unwrap(), None);
-        assert_eq!(
-            parse_digest_args(&["--now".into(), "123".into()]).unwrap(),
-            Some(123)
-        );
-        assert_eq!(parse_digest_args(&["--now=456".into()]).unwrap(), Some(456));
+        let parsed = parse_digest_args(&none).unwrap();
+        assert_eq!(parsed.now, None);
+        assert!(!parsed.dry_run);
+        let parsed = parse_digest_args(&["--now".into(), "123".into()]).unwrap();
+        assert_eq!(parsed.now, Some(123));
+        assert!(!parsed.dry_run);
+        let parsed = parse_digest_args(&["--now=456".into()]).unwrap();
+        assert_eq!(parsed.now, Some(456));
+        assert!(!parsed.dry_run);
         for bad in [
             vec!["--now".to_string()],
+            vec!["extra".to_string(), "args".to_string(), "here".to_string()],
+        ] {
+            assert_eq!(parse_digest_args(&bad).unwrap_err(), USAGE, "{bad:?}");
+        }
+        for bad in [
             vec!["--now".to_string(), "yesterday".to_string()],
             vec!["--now=".to_string()],
             vec!["--now".to_string(), "-1".to_string()],
-            vec!["extra".to_string(), "args".to_string(), "here".to_string()],
         ] {
-            assert!(parse_digest_args(&bad).is_err(), "{bad:?}");
+            assert_eq!(
+                parse_digest_args(&bad).unwrap_err(),
+                "invalid --now value (want unix secs)",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn digest_dry_run_parses_alone_and_with_now_either_order() {
+        let parsed = parse_digest_args(&["--dry-run".into()]).unwrap();
+        assert_eq!(parsed.now, None);
+        assert!(parsed.dry_run);
+        for args in [
+            vec!["--now", "123", "--dry-run"],
+            vec!["--dry-run", "--now", "123"],
+            vec!["--now=456", "--dry-run"],
+            vec!["--dry-run", "--now=456"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let parsed = parse_digest_args(&owned).unwrap();
+            assert!(parsed.dry_run, "{args:?}");
+            assert!(parsed.now.is_some(), "{args:?}");
+        }
+        let space: Vec<String> = ["--dry-run", "--now", "123"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_digest_args(&space).unwrap().now, Some(123));
+        let equals: Vec<String> = ["--dry-run", "--now=456"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_digest_args(&equals).unwrap().now, Some(456));
+    }
+
+    #[test]
+    fn digest_rejects_duplicates_and_unknown_args() {
+        for bad in [
+            vec!["--dry-run", "--dry-run"],
+            vec!["--now", "1", "--now", "2"],
+            vec!["--now=1", "--now=2"],
+            vec!["--now", "1", "--now=2"],
+            vec!["--now=1", "--dry-run", "--dry-run"],
+            vec!["--dryrun"],
+            vec!["--dry-run=x"],
+            vec!["digest"],
+            vec!["123"],
+        ] {
+            let owned: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert_eq!(parse_digest_args(&owned).unwrap_err(), USAGE, "{bad:?}");
         }
     }
 }

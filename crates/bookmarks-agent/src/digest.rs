@@ -10,7 +10,7 @@
 //! nagging without evidence of age); timestamps in the future never trigger.
 
 use crate::idea_card::{IdeaCard, Status};
-use ancientos_core::log::Entry;
+use ancientos_core::log::{DecisionLog, Entry};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Seconds in the weekly digest cadence.
@@ -29,6 +29,20 @@ pub fn digest_due(last_digest_at: Option<u64>, now: u64) -> bool {
         None => true,
         Some(last) => last.saturating_add(WEEK_SECS) <= now,
     }
+}
+
+/// True when a `digest` run records its showing: a real run only, with
+/// no `--dry-run` and no `--now` override (a `--now` clock is a test/demo
+/// clock, so it never records).
+pub fn should_record(dry_run: bool, now_override: bool) -> bool {
+    !dry_run && !now_override
+}
+
+/// Append a [`DIGEST_KIND`] record that the digest was shown at `now`
+/// (unix secs), resetting the weekly-due check. Metadata only.
+pub fn record_shown(log: &mut DecisionLog, now: u64) -> Result<Entry, String> {
+    log.append(DIGEST_KIND, serde_json::json!({ DIGEST_AT_FIELD: now }))
+        .map_err(|e| e.to_string())
 }
 
 /// Latest `at` timestamp across [`DIGEST_KIND`] entries; entries with a
@@ -311,6 +325,57 @@ mod tests {
         assert_eq!(last_digest_at(&[]), None);
         let entries = digest_entries(&[100, 300, 200]);
         assert_eq!(last_digest_at(&entries), Some(300));
+    }
+
+    #[test]
+    fn should_record_truth_table() {
+        assert!(should_record(false, false), "real run records");
+        assert!(!should_record(true, false), "--dry-run never records");
+        assert!(!should_record(false, true), "--now clock never records");
+        assert!(!should_record(true, true));
+    }
+
+    #[test]
+    fn record_shown_resets_weekly_due_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        let entry = record_shown(&mut log, NOW).unwrap();
+        assert_eq!(entry.kind, DIGEST_KIND);
+        assert_eq!(entry.payload, serde_json::json!({"at": NOW}));
+        let entries = DecisionLog::open(&path).unwrap().verify().unwrap();
+        let last = last_digest_at(&entries);
+        assert_eq!(last, Some(NOW));
+        assert!(!digest_due(last, NOW + WEEK_SECS - 1));
+        assert!(digest_due(last, NOW + WEEK_SECS), "exactly 7 days is due");
+    }
+
+    #[test]
+    fn dry_run_appends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        // Mirror cmd_digest's gate: only real runs append.
+        for (dry_run, now_override) in [(true, false), (false, true), (true, true)] {
+            if should_record(dry_run, now_override) {
+                record_shown(&mut log, NOW).unwrap();
+            }
+        }
+        assert!(log.verify_or_empty().unwrap().is_empty());
+    }
+
+    #[test]
+    fn two_records_max_wins_either_order() {
+        for order in [[NOW, NOW - 100], [NOW - 100, NOW]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("d.jsonl");
+            let mut log = DecisionLog::open(&path).unwrap();
+            for at in order {
+                record_shown(&mut log, at).unwrap();
+            }
+            let entries = log.verify_or_empty().unwrap();
+            assert_eq!(last_digest_at(&entries), Some(NOW), "{order:?}");
+        }
     }
 
     #[test]
