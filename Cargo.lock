@@ -111,6 +111,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-runner"
+version = "0.1.0"
+dependencies = [
+ "ancientos-core",
+ "ancientos-router",
+ "bookmarks-agent",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

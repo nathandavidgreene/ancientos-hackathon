@@ -5,3 +5,4 @@
 /data/
 *.jsonl
 !fixtures/sample_bookmarks.jsonl
+!fixtures/demo/synthetic_bookmarks.jsonl
