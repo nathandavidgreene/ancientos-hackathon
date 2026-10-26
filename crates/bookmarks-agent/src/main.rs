@@ -3,7 +3,8 @@
 //! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
 //! | `delegate <post_id>` | `deeper <post_id> [--offline <fixture.jsonl>]`
 //! | `ideas` | `triage <id> <adopt|park|drop>`
-//! | `tried <post_id> <yes|no|later> [note]` | `try-pending`.
+//! | `tried <post_id> <yes|no|later> [note]` | `try-pending`
+//! | `digest [--now SECS]`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
@@ -15,15 +16,16 @@
 //! `ideas` lists idea cards due for triage; `triage` records an
 //! adopt/park/drop decision.
 //! `tried` records a try-it follow-up; `try-pending` lists tagged posts
-//! without a yes/no follow-up yet.
+//! without a yes/no follow-up yet. `digest` prints the weekly idea-card
+//! triage digest plus "did you try it?" nudges (read-only).
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    brief, callback, deeper, delegate, fixture, idea_card, ingest, merge, oauth, token_store,
-    try_it, vote, x_api,
+    brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, merge, oauth,
+    token_store, try_it, vote, x_api,
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS]";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -409,6 +411,43 @@ fn cmd_try_pending(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `--now` override (unix secs) for tests/demo; `None` means system clock.
+fn parse_digest_args(args: &[String]) -> Result<Option<u64>, String> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    if args.len() == 2 && args[0] == "--now" {
+        return args[1]
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| "invalid --now value (want unix secs)".to_string());
+    }
+    if args.len() == 1 {
+        if let Some(v) = args[0].strip_prefix("--now=") {
+            return v
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| "invalid --now value (want unix secs)".to_string());
+        }
+    }
+    Err(USAGE.to_string())
+}
+
+fn cmd_digest(args: &[String]) -> Result<(), String> {
+    let now = match parse_digest_args(args)? {
+        Some(n) => n,
+        None => idea_card::now_secs(),
+    };
+    let cards = idea_card::load(&idea_card::idea_cards_path()?)?;
+    let log_path = brief::decision_log_path()?;
+    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
+    let pending = try_it::pending_followups(&log);
+    let d = digest::weekly_digest(&cards, &pending, &entries, now);
+    print!("{}", digest::render(&d));
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -424,6 +463,7 @@ fn main() {
         Some("triage") => cmd_triage(&args[1..]),
         Some("tried") => cmd_tried(&args[1..]),
         Some("try-pending") => cmd_try_pending(&args[1..]),
+        Some("digest") => cmd_digest(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {
@@ -498,5 +538,25 @@ mod tests {
         assert_eq!(status_str(idea_card::Status::Parked), "parked");
         assert_eq!(status_str(idea_card::Status::Dropped), "dropped");
         assert_eq!(status_str(idea_card::Status::New), "new");
+    }
+
+    #[test]
+    fn digest_now_parses_space_and_equals_forms() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_digest_args(&none).unwrap(), None);
+        assert_eq!(
+            parse_digest_args(&["--now".into(), "123".into()]).unwrap(),
+            Some(123)
+        );
+        assert_eq!(parse_digest_args(&["--now=456".into()]).unwrap(), Some(456));
+        for bad in [
+            vec!["--now".to_string()],
+            vec!["--now".to_string(), "yesterday".to_string()],
+            vec!["--now=".to_string()],
+            vec!["--now".to_string(), "-1".to_string()],
+            vec!["extra".to_string(), "args".to_string(), "here".to_string()],
+        ] {
+            assert!(parse_digest_args(&bad).is_err(), "{bad:?}");
+        }
     }
 }

@@ -10,7 +10,9 @@
 //! Fails closed: unset URL, unreachable host, non-2xx status, or a
 //! malformed response all return [`RouterError`]. Sensitive content must
 //! never fall back to Muse on any of these errors — dispatch routes to
-//! this client for the local slot and propagates the error.
+//! this client for the local slot and propagates the error. Every chat call
+//! starts with a cheap [`LocalLlmClient::health_check`] preflight so a dead
+//! server fails fast with the `scripts/local_llm.sh ensure` fix hint.
 use crate::{Destination, ModelClient, RouterError};
 
 /// Env var carrying the local server base URL (e.g. `http://localhost:11434`).
@@ -21,6 +23,8 @@ pub const MODEL_ENV: &str = "ANCIENTOS_LOCAL_LLM_MODEL";
 pub const DEFAULT_MODEL: &str = "llama3.2:1b";
 /// Request timeout: local models on CPU can be slow.
 const TIMEOUT_SECS: u64 = 120;
+/// Health-preflight timeout: the check before sensitive dispatch must stay cheap.
+const HEALTH_TIMEOUT_SECS: u64 = 3;
 
 /// Local LLM client. Holds no secrets, so `Debug` is safe to print.
 #[derive(Debug, Clone)]
@@ -80,6 +84,36 @@ impl LocalLlmClient {
         })
     }
 
+    /// Health preflight: GET `{base}/api/tags` (Ollama; falls back to
+    /// `/v1/models` on 404 for llama.cpp servers) with a short timeout.
+    /// `Ok(())` when the server answers 2xx; otherwise a fail-closed error
+    /// naming the fix script and stating sensitive data was not sent
+    /// elsewhere. Sends no prompt.
+    pub fn health_check(&self) -> Result<(), RouterError> {
+        let base = self
+            .base_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or(RouterError::MissingEnv(URL_ENV))?;
+        let trimmed = base.trim_end_matches('/');
+        let api_base = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+        let tags = format!("{api_base}/api/tags");
+        let models = if trimmed.ends_with("/v1") {
+            format!("{trimmed}/models")
+        } else {
+            format!("{trimmed}/v1/models")
+        };
+        match get_health(&tags) {
+            HealthGet::Ok => Ok(()),
+            HealthGet::NotFound => match get_health(&models) {
+                HealthGet::Ok => Ok(()),
+                HealthGet::NotFound => Err(unavailable(&models, "http status 404")),
+                HealthGet::Failed(reason) => Err(unavailable(&models, &reason)),
+            },
+            HealthGet::Failed(reason) => Err(unavailable(&tags, &reason)),
+        }
+    }
+
     /// Parse an OpenAI-compatible chat completion value.
     /// Reads `choices[0].message.content` as a string; anything else is a
     /// `BadResponse` (fail closed, never an empty guess).
@@ -105,6 +139,9 @@ impl ModelClient for LocalLlmClient {
     }
 
     fn complete(&self, prompt: &str) -> Result<String, RouterError> {
+        // Cheap preflight before sensitive dispatch: fail closed with the
+        // fix hint instead of attempting the chat call against a dead server.
+        self.health_check()?;
         let endpoint = self.endpoint()?;
         let body = self.request_body(prompt);
         let raw: serde_json::Value = ureq::post(&endpoint)
@@ -119,6 +156,35 @@ impl ModelClient for LocalLlmClient {
 
 fn get_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Outcome of a health GET. A small enum (not `ureq::Error`) so the
+/// `Err` branch stays under clippy's `result_large_err` limit.
+enum HealthGet {
+    Ok,
+    NotFound,
+    Failed(String),
+}
+
+/// Plain GET succeeding only on 2xx; the body is discarded.
+fn get_health(url: &str) -> HealthGet {
+    match ureq::get(url)
+        .timeout(std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS))
+        .call()
+    {
+        Ok(_) => HealthGet::Ok,
+        Err(ureq::Error::Status(404, _)) => HealthGet::NotFound,
+        Err(ureq::Error::Status(code, _)) => HealthGet::Failed(format!("http status {code}")),
+        Err(other) => HealthGet::Failed(other.to_string()),
+    }
+}
+
+/// Fail-closed unavailability error: names the URL and reason, points at the
+/// fix script, and states sensitive data was not sent elsewhere.
+fn unavailable(url: &str, reason: &str) -> RouterError {
+    RouterError::Http(format!(
+        "local LLM unavailable at {url}: {reason}; run scripts/local_llm.sh ensure \u{2014} sensitive data was NOT sent elsewhere"
+    ))
 }
 
 fn map_ureq_error(e: ureq::Error) -> RouterError {
@@ -140,82 +206,122 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// One-shot mock HTTP server: captures the request body, replies once
-    /// with `status` + `body`, then exits. Returns the base URL, the
-    /// captured request bodies, and the server thread handle.
-    fn mock_server(
-        status: u16,
-        body: &str,
-    ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    /// Captured requests: `(request line, body)` pairs in arrival order.
+    type Seen = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Mock HTTP server: serves exactly `count` connections, replying per
+    /// `respond(path)`, then exits. Returns the base URL, the captured
+    /// requests, and the server thread handle.
+    fn mock_server_fn(
+        respond: impl Fn(&str) -> (u16, String) + Send + 'static,
+        count: usize,
+    ) -> (String, Seen, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking mock server");
         let url = format!("http://{}", listener.local_addr().expect("mock addr"));
-        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let seen_thread = Arc::clone(&seen);
-        let body = body.to_string();
         let handle = std::thread::spawn(move || {
-            let Ok((stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut stream = stream;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("read timeout");
-            // Read headers line by line until the blank line.
-            let mut raw = Vec::new();
-            let mut buf = [0u8; 1];
-            let mut content_length = 0usize;
-            let mut line = Vec::new();
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        raw.push(buf[0]);
-                        line.push(buf[0]);
-                        if buf[0] == b'\n' {
-                            let text = String::from_utf8_lossy(&line).to_lowercase();
-                            if text.starts_with("content-length:") {
-                                content_length = text
-                                    .split(':')
-                                    .nth(1)
-                                    .and_then(|v| v.trim().parse().ok())
-                                    .unwrap_or(0);
+            for _ in 0..count {
+                // Deadline so a client bug fails the test instead of hanging it.
+                let start = std::time::Instant::now();
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break Some(stream),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if start.elapsed() > Duration::from_secs(10) {
+                                break None;
                             }
-                            if line == b"\r\n" || line == b"\n" {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                let Some(mut stream) = stream else {
+                    return;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                // Read headers line by line until the blank line.
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 1];
+                let mut content_length = 0usize;
+                let mut line = Vec::new();
+                let mut request_line = String::new();
+                let mut first = true;
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            raw.push(buf[0]);
+                            line.push(buf[0]);
+                            if buf[0] == b'\n' {
+                                if first {
+                                    request_line =
+                                        String::from_utf8_lossy(&line).trim().to_string();
+                                    first = false;
+                                }
+                                let text = String::from_utf8_lossy(&line).to_lowercase();
+                                if text.starts_with("content-length:") {
+                                    content_length = text
+                                        .split(':')
+                                        .nth(1)
+                                        .and_then(|v| v.trim().parse().ok())
+                                        .unwrap_or(0);
+                                }
+                                if line == b"\r\n" || line == b"\n" {
+                                    break;
+                                }
+                                line.clear();
+                            }
+                            if raw.len() > 65536 {
                                 break;
                             }
-                            line.clear();
-                        }
-                        if raw.len() > 65536 {
-                            break;
                         }
                     }
                 }
-            }
-            let mut rest = vec![0u8; content_length.min(1 << 20)];
-            let mut filled = 0;
-            while filled < rest.len() {
-                match stream.read(&mut rest[filled..]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => filled += n,
+                let mut rest = vec![0u8; content_length.min(1 << 20)];
+                let mut filled = 0;
+                while filled < rest.len() {
+                    match stream.read(&mut rest[filled..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => filled += n,
+                    }
                 }
+                rest.truncate(filled);
+                seen_thread.lock().expect("seen lock").push((
+                    request_line.clone(),
+                    String::from_utf8_lossy(&rest).into_owned(),
+                ));
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                let (status, body) = respond(path);
+                let reason = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Error",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
             }
-            rest.truncate(filled);
-            seen_thread
-                .lock()
-                .expect("seen lock")
-                .push(String::from_utf8_lossy(&rest).into_owned());
-            let reason = match status {
-                200 => "OK",
-                500 => "Internal Server Error",
-                _ => "Error",
-            };
-            let resp = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(resp.as_bytes());
         });
         (url, seen, handle)
+    }
+
+    /// Constant-response mock server serving exactly `count` connections.
+    fn mock_server(
+        status: u16,
+        body: &str,
+        count: usize,
+    ) -> (String, Seen, std::thread::JoinHandle<()>) {
+        let body = body.to_string();
+        mock_server_fn(move |_| (status, body.clone()), count)
     }
 
     /// A base URL with nothing listening (connection refused, fast).
@@ -231,15 +337,27 @@ mod tests {
 
     #[test]
     fn success_posts_openai_body_and_returns_content() {
-        let (url, seen, handle) = mock_server(200, OK_BODY);
+        let (url, seen, handle) = mock_server(200, OK_BODY, 2);
         let client = LocalLlmClient::new(Some(url), "test-model");
         assert_eq!(client.destination(), Destination::LocalLlama);
         let out = client.complete("private prompt").expect("mock success");
         assert_eq!(out, "hello local");
         handle.join().expect("server thread");
-        let bodies = seen.lock().expect("seen lock");
-        assert_eq!(bodies.len(), 1);
-        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).expect("request is json");
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2);
+        // Health preflight first, chat call second.
+        assert!(
+            seen[0].0.starts_with("GET /api/tags "),
+            "preflight: {}",
+            seen[0].0
+        );
+        assert!(seen[0].1.is_empty(), "preflight sends no prompt");
+        assert!(
+            seen[1].0.starts_with("POST /v1/chat/completions "),
+            "chat: {}",
+            seen[1].0
+        );
+        let sent: serde_json::Value = serde_json::from_str(&seen[1].1).expect("request is json");
         assert_eq!(sent["model"], "test-model");
         assert_eq!(sent["messages"][0]["role"], "user");
         assert_eq!(sent["messages"][0]["content"], "private prompt");
@@ -250,17 +368,22 @@ mod tests {
     fn unreachable_host_fails_closed() {
         let client = LocalLlmClient::new(Some(closed_url()), DEFAULT_MODEL);
         let err = client.complete("private").unwrap_err();
-        assert!(matches!(err, RouterError::Http(_)), "unexpected: {err:?}");
+        let msg = err.to_string();
+        assert!(matches!(err, RouterError::Http(_)), "unexpected: {msg}");
+        assert!(msg.contains("local LLM unavailable at"), "{msg}");
+        assert!(msg.contains("scripts/local_llm.sh ensure"), "{msg}");
+        assert!(msg.contains("NOT sent elsewhere"), "{msg}");
     }
 
     #[test]
     fn http_500_fails_closed() {
-        let (url, seen, handle) = mock_server(500, r#"{"error":"boom"}"#);
+        let (url, seen, handle) = mock_server(500, r#"{"error":"boom"}"#, 1);
         let client = LocalLlmClient::new(Some(url), DEFAULT_MODEL);
         let err = client.complete("private").unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, RouterError::Http(_)), "unexpected: {msg}");
         assert!(msg.contains("500"), "status in message: {msg}");
+        assert!(msg.contains("scripts/local_llm.sh ensure"), "{msg}");
         handle.join().expect("server thread");
         assert_eq!(seen.lock().expect("seen lock").len(), 1);
     }
@@ -284,13 +407,110 @@ mod tests {
             );
         }
         // Malformed over the wire also errors (not an empty guess).
-        let (url, _, handle) = mock_server(200, r#"{"choices":[]}"#);
+        let (url, _, handle) = mock_server(200, r#"{"choices":[]}"#, 2);
         let client = LocalLlmClient::new(Some(url), DEFAULT_MODEL);
         assert!(matches!(
             client.complete("private"),
             Err(RouterError::BadResponse(_))
         ));
         handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn health_ok_on_tags_2xx() {
+        let (url, seen, handle) = mock_server(200, r#"{"models":[{"name":"llama3.2:1b"}]}"#, 1);
+        let client = LocalLlmClient::new(Some(url), DEFAULT_MODEL);
+        assert!(client.health_check().is_ok());
+        handle.join().expect("server thread");
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].0.starts_with("GET /api/tags "),
+            "health path: {}",
+            seen[0].0
+        );
+        assert!(seen[0].1.is_empty(), "health sends no prompt");
+    }
+
+    #[test]
+    fn health_down_fails_closed_with_fix_hint() {
+        let url = closed_url();
+        let client = LocalLlmClient::new(Some(url.clone()), DEFAULT_MODEL);
+        let err = client.health_check().unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, RouterError::Http(_)), "unexpected: {msg}");
+        assert!(msg.contains(&format!("{url}/api/tags")), "{msg}");
+        assert!(msg.contains("scripts/local_llm.sh ensure"), "{msg}");
+        assert!(msg.contains("NOT sent elsewhere"), "{msg}");
+    }
+
+    #[test]
+    fn health_500_fails_closed() {
+        let (url, _, handle) = mock_server(500, r#"{"error":"boom"}"#, 1);
+        let client = LocalLlmClient::new(Some(url), DEFAULT_MODEL);
+        let err = client.health_check().unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, RouterError::Http(_)), "unexpected: {msg}");
+        assert!(msg.contains("500"), "{msg}");
+        assert!(msg.contains("scripts/local_llm.sh ensure"), "{msg}");
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn health_missing_url_fails_before_network() {
+        let client = LocalLlmClient::new(None, DEFAULT_MODEL);
+        assert!(matches!(
+            client.health_check(),
+            Err(RouterError::MissingEnv(URL_ENV))
+        ));
+    }
+
+    #[test]
+    fn health_falls_back_to_v1_models_on_404() {
+        let (url, seen, handle) = mock_server_fn(
+            |path| match path {
+                "/api/tags" => (404, "{}".to_string()),
+                "/v1/models" => (200, r#"{"data":[]}"#.to_string()),
+                other => panic!("unexpected health path: {other}"),
+            },
+            2,
+        );
+        let client = LocalLlmClient::new(Some(url), DEFAULT_MODEL);
+        assert!(client.health_check().is_ok());
+        handle.join().expect("server thread");
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].0.starts_with("GET /api/tags "), "{}", seen[0].0);
+        assert!(seen[1].0.starts_with("GET /v1/models "), "{}", seen[1].0);
+    }
+
+    #[test]
+    fn health_fallback_failure_names_models_url() {
+        let (url, _, handle) = mock_server_fn(
+            |path| match path {
+                "/api/tags" => (404, "{}".to_string()),
+                "/v1/models" => (500, "{}".to_string()),
+                other => panic!("unexpected health path: {other}"),
+            },
+            2,
+        );
+        let client = LocalLlmClient::new(Some(url.clone()), DEFAULT_MODEL);
+        let err = client.health_check().unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, RouterError::Http(_)), "unexpected: {msg}");
+        assert!(msg.contains(&format!("{url}/v1/models")), "{msg}");
+        assert!(msg.contains("500"), "{msg}");
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn health_strips_v1_suffix_for_tags_url() {
+        let (url, seen, handle) = mock_server(200, "{}", 1);
+        let client = LocalLlmClient::new(Some(format!("{url}/v1")), DEFAULT_MODEL);
+        assert!(client.health_check().is_ok());
+        handle.join().expect("server thread");
+        let seen = seen.lock().expect("seen lock");
+        assert!(seen[0].0.starts_with("GET /api/tags "), "{}", seen[0].0);
     }
 
     #[test]

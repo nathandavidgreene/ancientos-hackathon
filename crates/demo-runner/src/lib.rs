@@ -351,12 +351,11 @@ impl Workspace {
             return Err("no hands-on posts in synced store; sync first".to_string());
         }
         let mut log = self.log()?;
+        // Fixed demo clock: the log shot prints payloads, so wall time here
+        // would break byte-identical demo output.
+        let shown_at = demo_now_secs();
         for t in &tagged {
-            log.append(
-                try_it::SHOWN_KIND,
-                serde_json::json!({"post_id": t.post_id}),
-            )
-            .map_err(err)?;
+            try_it::record_shown(&mut log, &t.post_id, shown_at)?;
         }
         let pending_before = try_it::pending_followups(&log);
         let first = pending_before

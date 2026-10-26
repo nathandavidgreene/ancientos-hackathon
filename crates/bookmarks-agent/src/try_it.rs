@@ -15,6 +15,9 @@ use std::collections::BTreeSet;
 pub const SHOWN_KIND: &str = "try_it.shown";
 /// Log kind appended by [`record_followup`].
 pub const FOLLOWUP_KIND: &str = "try_it.followup";
+/// Payload field carrying the unix-secs timestamp of a [`SHOWN_KIND`] record.
+/// Older records lack it; readers treat a missing field as unknown age.
+pub const SHOWN_AT_FIELD: &str = "shown_at";
 /// Maximum steps returned by [`extract_steps`].
 pub const MAX_STEPS: usize = 8;
 /// Maximum note characters stored by [`record_followup`].
@@ -152,6 +155,25 @@ pub fn run_tried(
     }
     let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
     record_followup(&mut log, post_id, tried, note)
+}
+
+/// Append a [`SHOWN_KIND`] record with its timestamp. Metadata only:
+/// post id plus unix secs, never text.
+pub fn record_shown(log: &mut DecisionLog, post_id: &str, shown_at: u64) -> Result<Entry, String> {
+    if post_id.trim().is_empty() {
+        return Err("post id must be non-empty".to_string());
+    }
+    log.append(
+        SHOWN_KIND,
+        serde_json::json!({"post_id": post_id, "shown_at": shown_at}),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Timestamp of a [`SHOWN_KIND`] payload, if present and numeric.
+/// Records written before timestamps return `None` (compatibly ignored).
+pub fn shown_at_of(payload: &serde_json::Value) -> Option<u64> {
+    payload.get(SHOWN_AT_FIELD)?.as_u64()
 }
 
 /// Posts shown with the tag ([`SHOWN_KIND`]) that have no `yes`/`no`
@@ -999,6 +1021,35 @@ mod tests {
         assert!(followups[0].payload.get("note").is_none());
         assert_eq!(followups[1].payload["note"], "will try Sunday");
         for e in &followups {
+            assert!(e.payload.get("text").is_none(), "metadata only");
+        }
+    }
+
+    #[test]
+    fn shown_records_carry_timestamps_compatibly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        record_shown(&mut log, "p1", 1_700_000_000).unwrap();
+        // Legacy record without a timestamp still counts as shown.
+        log.append(SHOWN_KIND, serde_json::json!({"post_id": "p0"}))
+            .unwrap();
+        assert!(record_shown(&mut log, "  ", 0).is_err());
+        let log = DecisionLog::open(&path).unwrap();
+        assert_eq!(pending_followups(&log), ["p1", "p0"].map(str::to_string));
+        let entries = log.verify().unwrap();
+        assert_eq!(
+            shown_at_of(&entries[0].payload),
+            Some(1_700_000_000),
+            "timestamped record"
+        );
+        assert_eq!(shown_at_of(&entries[1].payload), None, "legacy record");
+        assert_eq!(
+            shown_at_of(&serde_json::json!({"shown_at": "yesterday"})),
+            None,
+            "non-numeric timestamp"
+        );
+        for e in entries.iter().take(2) {
             assert!(e.payload.get("text").is_none(), "metadata only");
         }
     }

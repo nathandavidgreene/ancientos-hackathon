@@ -702,14 +702,11 @@ pub fn run_full(
     )
     .map_err(|e| e.to_string())?;
     // Tag hands-on picks for follow-up: one `try_it.shown` entry per
-    // rendered tagged pick (post id only, never text).
+    // rendered tagged pick (post id plus timestamp, never text).
+    let shown_at = crate::idea_card::now_secs();
     for p in &picks {
         if crate::try_it::classify_text(&p.topic, &p.full_text).is_some() {
-            log.append(
-                crate::try_it::SHOWN_KIND,
-                serde_json::json!({"post_id": p.post_id}),
-            )
-            .map_err(|e| e.to_string())?;
+            crate::try_it::record_shown(&mut log, &p.post_id, shown_at)?;
         }
     }
 
