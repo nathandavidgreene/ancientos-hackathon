@@ -29,6 +29,8 @@ pub struct DelegateResult {
     pub search_ok: bool,
     pub post_url: String,
     pub inspiration_path: PathBuf,
+    /// Idea cards created from "worth borrowing" bullets.
+    pub idea_cards: usize,
 }
 
 /// Default inspiration path: `$ANCIENTOS_HOME/inspiration.md` (or
@@ -161,6 +163,14 @@ pub fn run_with(
     }
     let url = post_url(post_id, thread.username.as_deref());
     append_inspiration(insp_path, date, &url, &output)?;
+    let cards_path = insp_path.with_file_name(crate::idea_card::IDEA_CARDS_FILE_NAME);
+    let idea_cards = crate::idea_card::capture_from_delegate(
+        &cards_path,
+        &url,
+        &output,
+        crate::idea_card::now_secs(),
+    )?
+    .len();
     if let Some(parent) = log_path.parent() {
         if !parent.as_os_str().is_empty() {
             crate::token_store::ensure_dir_0700(parent)
@@ -198,6 +208,7 @@ pub fn run_with(
         search_ok: thread.search_ok,
         post_url: url,
         inspiration_path: insp_path.to_path_buf(),
+        idea_cards,
     })
 }
 

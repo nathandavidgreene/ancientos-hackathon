@@ -1,19 +1,21 @@
 //! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`
 //! | `brief [--fixture PATH] [--out PATH]`
 //! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
-//! | `delegate <post_id>`.
+//! | `delegate <post_id>` | `ideas` | `triage <id> <adopt|park|drop>`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
 //! merges the live store with a fixture and prints a daily brief. `vote`
 //! records a feedback verdict; `delegate` summarizes one thread with Muse
-//! Spark into inspiration.md (paid, off by default). Tokens, codes, and
-//! verifiers are never printed.
+//! Spark into inspiration.md (paid, off by default). `ideas` lists idea
+//! cards due for triage; `triage` records an adopt/park/drop decision.
+//! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    brief, callback, delegate, fixture, ingest, merge, oauth, token_store, vote, x_api,
+    brief, callback, delegate, fixture, idea_card, ingest, merge, oauth, token_store, vote, x_api,
 };
+use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id>";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | ideas | triage <id> <adopt|park|drop>";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -246,6 +248,79 @@ fn cmd_delegate(args: &[String]) -> Result<(), String> {
         println!();
     }
     println!("\nTokens: {}", res.usage.unwrap_or_default());
+    println!("Idea cards: {}", res.idea_cards);
+    Ok(())
+}
+
+fn format_idea_line(card: &idea_card::IdeaCard) -> String {
+    format!(
+        "{} {:?} {} {} {}",
+        card.id,
+        card.effort,
+        card.ancientos_mapping.join(","),
+        card.idea,
+        card.source_url
+    )
+}
+
+fn cmd_ideas(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let path = idea_card::idea_cards_path()?;
+    let cards = idea_card::list_due_for_triage(&path, idea_card::now_secs())?;
+    for card in &cards {
+        println!("{}", format_idea_line(card));
+    }
+    Ok(())
+}
+
+fn parse_triage_decision(s: &str) -> Result<idea_card::Triage, String> {
+    match s {
+        "adopt" => Ok(idea_card::Triage::Adopt),
+        "park" => Ok(idea_card::Triage::Park),
+        "drop" => Ok(idea_card::Triage::Drop),
+        _ => Err(USAGE.to_string()),
+    }
+}
+
+/// Backlog file for adopted ideas: `docs/backlog.md` unless overridden.
+fn backlog_path_for(value: &str) -> PathBuf {
+    if value.is_empty() {
+        PathBuf::from("docs/backlog.md")
+    } else {
+        PathBuf::from(value)
+    }
+}
+
+fn backlog_path() -> PathBuf {
+    backlog_path_for(&std::env::var("IDEA_BACKLOG_PATH").unwrap_or_default())
+}
+
+/// Lowercase status spelling, matching serde.
+fn status_str(status: idea_card::Status) -> &'static str {
+    match status {
+        idea_card::Status::New => "new",
+        idea_card::Status::Adopted => "adopted",
+        idea_card::Status::Parked => "parked",
+        idea_card::Status::Dropped => "dropped",
+    }
+}
+
+fn cmd_triage(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 || args[0].is_empty() || args[1].is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let decision = parse_triage_decision(&args[1])?;
+    let path = idea_card::idea_cards_path()?;
+    let card = idea_card::triage(
+        &path,
+        &backlog_path(),
+        &args[0],
+        decision,
+        idea_card::now_secs(),
+    )?;
+    println!("{}", status_str(card.status));
     Ok(())
 }
 
@@ -259,10 +334,81 @@ fn main() {
         Some("brief") => cmd_brief(&args[1..]),
         Some("vote") => cmd_vote(&args[1..]),
         Some("delegate") => cmd_delegate(&args[1..]),
+        Some("ideas") => cmd_ideas(&args[1..]),
+        Some("triage") => cmd_triage(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_card() -> idea_card::IdeaCard {
+        idea_card::IdeaCard {
+            id: "abc123".to_string(),
+            source_url: "https://x.com/i/status/1".to_string(),
+            idea: "Drag a card to approve".to_string(),
+            ancientos_mapping: vec!["gate".to_string()],
+            effort: idea_card::Effort::S,
+            status: idea_card::Status::New,
+            created_at: 100,
+            park_until: None,
+        }
+    }
+
+    #[test]
+    fn idea_line_holds_all_fields() {
+        let line = format_idea_line(&sample_card());
+        for field in [
+            "abc123",
+            "S",
+            "gate",
+            "Drag a card to approve",
+            "https://x.com/i/status/1",
+        ] {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+        assert!(!line.contains('\n'), "single line: {line}");
+    }
+
+    #[test]
+    fn triage_decision_parses_three_verbs() {
+        assert_eq!(
+            parse_triage_decision("adopt").unwrap(),
+            idea_card::Triage::Adopt
+        );
+        assert_eq!(
+            parse_triage_decision("park").unwrap(),
+            idea_card::Triage::Park
+        );
+        assert_eq!(
+            parse_triage_decision("drop").unwrap(),
+            idea_card::Triage::Drop
+        );
+        assert!(parse_triage_decision("Adopt").is_err());
+        assert!(parse_triage_decision("keep").is_err());
+        assert!(parse_triage_decision("").is_err());
+    }
+
+    #[test]
+    fn backlog_path_defaults_and_overrides() {
+        assert_eq!(backlog_path_for(""), PathBuf::from("docs/backlog.md"));
+        assert_eq!(
+            backlog_path_for("/tmp/custom.md"),
+            PathBuf::from("/tmp/custom.md")
+        );
+    }
+
+    #[test]
+    fn status_prints_lowercase() {
+        assert_eq!(status_str(idea_card::Status::Adopted), "adopted");
+        assert_eq!(status_str(idea_card::Status::Parked), "parked");
+        assert_eq!(status_str(idea_card::Status::Dropped), "dropped");
+        assert_eq!(status_str(idea_card::Status::New), "new");
     }
 }

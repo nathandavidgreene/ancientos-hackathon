@@ -3,6 +3,7 @@ pub mod brief;
 pub mod callback;
 pub mod delegate;
 pub mod fixture;
+pub mod idea_card;
 pub mod ingest;
 pub mod media;
 pub mod merge;
