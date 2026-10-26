@@ -20,7 +20,7 @@ pub struct Media {
     /// Thumbnail URL (videos and GIFs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_url: Option<String>,
-    /// Highest-bitrate mp4 variant (videos and GIFs).
+    /// Best mp4 variant (videos and GIFs): prefers 720p, excludes >1080p.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,19 +99,68 @@ fn clean_kind(s: &str) -> String {
     }
 }
 
+/// Parse the `WxH` resolution (if present) from an X video variant URL path
+/// like `/vid/avc1/1280x720/`, returning the shorter side as the "p" value.
+fn parse_p_value(url: &str) -> Option<u32> {
+    let bytes = url.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'x' || bytes[j] == b'X') {
+                let k = j + 1;
+                let mut l = k;
+                while l < bytes.len() && bytes[l].is_ascii_digit() {
+                    l += 1;
+                }
+                if l > k {
+                    if let (Ok(w), Ok(h)) = (url[i..j].parse::<u32>(), url[k..l].parse::<u32>()) {
+                        if w > 0 && h > 0 {
+                            return Some(w.min(h));
+                        }
+                    }
+                    i = l;
+                    continue;
+                }
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 fn parse_one(m: &serde_json::Value) -> Option<Media> {
     let kind = clean_kind(m.get("type")?.as_str()?);
     let get = |k: &str| m.get(k).and_then(|v| v.as_str()).and_then(safe_media_url);
     let video_url = m.get("variants").and_then(|v| v.as_array()).and_then(|vs| {
-        vs.iter()
+        let candidates: Vec<(u64, Option<u32>, String)> = vs
+            .iter()
             .filter(|v| v.get("content_type").and_then(|c| c.as_str()) == Some("video/mp4"))
             .filter_map(|v| {
                 let url = safe_media_url(v.get("url")?.as_str()?)?;
                 let br = v.get("bit_rate").and_then(|b| b.as_u64()).unwrap_or(0);
-                Some((br, url))
+                let p = parse_p_value(&url);
+                Some((br, p, url))
             })
-            .max_by_key(|(br, _)| *br)
-            .map(|(_, u)| u)
+            .filter(|(_, p, _)| p.is_none_or(|p| p <= 1080))
+            .collect();
+        candidates
+            .iter()
+            .filter(|(_, p, _)| *p == Some(720))
+            .max_by_key(|(br, _, _)| *br)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .filter(|(_, p, _)| p.is_some())
+                    .max_by_key(|(br, _, _)| *br)
+            })
+            .or_else(|| candidates.iter().max_by_key(|(br, _, _)| *br))
+            .map(|(_, _, u)| u.clone())
     });
     let media = Media {
         kind,
@@ -333,6 +382,98 @@ mod tests {
         }];
         let md = render_markdown(&video_like);
         assert!(md.contains("- Media (video):"), "{md}");
+    }
+
+    #[test]
+    fn prefers_720p_over_1080p() {
+        let v = json!({
+            "type": "video",
+            "preview_image_url": "https://pbs.twimg.com/thumb/b.jpg",
+            "variants": [
+                {"content_type": "video/mp4", "bit_rate": 3000000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/1920x1080/b1080.mp4"},
+                {"content_type": "video/mp4", "bit_rate": 1000000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/1280x720/b720.mp4"},
+            ]
+        });
+        let m = parse_one(&v).unwrap();
+        assert_eq!(
+            m.video_url.as_deref(),
+            Some("https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/1280x720/b720.mp4")
+        );
+    }
+
+    #[test]
+    fn excludes_variants_above_1080p() {
+        let v = json!({
+            "type": "video",
+            "preview_image_url": "https://pbs.twimg.com/thumb/b.jpg",
+            "variants": [
+                {"content_type": "video/mp4", "bit_rate": 10000000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/3840x2160/b2160.mp4"},
+                {"content_type": "video/mp4", "bit_rate": 8000000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/2560x1440/b1440.mp4"},
+                {"content_type": "video/mp4", "bit_rate": 500000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/640x480/b480.mp4"},
+            ]
+        });
+        let m = parse_one(&v).unwrap();
+        assert_eq!(
+            m.video_url.as_deref(),
+            Some("https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/640x480/b480.mp4")
+        );
+        let only_high = json!({
+            "type": "video",
+            "preview_image_url": "https://pbs.twimg.com/thumb/b.jpg",
+            "variants": [
+                {"content_type": "video/mp4", "bit_rate": 10000000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/3840x2160/b2160.mp4"},
+                {"content_type": "video/mp4", "bit_rate": 8000000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/2560x1440/b1440.mp4"},
+            ]
+        });
+        let m = parse_one(&only_high).unwrap();
+        assert!(m.video_url.is_none());
+    }
+
+    #[test]
+    fn falls_back_when_no_resolution() {
+        let v = json!({
+            "type": "video",
+            "preview_image_url": "https://pbs.twimg.com/thumb/b.jpg",
+            "variants": [
+                {"content_type": "video/mp4", "bit_rate": 256000, "url": "https://video.twimg.com/b_low.mp4"},
+                {"content_type": "video/mp4", "bit_rate": 2176000, "url": "https://video.twimg.com/b_high.mp4"},
+            ]
+        });
+        let m = parse_one(&v).unwrap();
+        assert_eq!(
+            m.video_url.as_deref(),
+            Some("https://video.twimg.com/b_high.mp4")
+        );
+        let mixed = json!({
+            "type": "video",
+            "preview_image_url": "https://pbs.twimg.com/thumb/b.jpg",
+            "variants": [
+                {"content_type": "video/mp4", "bit_rate": 5000000, "url": "https://video.twimg.com/b_nores.mp4"},
+                {"content_type": "video/mp4", "bit_rate": 500000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/640x480/b480.mp4"},
+            ]
+        });
+        let m = parse_one(&mixed).unwrap();
+        assert_eq!(
+            m.video_url.as_deref(),
+            Some("https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/640x480/b480.mp4")
+        );
+    }
+
+    #[test]
+    fn vertical_720x1280_counts_as_720p() {
+        let v = json!({
+            "type": "video",
+            "preview_image_url": "https://pbs.twimg.com/thumb/b.jpg",
+            "variants": [
+                {"content_type": "video/mp4", "bit_rate": 3000000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/1920x1080/b1080.mp4"},
+                {"content_type": "video/mp4", "bit_rate": 1000000, "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/720x1280/bvert.mp4"},
+            ]
+        });
+        let m = parse_one(&v).unwrap();
+        assert_eq!(
+            m.video_url.as_deref(),
+            Some("https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/720x1280/bvert.mp4")
+        );
     }
 }
 
