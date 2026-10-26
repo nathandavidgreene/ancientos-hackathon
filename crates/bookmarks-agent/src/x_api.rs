@@ -14,8 +14,81 @@ pub const ME_URL: &str = "https://api.x.com/2/users/me";
 pub fn bookmarks_url(user_id: &str) -> String {
     format!(
         "https://api.x.com/2/users/{user_id}/bookmarks?max_results=100\
-         &tweet.fields=created_at,author_id&expansions=author_id&user.fields=username"
+         &tweet.fields=note_tweet,text,created_at,author_id&expansions=author_id&user.fields=username"
     )
+}
+
+/// Batched tweets endpoint for full-text hydration (max 100 ids).
+pub fn hydrate_url(ids: &[String]) -> Result<String, String> {
+    if ids.is_empty() {
+        return Err("no ids to hydrate".to_string());
+    }
+    if ids.len() > 100 {
+        return Err("too many ids to hydrate (max 100)".to_string());
+    }
+    for id in ids {
+        if id.is_empty() {
+            return Err("cannot hydrate an empty post id".to_string());
+        }
+        if id.contains([',', '&', '=', '?', '#', ' ', '\t', '\n']) {
+            return Err("invalid post id for hydrate".to_string());
+        }
+    }
+    Ok(format!(
+        "https://api.x.com/2/tweets?ids={}&tweet.fields=note_tweet,text",
+        ids.join(",")
+    ))
+}
+
+/// Full post text: `note_tweet.text` (untruncated long-post text) wins,
+/// else `text`. Empty when both are missing.
+fn full_text_of(tweet: &serde_json::Value) -> String {
+    if let Some(s) = tweet
+        .get("note_tweet")
+        .and_then(|n| n.get("text"))
+        .and_then(|v| v.as_str())
+    {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    tweet
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn had_note_tweet(tweet: &serde_json::Value) -> bool {
+    tweet
+        .get("note_tweet")
+        .and_then(|n| n.get("text"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// Map a batched `/tweets` response to post_id -> full text. Pure, for tests.
+/// `note_tweet.text` is preferred; entries without an id or with empty text
+/// are skipped so callers keep their stored text.
+pub fn parse_hydrate_response(value: &serde_json::Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Some(tweets) = value.get("data").and_then(|d| d.as_array()) {
+        for t in tweets {
+            let Some(id) = t
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let text = full_text_of(t);
+            if text.is_empty() {
+                continue;
+            }
+            out.insert(id.to_string(), text);
+        }
+    }
+    out
 }
 
 fn paid_error() -> String {
@@ -76,11 +149,7 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
             items.push(Bookmark {
                 post_id: id.to_string(),
                 url,
-                text: t
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                text: full_text_of(t),
                 author_username: author.map(str::to_string),
                 created_at: t
                     .get("created_at")
@@ -88,6 +157,7 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
                     .map(str::to_string),
                 folders: None,
                 label: None,
+                had_note_tweet: had_note_tweet(t),
             });
         }
     }
@@ -190,6 +260,33 @@ impl XApiSource {
         self.user_id = Some(id.clone());
         Ok(id)
     }
+
+    /// Fetch full post text for up to 100 ids with ONE batched GET to
+    /// `/tweets`. Same token handling/refresh as [`fetch`](Self::fetch);
+    /// fails closed without the paid switch. Returns post_id -> full text
+    /// with `note_tweet.text` preferred.
+    pub fn hydrate(&mut self, ids: &[String]) -> Result<HashMap<String, String>, String> {
+        require_paid()?;
+        let url = hydrate_url(ids)?;
+        self.ensure_fresh_token()?;
+        let raw = get_json(&url, &self.tokens.access_token.clone())?;
+        Ok(parse_hydrate_response(&raw))
+    }
+}
+
+/// Fetch full post text for up to 100 ids with ONE batched GET to
+/// `https://api.x.com/2/tweets?ids=...&tweet.fields=note_tweet,text`.
+/// Loads tokens from the store (refreshing when expired) and fails closed
+/// unless `ANCIENTOS_ALLOW_PAID=1`. Returns post_id -> full text with
+/// `note_tweet.text` preferred. Never logs tokens.
+pub fn hydrate(ids: &[String]) -> Result<HashMap<String, String>, String> {
+    require_paid()?;
+    let client_id = std::env::var("X_CLIENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "X_CLIENT_ID not set".to_string())?;
+    let mut src = XApiSource::load_from_store(client_id)?;
+    src.hydrate(ids)
 }
 
 impl BookmarkSource for XApiSource {
@@ -231,7 +328,10 @@ mod tests {
         let u = bookmarks_url("123");
         assert!(u.contains("/2/users/123/bookmarks"), "{u}");
         assert!(u.contains("max_results=100"), "{u}");
-        assert!(u.contains("tweet.fields=created_at,author_id"), "{u}");
+        assert!(
+            u.contains("tweet.fields=note_tweet,text,created_at,author_id"),
+            "{u}"
+        );
         assert!(u.contains("expansions=author_id"), "{u}");
         assert!(u.contains("user.fields=username"), "{u}");
     }
@@ -311,6 +411,89 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("ANCIENTOS_ALLOW_PAID", v),
             None => std::env::remove_var("ANCIENTOS_ALLOW_PAID"),
+        }
+    }
+
+    #[test]
+    fn prefers_note_tweet_text_in_bookmarks_parsing() {
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "10", "text": "truncated… https://t.co/abc",
+                 "note_tweet": {"text": "synthetic full long-post text"},
+                 "author_id": "u1"},
+                {"id": "11", "text": "synthetic short text", "author_id": "u1"},
+                {"id": "12", "text": "synthetic fallback",
+                 "note_tweet": {"text": ""}, "author_id": "u1"}
+            ],
+            "includes": {"users": [{"id": "u1", "username": "syn_user"}]},
+            "meta": {}
+        });
+        let page = parse_bookmarks_page(&raw).unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert_eq!(page.items[0].text, "synthetic full long-post text");
+        assert!(page.items[0].had_note_tweet);
+        assert_eq!(page.items[1].text, "synthetic short text");
+        assert!(!page.items[1].had_note_tweet);
+        // Empty note_tweet.text falls back to text.
+        assert_eq!(page.items[2].text, "synthetic fallback");
+        assert!(!page.items[2].had_note_tweet);
+    }
+
+    #[test]
+    fn hydrate_url_builds_one_batched_request() {
+        let ids = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        let u = hydrate_url(&ids).unwrap();
+        assert!(u.starts_with("https://api.x.com/2/tweets?ids=1,2,3"), "{u}");
+        assert!(u.contains("tweet.fields=note_tweet,text"), "{u}");
+        assert!(hydrate_url(&[]).is_err());
+        let many: Vec<String> = (0..101).map(|i| i.to_string()).collect();
+        assert!(hydrate_url(&many).is_err());
+        assert!(hydrate_url(&["".to_string()]).is_err());
+        assert!(hydrate_url(&["a,b".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_hydrate_response_preferring_note_tweet() {
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "a", "text": "short",
+                 "note_tweet": {"text": "synthetic full a"}},
+                {"id": "b", "text": "synthetic plain b"},
+                {"id": "", "text": "no id skipped"},
+                {"id": "c"},
+                {"text": "missing id skipped"}
+            ]
+        });
+        let map = parse_hydrate_response(&raw);
+        assert_eq!(map.get("a").map(String::as_str), Some("synthetic full a"));
+        assert_eq!(map.get("b").map(String::as_str), Some("synthetic plain b"));
+        assert!(!map.contains_key("c"), "empty text skipped: {map:?}");
+        assert_eq!(map.len(), 2);
+        let empty = parse_hydrate_response(&serde_json::json!({"meta": {}}));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn hydrate_free_fn_fails_closed_without_paid_switch() {
+        let _guard = env_lock();
+        let saved_paid = std::env::var("ANCIENTOS_ALLOW_PAID").ok();
+        let saved_home = std::env::var("ANCIENTOS_HOME").ok();
+        let saved_client = std::env::var("X_CLIENT_ID").ok();
+        std::env::remove_var("ANCIENTOS_ALLOW_PAID");
+        std::env::set_var("X_CLIENT_ID", "synthetic-client");
+        let ids = vec!["1".to_string()];
+        assert!(hydrate(&ids).is_err());
+        match saved_paid {
+            Some(v) => std::env::set_var("ANCIENTOS_ALLOW_PAID", v),
+            None => std::env::remove_var("ANCIENTOS_ALLOW_PAID"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("ANCIENTOS_HOME", v),
+            None => std::env::remove_var("ANCIENTOS_HOME"),
+        }
+        match saved_client {
+            Some(v) => std::env::set_var("X_CLIENT_ID", v),
+            None => std::env::remove_var("X_CLIENT_ID"),
         }
     }
 }

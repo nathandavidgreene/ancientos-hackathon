@@ -137,6 +137,7 @@ mod tests {
             created_at: None,
             folders: None,
             label: None,
+            had_note_tweet: false,
         }
     }
 

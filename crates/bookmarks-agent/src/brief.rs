@@ -42,6 +42,9 @@ pub struct BriefPick {
     pub url: String,
     pub topic: String,
     pub why: String,
+    /// Full post text for display only (hydrated when truncated).
+    /// Never sent to the model; the prompt uses sanitized excerpts.
+    pub full_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +71,10 @@ pub trait BriefModel {
     fn model_id(&self) -> String;
     fn call(&self, prompt: &str) -> Result<ModelReply, RouterError>;
 }
+
+/// Full-text hydrator: post ids -> post_id to full text. Called at most once
+/// per brief; failures keep stored text.
+pub type Hydrator<'a> = dyn Fn(&[String]) -> Result<HashMap<String, String>, String> + 'a;
 
 impl BriefModel for MuseClient {
     fn model_id(&self) -> String {
@@ -350,6 +357,48 @@ fn fmt_tok(v: Option<u64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
+/// True when stored `text` looks like a truncated X post: a t.co link at the
+/// end, a trailing `…`, or at least 270 chars without a `note_tweet` source
+/// (which would already be the full text).
+pub fn looks_truncated(text: &str, had_note_tweet: bool) -> bool {
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed
+        .split_whitespace()
+        .last()
+        .is_some_and(|tok| tok.contains("t.co/"))
+    {
+        return true;
+    }
+    if trimmed.ends_with('…') {
+        return true;
+    }
+    if !had_note_tweet && trimmed.chars().count() >= 270 {
+        return true;
+    }
+    false
+}
+
+/// Render `text` as a Markdown blockquote: every line prefixed with `> `,
+/// blank lines as `>`.
+pub fn render_blockquote(text: &str) -> String {
+    if text.is_empty() {
+        return ">".to_string();
+    }
+    text.lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn render_markdown(
     date: &str,
     picks: &[BriefPick],
@@ -368,12 +417,13 @@ pub fn render_markdown(
                 .map(|a| format!("@{a}"))
                 .unwrap_or_else(|| "unknown".to_string());
             md.push_str(&format!(
-                "## {}. **{}**\n- Author: {}\n- Topic: {}\n- Link: {}\n\n",
+                "## {}. **{}**\n- Author: {}\n- Topic: {}\n- Link: {}\n\n{}\n\n",
                 i + 1,
                 p.why,
                 author,
                 p.topic,
-                p.url
+                p.url,
+                render_blockquote(&p.full_text)
             ));
         }
     }
@@ -394,12 +444,26 @@ pub fn render_markdown(
 }
 
 /// Run the brief: select candidates, make at most one model call, gate every
-/// pick, append to the decision log, and render markdown.
+/// pick, hydrate truncated full text (display only), append to the decision
+/// log, and render markdown.
 pub fn run(
     merged: &MergeOutput,
     model: &dyn BriefModel,
     log_path: &Path,
     date: &str,
+) -> Result<BriefResult, String> {
+    run_with_hydrator(merged, model, log_path, date, Some(&crate::x_api::hydrate))
+}
+
+/// Same as [`run`] but with an injectable hydrator for tests. The hydrator is
+/// called at most once per brief with the truncated pick ids; on failure the
+/// stored text is kept. `None` skips hydration entirely.
+pub fn run_with_hydrator(
+    merged: &MergeOutput,
+    model: &dyn BriefModel,
+    log_path: &Path,
+    date: &str,
+    hydrator: Option<&Hydrator<'_>>,
 ) -> Result<BriefResult, String> {
     if merged.rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
@@ -409,7 +473,8 @@ pub fn run(
         return Err("no bookmarks to brief".to_string());
     }
 
-    // Only sanitized text may leave the device.
+    // Only sanitized text may leave the device. The prompt is built from
+    // stored excerpts only; hydration happens after picks and is display only.
     let dest = route(Sensitivity::Sanitized, false);
     let (resolved, model_id, usage, fallback) = if dest == Destination::MuseSpark {
         match model.call(&build_prompt(&candidates)) {
@@ -424,6 +489,11 @@ pub fn run(
         (local_picks(&candidates), "local".to_string(), None, true)
     };
 
+    let stored: HashMap<&str, &Bookmark> = merged
+        .rows
+        .iter()
+        .map(|b| (b.post_id.as_str(), b))
+        .collect();
     let mut gate = Gate::new();
     gate.register(BRIEF_ACTION, Risk::Low);
     let mut evaluated: Vec<(BriefPick, Verdict, String)> = Vec::new();
@@ -435,6 +505,10 @@ pub fn run(
             agent: AGENT_NAME.to_string(),
             action: BRIEF_ACTION.to_string(),
         });
+        let full_text = stored
+            .get(c.post_id.as_str())
+            .map(|b| b.text.clone())
+            .unwrap_or_default();
         let pick = BriefPick {
             index: c.index,
             post_id: c.post_id.clone(),
@@ -442,14 +516,44 @@ pub fn run(
             url: c.url.clone(),
             topic: c.topic.clone(),
             why: why.clone(),
+            full_text,
         };
         evaluated.push((pick, verdict, why.clone()));
     }
-    let picks: Vec<BriefPick> = evaluated
+    let mut picks: Vec<BriefPick> = evaluated
         .iter()
         .filter(|(_, v, _)| *v == Verdict::Allow)
         .map(|(p, _, _)| p.clone())
         .collect();
+
+    // Hydrate truncated picks with full text (display only). At most one call.
+    let need: Vec<String> = picks
+        .iter()
+        .filter(|p| {
+            let (text, had) = stored
+                .get(p.post_id.as_str())
+                .map(|b| (b.text.as_str(), b.had_note_tweet))
+                .unwrap_or((p.full_text.as_str(), false));
+            looks_truncated(text, had)
+        })
+        .map(|p| p.post_id.clone())
+        .collect();
+    let requested = need.len();
+    let mut hydrated = 0usize;
+    if !need.is_empty() {
+        if let Some(h) = hydrator {
+            if let Ok(map) = h(&need) {
+                for p in &mut picks {
+                    if let Some(full) = map.get(&p.post_id) {
+                        if !full.is_empty() {
+                            p.full_text = full.clone();
+                            hydrated += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if let Some(parent) = log_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -490,6 +594,12 @@ pub fn run(
         log.append("brief.pick", payload)
             .map_err(|e| e.to_string())?;
     }
+    // Never log post text here: counts only.
+    log.append(
+        "brief.hydrate",
+        serde_json::json!({"requested": requested, "hydrated": hydrated}),
+    )
+    .map_err(|e| e.to_string())?;
 
     let markdown = render_markdown(date, &picks, &merged.counts, &model_id, usage.as_ref());
     Ok(BriefResult {
@@ -522,6 +632,7 @@ mod tests {
                 method: None,
                 is_foldered: None,
             }),
+            had_note_tweet: false,
         }
     }
 
@@ -730,6 +841,7 @@ mod tests {
         assert_eq!(res.picks.len(), 3);
         assert_eq!(res.picks[0].post_id, "id1");
         assert_eq!(res.picks[0].why, "model reason two");
+        assert_eq!(res.picks[0].full_text, "synthetic text for id1");
 
         assert!(res.markdown.starts_with("# Daily brief — 2026-10-26"));
         assert!(res.markdown.contains("**model reason two**"));
@@ -738,10 +850,15 @@ mod tests {
         assert!(res.markdown.contains("TopicA"));
         assert!(res.markdown.contains("Model: fake-spark"));
         assert!(res.markdown.contains("prompt=10"));
+        assert!(
+            res.markdown.contains("> synthetic text for id1"),
+            "{}",
+            res.markdown
+        );
 
         let log = DecisionLog::open(&log_path).unwrap();
         let entries = log.verify().unwrap();
-        assert_eq!(entries.len(), 1 + 1 + 3);
+        assert_eq!(entries.len(), 1 + 1 + 3 + 1);
         assert_eq!(entries[0].kind, "brief.candidates");
         assert_eq!(entries[0].payload["count"], 4);
         assert_eq!(entries[1].kind, "brief.model_call");
@@ -753,6 +870,13 @@ mod tests {
         assert_eq!(entries[2].kind, "brief.pick");
         assert_eq!(entries[2].payload["post_id"], "id1");
         assert_eq!(entries[2].payload["verdict"], "allow");
+        assert_eq!(entries[5].kind, "brief.hydrate");
+        assert_eq!(entries[5].payload["requested"], 0);
+        assert_eq!(entries[5].payload["hydrated"], 0);
+        assert!(
+            !entries[5].payload.to_string().contains("synthetic text"),
+            "no text in hydrate entry"
+        );
     }
 
     #[test]
@@ -782,7 +906,14 @@ mod tests {
         let merged = merged_of(vec![b], &["s1"]);
         let dir = tempfile::tempdir().unwrap();
         let model = FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#);
-        run(&merged, &model, &dir.path().join("d.jsonl"), "2026-10-26").unwrap();
+        run_with_hydrator(
+            &merged,
+            &model,
+            &dir.path().join("d.jsonl"),
+            "2026-10-26",
+            None,
+        )
+        .unwrap();
         let prompt = &model.seen.borrow()[0];
         assert!(!prompt.contains("@syn_handle"), "{prompt}");
         assert!(!prompt.contains("https://t.co/abc"), "{prompt}");
@@ -842,5 +973,169 @@ mod tests {
         assert_eq!(&d[4..5], "-");
         assert_eq!(&d[7..8], "-");
         assert!(d.chars().filter(|c| *c != '-').all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn detects_truncated_text() {
+        // t.co link at the end.
+        assert!(looks_truncated(
+            "synthetic excerpt https://t.co/abc123",
+            false
+        ));
+        assert!(looks_truncated(
+            "synthetic excerpt https://t.co/abc123  ",
+            false
+        ));
+        // t.co link not at the end is not truncation.
+        assert!(!looks_truncated(
+            "see https://t.co/abc123 for synthetic context here",
+            false
+        ));
+        // Trailing ellipsis.
+        assert!(looks_truncated("synthetic truncated…", false));
+        assert!(looks_truncated("synthetic truncated…   ", false));
+        assert!(!looks_truncated("synthetic complete.", false));
+        // Long text without note_tweet source.
+        let long = "x".repeat(270);
+        assert!(looks_truncated(&long, false));
+        assert!(looks_truncated(&"y".repeat(500), false));
+        assert!(!looks_truncated(&"z".repeat(269), false));
+        // Long text with note_tweet source is already full.
+        assert!(!looks_truncated(&long, true));
+        // Short non-truncated and empty.
+        assert!(!looks_truncated("synthetic short", false));
+        assert!(!looks_truncated("", false));
+        assert!(!looks_truncated("   ", false));
+    }
+
+    #[test]
+    fn renders_blockquote_with_blank_lines() {
+        assert_eq!(render_blockquote("synthetic line"), "> synthetic line");
+        assert_eq!(
+            render_blockquote("synthetic one\nsynthetic two"),
+            "> synthetic one\n> synthetic two"
+        );
+        assert_eq!(
+            render_blockquote("synthetic one\n\nsynthetic three"),
+            "> synthetic one\n>\n> synthetic three"
+        );
+        assert_eq!(render_blockquote(""), ">");
+    }
+
+    #[test]
+    fn hydrate_called_at_most_once_for_truncated_picks() {
+        let mut t1 = bm("t1", None, Some("T"), None);
+        t1.text = "synthetic truncated one https://t.co/aaa".into();
+        let mut t2 = bm("t2", None, Some("T"), None);
+        t2.text = "synthetic truncated two…".into();
+        let t3 = bm("t3", None, Some("T"), None);
+        let merged = merged_of(vec![t1, t2, t3], &["t1", "t2", "t3"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        let calls = RefCell::new(0usize);
+        let seen_ids = RefCell::new(Vec::new());
+        let hydrator = |ids: &[String]| -> Result<HashMap<String, String>, String> {
+            *calls.borrow_mut() += 1;
+            *seen_ids.borrow_mut() = ids.to_vec();
+            let mut map = HashMap::new();
+            for id in ids {
+                map.insert(id.clone(), format!("synthetic FULL for {id}\nsecond line"));
+            }
+            Ok(map)
+        };
+        let model = FakeModel::ok(r#"[{"n":1,"why":"ok one"},{"n":2,"why":"ok two"}]"#);
+        let res =
+            run_with_hydrator(&merged, &model, &log_path, "2026-10-26", Some(&hydrator)).unwrap();
+        assert_eq!(*calls.borrow(), 1, "exactly one hydrate call");
+        let mut got = seen_ids.borrow().clone();
+        got.sort();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&"t1".to_string()));
+        assert!(got.contains(&"t2".to_string()));
+        // Picks carry hydrated full text; markdown shows it as a blockquote.
+        let p1 = res.picks.iter().find(|p| p.post_id == "t1").unwrap();
+        assert_eq!(p1.full_text, "synthetic FULL for t1\nsecond line");
+        assert!(res.markdown.contains("> synthetic FULL for t1"));
+        assert!(res.markdown.contains("> second line"));
+        // Non-truncated pick keeps stored text.
+        let p3 = res.picks.iter().find(|p| p.post_id == "t3");
+        if let Some(p) = p3 {
+            assert_eq!(p.full_text, "synthetic text for t3");
+        }
+        let log = DecisionLog::open(&log_path).unwrap();
+        let entries = log.verify().unwrap();
+        let h = entries.iter().find(|e| e.kind == "brief.hydrate").unwrap();
+        assert_eq!(h.payload["requested"], 2);
+        assert_eq!(h.payload["hydrated"], 2);
+        assert!(!h.payload.to_string().contains("synthetic FULL"));
+    }
+
+    #[test]
+    fn hydrate_failure_keeps_stored_text() {
+        let mut t1 = bm("t1", None, Some("T"), None);
+        t1.text = "synthetic truncated https://t.co/zzz".into();
+        let merged = merged_of(vec![t1], &["t1"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        let failing = |_ids: &[String]| -> Result<HashMap<String, String>, String> {
+            Err("synthetic hydrate failure".into())
+        };
+        let res = run_with_hydrator(
+            &merged,
+            &FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#),
+            &log_path,
+            "2026-10-26",
+            Some(&failing),
+        )
+        .unwrap();
+        assert_eq!(res.picks.len(), 1);
+        assert_eq!(
+            res.picks[0].full_text,
+            "synthetic truncated https://t.co/zzz"
+        );
+        assert!(
+            res.markdown
+                .contains("> synthetic truncated https://t.co/zzz"),
+            "{}",
+            res.markdown
+        );
+        let log = DecisionLog::open(&log_path).unwrap();
+        let entries = log.verify().unwrap();
+        let h = entries.iter().find(|e| e.kind == "brief.hydrate").unwrap();
+        assert_eq!(h.payload["requested"], 1);
+        assert_eq!(h.payload["hydrated"], 0);
+    }
+
+    #[test]
+    fn hydrate_does_not_change_model_prompt() {
+        let mut t1 = bm("t1", None, Some("T"), None);
+        t1.text = "synthetic stored https://t.co/qqq".into();
+        let merged = merged_of(vec![t1], &["t1"]);
+        let dir = tempfile::tempdir().unwrap();
+        let model = FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#);
+        let hydrator = |ids: &[String]| -> Result<HashMap<String, String>, String> {
+            assert_eq!(ids, &["t1".to_string()]);
+            let mut map = HashMap::new();
+            map.insert(
+                "t1".to_string(),
+                "synthetic HYDRATED-ONLY full text".to_string(),
+            );
+            Ok(map)
+        };
+        let res = run_with_hydrator(
+            &merged,
+            &model,
+            &dir.path().join("d.jsonl"),
+            "2026-10-26",
+            Some(&hydrator),
+        )
+        .unwrap();
+        let prompt = &model.seen.borrow()[0];
+        assert!(
+            !prompt.contains("HYDRATED-ONLY"),
+            "prompt must not see hydrated text: {prompt}"
+        );
+        assert!(prompt.contains("synthetic stored"), "{prompt}");
+        assert_eq!(res.picks[0].full_text, "synthetic HYDRATED-ONLY full text");
     }
 }

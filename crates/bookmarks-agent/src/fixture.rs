@@ -27,6 +27,10 @@ pub struct Bookmark {
     pub folders: Option<Vec<String>>,
     #[serde(default)]
     pub label: Option<Label>,
+    /// True when `text` came from `note_tweet.text` (already the full long-post
+    /// text, never truncated). Defaults to false for fixtures and old stores.
+    #[serde(default)]
+    pub had_note_tweet: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
