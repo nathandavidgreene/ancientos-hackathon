@@ -782,6 +782,21 @@ fn fallback_steps(thread: &[ThreadPost]) -> Vec<(String, String)> {
     out
 }
 
+/// `## Quoted & linked` section for the paid path: ids + truncated text.
+fn quoted_linked_section(quoted: &[ThreadPost], linked: &[ThreadPost]) -> String {
+    let mut out = String::from("\n## Quoted & linked\n");
+    if quoted.is_empty() && linked.is_empty() {
+        out.push_str("(none)\n");
+    }
+    for (kind, list) in [("quoted", quoted), ("linked", linked)] {
+        for q in list {
+            let clean = crate::sanitize::sanitize_uncapped(&q.text);
+            out.push_str(&format!("- ({kind} {}) {}\n", q.id, truncate_item(&clean)));
+        }
+    }
+    out
+}
+
 /// Deterministic local fallback walkthrough with fixed sections.
 /// `thread_joined` is thread text only for the Steps section; quoted and
 /// linked text appears only under Quoted sections, never as steps.
@@ -1166,8 +1181,17 @@ pub fn run_with(
             return Err("model returned no usable steps after filtering".to_string());
         }
         let title = short_title(&thread);
-        let mut out = format!("# {title}\n\n{}\n", filtered.trim_end());
-        out.push_str(&try_it_appendix(&thread_joined, &media, is_try_it));
+        let mut out = format!("# {title}\n\n## Steps\n{}\n", filtered.trim_end());
+        out.push_str(&quoted_linked_section(&quoted, &linked));
+        // Model already wrote the Steps; the Try-it appendix adds practice
+        // steps + media under its own heading (no duplicate Steps).
+        out.push_str(
+            &try_it_appendix(&thread_joined, &media, is_try_it).replacen(
+                "\n## Steps\n",
+                "\n## Try it\n",
+                1,
+            ),
+        );
         (out, model, usage, "paid".to_string())
     } else {
         let out = local_walkthrough(
@@ -2407,6 +2431,16 @@ mod tests {
             filter_model_steps(content),
             "Intro line\n1. Install WordCraft now\nOutro\n"
         );
+    }
+
+    #[test]
+    fn paid_section_lists_quoted_and_linked() {
+        let out = quoted_linked_section(&[post("9", "quoted text")], &[]);
+        assert!(
+            out.contains("## Quoted & linked") && out.contains("(quoted 9) quoted text"),
+            "{out}"
+        );
+        assert!(quoted_linked_section(&[], &[]).contains("(none)"));
     }
 
     #[test]
