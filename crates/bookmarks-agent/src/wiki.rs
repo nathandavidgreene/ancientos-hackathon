@@ -735,8 +735,8 @@ pub fn apply_edits(
     Ok(touched.into_iter().collect())
 }
 
-/// Render the catalog: one line per page (`- [[slug]] — <summary>
-/// `(sources: <n>)`), sorted by slug.
+/// Render the catalog: one line per page
+/// (`- [[slug]] — <summary> (sources: <n>)`), sorted by slug.
 pub fn render_index(pages: &[Page]) -> String {
     let mut out = String::from("# wiki index\n\n");
     let mut sorted: Vec<&Page> = pages.iter().collect();

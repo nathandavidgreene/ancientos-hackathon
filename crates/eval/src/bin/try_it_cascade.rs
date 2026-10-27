@@ -130,7 +130,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     })
 }
 
-/// Parse a `--jev-threshold` value: a number in [0,1]. Anything else is an
+/// Parse a `--jev-threshold` value: a number in \[0, 1\]. Anything else is an
 /// error (fail closed): an explicit bad flag never silently falls back.
 fn parse_jev_threshold(value: &str) -> Result<f64, String> {
     value

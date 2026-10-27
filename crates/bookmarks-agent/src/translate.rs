@@ -12,7 +12,7 @@
 //! - Only [`DataClass::Public`](ancientos_router::data_class::DataClass) text
 //!   may reach the hosted Muse client, and only when `ANCIENTOS_ALLOW_PAID=1`;
 //!   the sanitized text is sent, never the raw text (see [`crate::sanitize`]).
-//! - Anything else goes to the local model only ([`LocalLlmClient`], via
+//! - Anything else goes to the local model only ([`LocalLlmClient`](ancientos_router::local_llm::LocalLlmClient), via
 //!   `scripts/local_llm.sh`) or stays [`TranslationStatus::Untranslated`];
 //!   it is never sent to a hosted model.
 //! - The class comes from [`class_of`]: text whose only stripped parts are

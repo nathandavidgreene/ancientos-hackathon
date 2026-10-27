@@ -48,11 +48,11 @@ pub const TRY_IT_INSTRUCTIONS: &str = "This X bookmark is try-it the reader woul
 pub const TRY_IT_THRESHOLD: f64 = 0.3;
 
 /// Env var overriding the Jev try-it threshold. Unset, empty, unparseable,
-/// NaN, or outside [0,1] falls back to [`TRY_IT_THRESHOLD`] (see
+/// NaN, or outside \[0, 1\] falls back to [`TRY_IT_THRESHOLD`] (see
 /// [`jev_threshold_from_env`]).
 pub const ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV: &str = "ANCIENTOS_JEV_TRY_IT_THRESHOLD";
 
-/// Read [`ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV`]: a number in [0,1] wins;
+/// Read [`ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV`]: a number in \[0, 1\] wins;
 /// anything else (unset, empty, unparseable, NaN, out of range) falls back
 /// to [`TRY_IT_THRESHOLD`]. Never panics.
 pub fn jev_threshold_from_env() -> f64 {
@@ -414,7 +414,7 @@ impl<'a> Cascade<'a> {
     }
 
     /// Override the Jev yes threshold (`noul >= threshold` answers yes).
-    /// NaN or outside [0,1] falls back to [`TRY_IT_THRESHOLD`] (fail closed).
+    /// NaN or outside \[0, 1\] falls back to [`TRY_IT_THRESHOLD`] (fail closed).
     pub fn with_jev_threshold(mut self, threshold: f64) -> Self {
         if !threshold.is_nan() && (0.0..=1.0).contains(&threshold) {
             self.jev_threshold = threshold;

@@ -1,6 +1,6 @@
 //! Human approval queue: agents propose risky actions, a person approves or denies.
 //!
-//! State lives only in the existing hash-chained [`DecisionLog`](crate::log::DecisionLog):
+//! State lives only in the existing hash-chained [`DecisionLog`]:
 //! entries of kind `approval.requested`, `approval.approved`, `approval.denied`,
 //! `approval.expired` and `approval.released` are folded into current state.
 //! The log is never rewritten or truncated. Every function here fails closed:
@@ -9,7 +9,7 @@
 //!
 //! Flow:
 //! 1. [`request`] records a proposal, but only for actions the caller-provided
-//!    [`Gate`](crate::gate::Gate) evaluates as `NeedsHuman`.
+//!    [`Gate`] evaluates as `NeedsHuman`.
 //!    Gate-allowed actions are refused ("no approval is needed") and
 //!    gate-denied actions are refused with the deny reason.
 //! 2. A human calls [`approve`] or [`deny`] exactly once, passing the

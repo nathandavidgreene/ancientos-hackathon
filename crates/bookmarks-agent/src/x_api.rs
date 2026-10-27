@@ -2,7 +2,7 @@
 //!
 //! Paid calls are off by default: every entry point fails closed unless
 //! `ANCIENTOS_ALLOW_PAID=1`. The user id is fetched once from `/users/me`,
-//! then bookmarks pages map to [`Bookmark`](crate::fixture::Bookmark).
+//! then bookmarks pages map to [`Bookmark`].
 use crate::fixture::Bookmark;
 use crate::ingest::{BookmarkSource, Page};
 use crate::token_store::{StoredTokens, TokenStoreError};

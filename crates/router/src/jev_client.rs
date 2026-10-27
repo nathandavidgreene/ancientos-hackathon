@@ -20,7 +20,7 @@
 //!
 //! Keys are read from env at call time and never stored on the client,
 //! logged, or printed. The HTTP request/response shape is shared by both
-//! backends in the single function [`post_systemone`].
+//! backends in the single function `post_systemone`.
 //!
 //! VERIFIED 2026-10-26 against api.typesafe.ai (OpenAPI + one live call):
 //! Jev is NOT a chat API. `POST /v1/systemone` takes

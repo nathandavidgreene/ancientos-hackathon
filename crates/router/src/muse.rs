@@ -2,7 +2,7 @@
 //!
 //! The API key is read from `META_API_KEY` at call time and never stored on
 //! the client, logged, or printed. Calls fail closed: content whose
-//! [`DataClass`](crate::data_class::DataClass) exceeds the hosted ceiling
+//! [`DataClass`] exceeds the hosted ceiling
 //! ([`DataClass::Public`](crate::data_class::DataClass)) is refused before
 //! any network I/O, and the rest are refused unless the paid-call switch
 //! `ANCIENTOS_ALLOW_PAID` equals `"1"` and a key is set.

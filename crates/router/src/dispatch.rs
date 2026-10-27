@@ -12,7 +12,7 @@
 //! off by default and only an enabled task routes to it.
 //!
 //! The `*_with_class` twins take an explicit
-//! [`DataClass`](crate::data_class::DataClass): a call whose class exceeds
+//! [`DataClass`]: a call whose class exceeds
 //! the chosen route's ceiling is refused before the client is touched, with
 //! a `router.egress_denied` entry when a log is given. The plain functions
 //! derive the class from the sensitivity and log nothing.

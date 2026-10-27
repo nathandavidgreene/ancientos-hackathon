@@ -1176,7 +1176,7 @@ fn has_bullets(text: &str) -> bool {
     })
 }
 
-/// "hold for ..." or "hold <number>" ("hold 4s", "hold 30 seconds").
+/// "hold for ..." or `"hold <number>"` ("hold 4s", "hold 30 seconds").
 fn has_hold_cue(lower: &str) -> bool {
     if contains_phrase(lower, "hold for") {
         return true;
