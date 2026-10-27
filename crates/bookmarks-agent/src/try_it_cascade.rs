@@ -1,7 +1,7 @@
 //! "Try it" cascade: cheap rules first, then Jev, then Muse Spark.
 //!
-//! Stage 0 (topic filter) runs before everything: posts about ecosystems the
-//! reader has moved past (see [`crate::topic_filter`]) answer no with no API
+//! Stage 0 (topic filter) runs before everything: posts mentioning a term on
+//! the user's private mute list (see [`crate::topic_mute`]) answer no with no API
 //! call, even when the rules verdict is `ConfidentYes`.
 //!
 //! Stage 1 (rules) is an INPUT ([`RulesVerdict`]) because the router cannot
@@ -28,7 +28,7 @@
 //! never fails, so one bad item (or a rate limit) never aborts a run;
 //! callers that must stop on HTTP 429 check
 //! [`CascadeDecision::is_rate_limited`].
-use crate::topic_filter::excluded_topic;
+use crate::topic_mute::excluded_topic;
 use ancientos_core::log::DecisionLog;
 use ancientos_core::loop_guard::LoopGuard;
 use ancientos_router::data_class::{check_egress, DataClass, Route};
@@ -153,11 +153,11 @@ impl TryItExplanation {
         }
     }
 
-    /// Stage 0 explanation: the excluded topic id (args: topic id; never fails).
+    /// Stage 0 explanation: the matched muted term (args: topic id; never fails).
     pub fn topic_filter(topic_id: &str) -> Self {
         Self {
             stage: CascadeStage::TopicFilter,
-            reason: format!("excluded topic '{topic_id}'"),
+            reason: format!("muted term '{topic_id}'"),
             confidence: None,
         }
     }
@@ -481,7 +481,7 @@ impl<'a> Cascade<'a> {
                 stage: CascadeStage::TopicFilter,
                 error: None,
                 truncated: false,
-                explanation: TryItExplanation::topic_filter(topic),
+                explanation: TryItExplanation::topic_filter(&topic),
             };
         }
         // Stage 1: confident rules answer yes with no API call.
@@ -1804,6 +1804,10 @@ mod tests {
 
     #[test]
     fn excluded_topic_answers_no_with_zero_calls() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new([
+            "zorblax",
+            "quuxwidget",
+        ]));
         // Live mock servers that must see no request: both backends paid
         // and available, yet stage 0 answers before any call. The servers
         // block on accept, so they are left unjoined (no request arrives).
@@ -1815,10 +1819,10 @@ mod tests {
         let mut stats = zero_stats();
         for (text, topic) in [
             (
-                "OpenClaw setup you can try now: 1) install 2) run it",
-                "openclaw",
+                "Zorblax setup you can try now: 1) install 2) run it",
+                "zorblax",
             ),
-            ("Try this Hermes Agent quickstart today", "hermes"),
+            ("Try this QuuxWidget quickstart today", "quuxwidget"),
         ] {
             for rules in [RulesVerdict::Unsure, RulesVerdict::ConfidentYes] {
                 let d = cascade.decide(text, DataClass::Public, rules, &mut stats, None);
@@ -1856,15 +1860,18 @@ mod tests {
 
     #[test]
     fn non_excluded_topics_reach_later_stages() {
-        // Bare "Hermes" is not an excluded topic: the cascade proceeds
-        // (here, Jev answers yes).
+        // A post with no muted term proceeds (here, Jev answers yes).
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new([
+            "zorblax",
+            "quuxwidget",
+        ]));
         let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.9));
         let jev = jev_client(jev_url, true);
         let muse = muse_client(closed_url(), true);
         let cascade = Cascade::new(Some(&jev), Some(&muse));
         let mut stats = zero_stats();
         let d = cascade.decide(
-            "Hermes bag review",
+            "Zorb lax bag review",
             DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
@@ -2018,16 +2025,20 @@ mod tests {
     fn explanations_name_stage_reason_and_score() {
         let cascade = Cascade::new(None, None);
         let mut stats = zero_stats();
-        // Topic filter: the excluded topic id, no score.
+        // Topic filter: the matched muted term, no score.
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new([
+            "zorblax",
+            "quuxwidget",
+        ]));
         let d = cascade.decide(
-            "OpenClaw quickstart",
+            "Zorblax quickstart",
             DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
             None,
         );
         assert_eq!(d.explanation.stage, CascadeStage::TopicFilter);
-        assert_eq!(d.explanation.reason, "excluded topic 'openclaw'");
+        assert_eq!(d.explanation.reason, "muted term 'zorblax'");
         assert_eq!(d.explanation.confidence, None);
         // Confident rules without cue text: the fallback reason, no score.
         let d = cascade.decide(

@@ -161,7 +161,7 @@ impl State {
         let cache = bookmarks_agent::link_context::load_cache(
             &dir.join(bookmarks_agent::link_context::CACHE_FILE_NAME),
         );
-        let mute = bookmarks_agent::topic_mute::MuteList::from_env()?;
+        let mute = bookmarks_agent::topic_mute::current()?;
         let (visible, _skips) =
             bookmarks_agent::topic_mute::filter_surfaced(&bookmarks, &mute, &cache);
         let state = Self {

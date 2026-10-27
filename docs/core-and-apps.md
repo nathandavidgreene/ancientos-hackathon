@@ -86,7 +86,8 @@ sequenceDiagram
 | `router::*` | Decides where data may go and talks to models; knows data classes, not bookmarks. |
 
 Moved into `bookmarks-agent` (app specifics): `feedback`, `try_it_cascade`,
-`topic_filter`, the bookmark category table, and the paid action constants.
+`topic_filter` (since merged into `topic_mute`), the bookmark category table,
+and the paid action constants.
 
 ## How the boundary is enforced
 

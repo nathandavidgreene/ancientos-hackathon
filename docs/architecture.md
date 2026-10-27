@@ -80,7 +80,7 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `try_it` | bookmarks-agent | Hands-on classifier, tried yes/no/later follow-ups |
 | `deeper` | bookmarks-agent | "Go deeper" walkthroughs |
 | `try_it_cascade` | bookmarks-agent | Try-it cascade: confident rules, else Jev `noul >= 0.3` (default; `ANCIENTOS_JEV_TRY_IT_THRESHOLD` or `--jev-threshold` overrides), else Muse Spark; paid-gated, sanitized-only, fail-closed; scored by `crates/eval/src/bin/try_it_cascade.rs` |
-| `topic_filter` | bookmarks-agent | Off-topic pre-filter for the try-it classifiers |
+| `topic_mute` | bookmarks-agent | Single topic filter: private mute list (env/file, empty default) hides muted and removed-on-X posts and answers try-it stage 0 |
 | `link_context` | bookmarks-agent | Linked-page and media enrichment for the try-it classifiers |
 | `liveness` | bookmarks-agent | Confirms a bookmark still exists before it is surfaced; dead posts are filtered in memory only |
 | `ranker` | bookmarks-agent | Personal ranking learned locally from verdicts (naive Bayes), with plain-language reasons |

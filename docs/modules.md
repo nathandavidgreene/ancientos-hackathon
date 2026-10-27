@@ -6,7 +6,7 @@ section links to its full [rustdoc](api.md) page.
 
 - [ancientos-core](reference/ancientos-core.md): `approvals`, `gate`, `log`, `loop_guard`, `redact`, `scheduler`, plus the read-only `ancientos-log` CLI (verify, show, replay-approvals)
 - [ancientos-router](reference/ancientos-router.md): `data_class`, `dispatch`, `jev_client`, `local_llm`, `modal`, `muse`
-- [bookmarks-agent](reference/bookmarks-agent.md): `author_filter`, `brief`, `callback`, `daemon`, `deeper`, `delegate`, `digest`, `feedback`, `fixture`, `idea_card`, `ingest`, `language`, `link_context`, `liveness`, `media`, `merge`, `oauth`, `ranker`, `sanitize`, `semantic`, `stats`, `token_store`, `topic_filter`, `translate`, `try_it`, `try_it_cascade`, `unroll`, `vote`, `wiki`, `x_api`, plus the CLI binary
+- [bookmarks-agent](reference/bookmarks-agent.md): `author_filter`, `brief`, `callback`, `daemon`, `deeper`, `delegate`, `digest`, `feedback`, `fixture`, `idea_card`, `ingest`, `language`, `link_context`, `liveness`, `media`, `merge`, `oauth`, `ranker`, `sanitize`, `semantic`, `stats`, `token_store`, `topic_mute`, `translate`, `try_it`, `try_it_cascade`, `unroll`, `vote`, `wiki`, `x_api`, plus the CLI binary
 - [web-ui](reference/web-ui.md): `phone` (mobile approve/deny page at `/m`, token-gated)
 - [muse-runs](reference/muse-runs.md): second app, a Muse Code run as a gated action, plus the CLI binary
 - [wonder](reference/wonder.md): third app, a Muse Wonder question as a gated action, plus the CLI binary

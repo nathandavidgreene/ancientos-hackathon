@@ -129,8 +129,8 @@ pub fn explain_text(topic: &str, text: &str) -> TryItExplanation {
 /// Explain one classification with the media cue (see [`explain`]).
 /// Never fails.
 pub fn explain_with_media(topic: &str, text: &str, has_video: bool) -> TryItExplanation {
-    if let Some(topic_id) = crate::topic_filter::excluded_topic(text) {
-        return TryItExplanation::topic_filter(topic_id);
+    if let Some(term) = crate::topic_mute::excluded_topic(text) {
+        return TryItExplanation::topic_filter(&term);
     }
     if let Some(tag) = classify_with_media(topic, text, has_video) {
         return tag.explanation;
@@ -166,12 +166,12 @@ pub fn explain_with_media(topic: &str, text: &str, has_video: bool) -> TryItExpl
 ///
 /// Structural cues (lists, durations, lone imperatives) never tag alone.
 ///
-/// Posts about excluded topics (see `crate::topic_filter`: the
-/// reader has moved past those ecosystems) are never tagged, no matter how
+/// Posts mentioning a muted term (see `crate::topic_mute`, the user's
+/// private mute list) are never tagged, no matter how
 /// many cues fire. This only withholds the tag; the post still appears in
 /// briefs.
 pub fn classify_with_media(topic: &str, text: &str, has_video: bool) -> Option<TryItTag> {
-    if crate::topic_filter::excluded_topic(text).is_some() {
+    if crate::topic_mute::excluded_topic(text).is_some() {
         return None;
     }
     let det = detect(text);
@@ -1874,25 +1874,31 @@ mod tests {
 
     #[test]
     fn excluded_topics_are_never_tagged() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new([
+            "zorblax",
+            "quuxwidget",
+            "blorptool",
+            "nousresearch/quux",
+        ]));
         // Each pair: the same hands-on post without and with the topic
         // mention. The bare post tags (proving the cues fire); the topic
         // mention withholds the tag through every classifier entry point.
         let pairs = [
             (
                 "[synthetic] Desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
-                "[synthetic] OpenClaw desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
+                "[synthetic] Zorblax desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
             ),
             (
                 "[synthetic] Box breathing: inhale 4s, hold 4s, exhale 4s, hold 4s. Repeat 4 rounds.",
-                "[synthetic] Box breathing with the Hermes Agent: inhale 4s, hold 4s, exhale 4s, hold 4s. Repeat 4 rounds.",
+                "[synthetic] Box breathing with the QuuxWidget: inhale 4s, hold 4s, exhale 4s, hold 4s. Repeat 4 rounds.",
             ),
             (
                 "[synthetic] Workout: 3 sets of 10 push-ups. Rest 60s between sets.",
-                "[synthetic] Clawdbot workout: 3 sets of 10 push-ups. Rest 60s between sets.",
+                "[synthetic] Blorptool workout: 3 sets of 10 push-ups. Rest 60s between sets.",
             ),
             (
                 "[synthetic] Morning mobility: touch your toes and hold for 20 seconds, then repeat 3 times.",
-                "[synthetic] Morning mobility via nousresearch/hermes: touch your toes and hold for 20 seconds, then repeat 3 times.",
+                "[synthetic] Morning mobility via nousresearch/quux: touch your toes and hold for 20 seconds, then repeat 3 times.",
             ),
         ];
         for (i, (plain, excluded)) in pairs.into_iter().enumerate() {
@@ -1921,10 +1927,16 @@ mod tests {
 
     #[test]
     fn near_miss_topics_still_tag() {
-        // Bare "Hermes" and "clawback" are not excluded topics: hands-on
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new([
+            "zorblax",
+            "quuxwidget",
+            "blorptool",
+            "nousresearch/quux",
+        ]));
+        // "Zorb" and "clawback" are not muted terms: hands-on
         // posts mentioning them keep their tags.
         let texts = [
-            "[synthetic] Hermes desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
+            "[synthetic] Zorb desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
             "[synthetic] Clawback stretch routine: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
         ];
         for text in texts {
@@ -1937,9 +1949,15 @@ mod tests {
 
     #[test]
     fn excluded_topic_post_still_appears_in_brief_untagged() {
-        // The filter withholds the [TRY IT] marker only; the post itself
-        // is still rendered in the brief.
-        let text = "[synthetic] OpenClaw desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.";
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new([
+            "zorblax",
+            "quuxwidget",
+            "blorptool",
+            "nousresearch/quux",
+        ]));
+        // Brief selection drops muted posts (topic_mute); if one is rendered
+        // anyway, the classifier still withholds the [TRY IT] marker.
+        let text = "[synthetic] Zorblax desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.";
         let picks = vec![crate::brief::BriefPick {
             index: 0,
             post_id: "ex-brief".to_string(),
@@ -2419,12 +2437,18 @@ mod tests {
 
     #[test]
     fn explain_covers_topic_filter_tagged_and_untagged() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new([
+            "zorblax",
+            "quuxwidget",
+            "blorptool",
+            "nousresearch/quux",
+        ]));
         let filtered = explain_text(
             "Health & Wellness",
-            "OpenClaw shoulder routine 1) roll 10x 2) hold 20s. Try it now.",
+            "Zorblax shoulder routine 1) roll 10x 2) hold 20s. Try it now.",
         );
         assert_eq!(filtered.stage, CascadeStage::TopicFilter);
-        assert_eq!(filtered.reason, "excluded topic 'openclaw'");
+        assert_eq!(filtered.reason, "muted term 'zorblax'");
         assert_eq!(filtered.confidence, None);
         let tagged = explain_text(
             "Health & Wellness",

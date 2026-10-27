@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+/// Made-up muted term for the cascade demo (shot 12); never a real one.
+pub const DEMO_MUTED_TERM: &str = "zorblax";
+
 pub mod accuracy;
 pub mod muse_runs_demo;
 
@@ -988,20 +991,26 @@ impl Workspace {
     pub fn cascade_demo(&self) -> Result<CascadeDemo, String> {
         let _ = self;
         require_paid_off()?;
-        let text1 = "[synthetic] OpenClaw setup guide: 1) install 2) run. Try it now.";
+        // Same mute config path as the app, with a made-up demo term so
+        // nothing personal is in the repo or on screen.
+        let _mute =
+            bookmarks_agent::topic_mute::set_terms(bookmarks_agent::topic_mute::MuteList::new([
+                DEMO_MUTED_TERM,
+            ]));
+        let text1 = "[synthetic] Zorblax setup guide: 1) install 2) run. Try it now.";
         let topic2 = "Health & Wellness";
         let text2 = "[synthetic] Desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side 3) seated twist 30s each side. Try it now.";
         let topic3 = "Local tooling";
         let text3 = "[synthetic] A quiet note about local file tooling and paper maps.";
-        let excluded = bookmarks_agent::topic_filter::excluded_topic(text1)
-            .ok_or_else(|| "cascade demo: demo-4001 must match an excluded topic".to_string())?;
-        if bookmarks_agent::topic_filter::excluded_topic(text2).is_some() {
+        let excluded = bookmarks_agent::topic_mute::excluded_topic(text1)
+            .ok_or_else(|| "cascade demo: demo-4001 must match a muted term".to_string())?;
+        if bookmarks_agent::topic_mute::excluded_topic(text2).is_some() {
             return Err("cascade demo: demo-4002 must not be topic-filtered".to_string());
         }
         if !try_it::rules_confident(topic2, text2) {
             return Err("cascade demo: demo-4002 must be rules-confident".to_string());
         }
-        if bookmarks_agent::topic_filter::excluded_topic(text3).is_some() {
+        if bookmarks_agent::topic_mute::excluded_topic(text3).is_some() {
             return Err("cascade demo: demo-4003 must not be topic-filtered".to_string());
         }
         if try_it::rules_confident(topic3, text3) {
@@ -1018,7 +1027,7 @@ impl Workspace {
                     post_id: "demo-4001".to_string(),
                     try_it: false,
                     stage: "topic_filter".to_string(),
-                    note: format!("excluded topic '{excluded}', no call"),
+                    note: format!("muted term '{excluded}', no call"),
                 },
                 CascadeItem {
                     post_id: "demo-4002".to_string(),
@@ -1254,7 +1263,7 @@ mod tests {
         assert_eq!(demo.items.len(), 3);
         assert_eq!(demo.items[0].stage, "topic_filter");
         assert!(!demo.items[0].try_it);
-        assert!(demo.items[0].note.contains("openclaw"));
+        assert!(demo.items[0].note.contains("zorblax"));
         assert_eq!(demo.items[1].stage, "rules");
         assert!(demo.items[1].try_it);
         assert_eq!(demo.items[2].stage, "jev");

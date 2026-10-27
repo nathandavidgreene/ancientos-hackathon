@@ -436,11 +436,11 @@ fn full_cascade_through_all_stages() {
 
 #[test]
 fn excluded_topic_is_filtered_before_any_call() {
-    // t1 mentions OpenClaw and would be rules-confident without stage 0;
+    // t1 mentions the synthetic muted term zorblax and would be rules-confident without stage 0;
     // it must answer no with the topic_filter stage and trigger no call.
     // t2 is an ordinary unsure item flowing through jev (no) to muse (yes).
     let t1_text =
-        "Try it: OpenClaw shoulder routine 1) roll shoulders 10x 2) neck tilt 20s each side.";
+        "Try it: Zorblax shoulder routine 1) roll shoulders 10x 2) neck tilt 20s each side.";
     assert!(
         bookmarks_agent::try_it::rules_confident(
             "Health & Wellness",
@@ -477,8 +477,12 @@ fn excluded_topic_is_filtered_before_any_call() {
             ("META_API_BASE", &muse_url),
             ("META_API_KEY", "test-key"),
             ("ANCIENTOS_ALLOW_PAID", "1"),
+            ("ANCIENTOS_MUTED_TERMS", "zorblax"),
         ],
-        &["ANCIENTOS_JEV_TRY_IT_THRESHOLD"],
+        &[
+            "ANCIENTOS_JEV_TRY_IT_THRESHOLD",
+            "ANCIENTOS_MUTED_TERMS_FILE",
+        ],
     );
     assert!(ok, "exit ok, stderr: {stderr}");
     jev_done

@@ -11,7 +11,7 @@ fallback lands on the rules verdict, and `Cascade::decide` never fails.
 ```mermaid
 flowchart TD
   P[bookmark] --> LC[link_context::cascade_input<br/>sanitized post text + sanitized enrichment<br/>enrichment withheld for non-public posts]
-  LC --> S0{Stage 0: topic_filter<br/>off-topic ecosystem?}
+  LC --> S0{Stage 0: topic_filter<br/>muted term?}
   S0 -- yes --> NO0[try_it = no<br/>no API call]
   S0 -- no --> S1{Stage 1: rules verdict}
   S1 -- ConfidentYes --> YES1[try_it = yes<br/>no API call]

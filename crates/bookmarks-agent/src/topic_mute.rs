@@ -7,10 +7,66 @@
 //! newline separated) and/or a file named by `ANCIENTOS_MUTED_TERMS_FILE`
 //! (one term per line, `#` comments). The repo default is empty. Skips are
 //! logged as counts only, never post text or terms.
+//!
+//! This is the single topic filter (P9): the same list also answers try-it
+//! stage 0 ([`excluded_topic`]) for try-it, the try-it cascade, the eval
+//! binary, and demo-runner. Nothing personal is hardcoded in the repo.
 
 use crate::fixture::Bookmark;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+
+thread_local! {
+    /// Per-thread list set by [`with_terms`]; wins over the env config.
+    static OVERRIDE: RefCell<Option<MuteList>> = const { RefCell::new(None) };
+}
+
+/// Restores the previous per-thread override when dropped.
+#[must_use = "the override ends when the guard drops"]
+pub struct TermsGuard(Option<MuteList>);
+
+impl Drop for TermsGuard {
+    /// Put the saved override back.
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        OVERRIDE.with(|o| *o.borrow_mut() = prev);
+    }
+}
+
+/// Make `list` this thread's mute config (instead of the env) until the
+/// returned guard drops. For synthetic demos and tests.
+pub fn set_terms(list: MuteList) -> TermsGuard {
+    TermsGuard(OVERRIDE.with(|o| o.borrow_mut().replace(list)))
+}
+
+/// Run `f` with `list` as this thread's mute config instead of the env
+/// (restored afterwards, even on panic).
+pub fn with_terms<R>(list: MuteList, f: impl FnOnce() -> R) -> R {
+    let _guard = set_terms(list);
+    f()
+}
+
+/// The active mute config: this thread's [`with_terms`] list, else env.
+pub fn current() -> Result<MuteList, String> {
+    if let Some(l) = OVERRIDE.with(|o| o.borrow().clone()) {
+        return Ok(l);
+    }
+    MuteList::from_env()
+}
+
+/// Id returned by [`excluded_topic`] when the config cannot be read.
+pub const CONFIG_ERROR_ID: &str = "mute config unreadable";
+
+/// Try-it stage 0: the muted term `text` mentions under the active config,
+/// or `None`. Fails closed: an unreadable config returns
+/// [`CONFIG_ERROR_ID`], so the post is answered no with no model call.
+pub fn excluded_topic(text: &str) -> Option<String> {
+    match current() {
+        Ok(l) => l.muted_term(text).map(str::to_string),
+        Err(_) => Some(CONFIG_ERROR_ID.to_string()),
+    }
+}
 
 /// Env var holding an inline muted-term list.
 pub const TERMS_ENV_VAR: &str = "ANCIENTOS_MUTED_TERMS";
@@ -88,6 +144,15 @@ impl MuteList {
         self.terms.is_empty()
     }
 
+    /// The first muted term contained in `text` (case-insensitive), or `None`.
+    pub fn muted_term(&self, text: &str) -> Option<&str> {
+        let lower = text.to_lowercase();
+        self.terms
+            .iter()
+            .find(|t| lower.contains(t.as_str()))
+            .map(String::as_str)
+    }
+
     /// True when any text contains a muted term, case-insensitively.
     pub fn matches_any(&self, texts: &[&str]) -> bool {
         if self.terms.is_empty() {
@@ -157,7 +222,7 @@ pub fn filter_for_log(
     rows: &[Bookmark],
     log_path: &Path,
 ) -> Result<(Vec<Bookmark>, SkipCounts), String> {
-    let mute = MuteList::from_env()?;
+    let mute = current()?;
     let cache = match crate::link_context::cache_path_for_log(log_path) {
         Ok(p) => crate::link_context::load_cache(&p),
         Err(_) => HashMap::new(),
@@ -259,6 +324,17 @@ mod tests {
         let (kept, c) = filter_surfaced(&[b], &m, &cache);
         assert!(kept.is_empty());
         assert_eq!(c.muted, 1);
+    }
+
+    #[test]
+    fn excluded_topic_uses_override_and_restores() {
+        let hit = with_terms(MuteList::new(["Zorblax"]), || {
+            excluded_topic("a ZORBLAX post")
+        });
+        assert_eq!(hit.as_deref(), Some("zorblax"));
+        let miss = with_terms(MuteList::new(["zorblax"]), || excluded_topic("plain"));
+        assert_eq!(miss, None);
+        assert!(OVERRIDE.with(|o| o.borrow().is_none()));
     }
 
     #[test]
