@@ -130,6 +130,7 @@ pub enum Status {
 }
 
 impl Status {
+    /// Stable string form of the approval status.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -187,6 +188,7 @@ impl Approval {
         None
     }
 
+    /// True if still pending (not decided, not expired) at `now`.
     pub fn is_pending_at(&self, now: u64) -> bool {
         self.status_at(now) == Status::Pending
     }
@@ -203,10 +205,12 @@ pub struct ReleaseToken {
 }
 
 impl ReleaseToken {
+    /// Id of the approval this token releases.
     pub fn approval_id(&self) -> &str {
         &self.approval_id
     }
 
+    /// Hash of the approved payload this token releases.
     pub fn payload_hash(&self) -> &str {
         &self.payload_hash
     }
@@ -313,6 +317,7 @@ impl ApprovalRequest {
         })
     }
 
+    /// Decision log payload for this request.
     fn to_entry_payload(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
@@ -327,10 +332,12 @@ impl ApprovalRequest {
     }
 }
 
+/// String field `key` of a JSON object.
 fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key)?.as_str().map(str::to_string)
 }
 
+/// u64 field `key` of a JSON object.
 fn u64_field(v: &serde_json::Value, key: &str) -> Option<u64> {
     v.get(key)?.as_u64()
 }
@@ -361,6 +368,7 @@ fn parse_request(v: &serde_json::Value) -> Option<ApprovalRequest> {
     Some(req)
 }
 
+/// Apply an approve or deny entry to the folded approval state, checking the payload hash.
 fn apply_decision(
     folded: &mut BTreeMap<String, Approval>,
     id: &str,
@@ -388,6 +396,7 @@ fn apply_decision(
     });
 }
 
+/// Mark an approval released, if the payload hash matches.
 fn apply_release(folded: &mut BTreeMap<String, Approval>, id: &str, payload_hash: &str) {
     let Some(a) = folded.get_mut(id) else {
         return;
@@ -745,6 +754,7 @@ mod tests {
     const RISKY: &str = "x.post";
     const NOW: u64 = 1_700_000_000;
 
+    /// Test helper: a gate with one low-risk and one high-risk action.
     fn test_gate() -> Gate {
         use crate::gate::Risk;
         let mut g = Gate::new();
@@ -753,6 +763,7 @@ mod tests {
         g
     }
 
+    /// Test helper: open log.
     fn open_log() -> (tempfile::TempDir, DecisionLog, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("decision_log.jsonl");
@@ -760,10 +771,12 @@ mod tests {
         (dir, log, path)
     }
 
+    /// Test helper: len.
     fn len(log: &DecisionLog) -> usize {
         log.verify_or_empty().unwrap().len()
     }
 
+    /// Test helper: propose.
     fn propose(log: &mut DecisionLog, now: u64, payload: serde_json::Value) -> ApprovalRequest {
         request(
             log,

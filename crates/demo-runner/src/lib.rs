@@ -35,10 +35,12 @@ pub struct Workspace {
     dir: PathBuf,
 }
 
+/// Turn any displayable error into a String.
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// Category of a demo bookmark: its parent label, else `unknown`.
 pub fn category(b: &Bookmark) -> String {
     b.label
         .as_ref()
@@ -47,6 +49,7 @@ pub fn category(b: &Bookmark) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// Sensitivity for a category: above the Public data class is Sensitive, else Sanitized.
 pub fn sensitivity(cat: &str) -> Sensitivity {
     // Same rule as before, via the shared data-class table: sensitive and
     // unknown categories are above Public, everything else is Public.
@@ -76,21 +79,26 @@ pub fn select(rows: &[Bookmark], day: usize, n: usize) -> Vec<&Bookmark> {
 }
 
 impl Workspace {
+    /// Open or create a demo workspace in `dir`.
     pub fn new(dir: impl AsRef<Path>) -> Result<Self, String> {
         std::fs::create_dir_all(dir.as_ref()).map_err(err)?;
         Ok(Self {
             dir: dir.as_ref().into(),
         })
     }
+    /// Bookmark store path.
     fn store(&self) -> PathBuf {
         self.dir.join("store.jsonl")
     }
+    /// Brief output path.
     fn brief_path(&self) -> PathBuf {
         self.dir.join("brief.json")
     }
+    /// Decision log path.
     pub fn log_path(&self) -> PathBuf {
         self.dir.join("decision_log.jsonl")
     }
+    /// Open the decision log.
     fn log(&self) -> Result<DecisionLog, String> {
         DecisionLog::open(self.log_path()).map_err(err)
     }
@@ -125,6 +133,7 @@ impl Workspace {
         Ok(n)
     }
 
+    /// Categories auto-approved under `policy`, from the logged votes.
     pub fn auto_approved(&self, policy: ThresholdPolicy) -> Result<BTreeSet<String>, String> {
         let log = self.log()?;
         Ok(feedback::auto_approved(
@@ -770,10 +779,12 @@ struct FixedReply {
 }
 
 impl ModelClient for FixedReply {
+    /// Mock destination.
     fn destination(&self) -> Destination {
         self.dest
     }
 
+    /// Canned reply.
     fn complete(&self, _prompt: &str) -> Result<String, RouterError> {
         Ok(self.reply.clone())
     }
@@ -786,6 +797,7 @@ impl Workspace {
         self.dir.join("deeper")
     }
 
+    /// Agent context for approvals in this workspace at `now`.
     fn approvals_ctx(&self, now: u64) -> daemon::AgentCtx {
         daemon::AgentCtx {
             log_path: self.log_path(),
@@ -1156,6 +1168,7 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    /// Test helper: fixture path.
     fn fixture_path() -> PathBuf {
         PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1220,6 +1233,7 @@ mod tests {
         assert!(select(&[], 0, 5).is_empty());
     }
 
+    /// Test helper: second fixture path.
     fn second_fixture_path() -> PathBuf {
         PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),

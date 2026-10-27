@@ -32,6 +32,7 @@ pub struct ThreadPost {
     pub quoted: Option<(String, String)>,
 }
 
+/// Full text of a tweet, preferring the long note_tweet text.
 fn full_text_of(tweet: &serde_json::Value) -> String {
     if let Some(s) = tweet
         .get("note_tweet")
@@ -48,6 +49,7 @@ fn full_text_of(tweet: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// Non-empty string field `key` of a JSON object.
 fn non_empty_str(value: &serde_json::Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -92,6 +94,7 @@ pub fn parse_post(value: &serde_json::Value) -> Option<ThreadPost> {
     })
 }
 
+/// True if `post` is a reply to `parent_id`.
 fn replies_to(post: &ThreadPost, parent_id: &str) -> bool {
     post.referenced_tweets
         .iter()
@@ -142,6 +145,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Test helper: post.
     fn post(id: &str, author: &str, reply_to: Option<&str>, created: Option<&str>) -> ThreadPost {
         ThreadPost {
             id: id.into(),
@@ -161,6 +165,7 @@ mod tests {
         }
     }
 
+    /// Test helper: ids.
     fn ids(chain: &[ThreadPost]) -> Vec<&str> {
         chain.iter().map(|p| p.id.as_str()).collect()
     }

@@ -7,6 +7,7 @@ unset ANCIENTOS_ALLOW_PAID
 unset META_API_KEY MODAL_LLAMA_URL ANCIENTOS_LOCAL_LLM_URL ANCIENTOS_LOCAL_LLM_MODEL X_CLIENT_ID || true
 DATA="$(mktemp -d)"
 trap 'rm -rf "$DATA"' EXIT
+# Print usage and exit.
 usage() {
   echo "usage: scripts/demo.sh [--shot N]" >&2
   echo "  N is 1..14; no args runs all shots" >&2
@@ -36,17 +37,20 @@ export IDEA_BACKLOG_PATH="$DATA/backlog.md"
 export ANCIENTOS_FIXTURE=""
 export ANCIENTOS_DEMO_FIXED_NOW="2026-10-26T00:00:00Z"
 mkdir -p "$ANCIENTOS_HOME"
+# Run the demo-runner binary against the demo data dir.
 run() { ./target/debug/demo-runner --data "$DATA" "$@"; }
 
 FIX1="fixtures/demo/synthetic_bookmarks.jsonl"
 FIX2="fixtures/demo/try_it_and_thread_bookmarks.jsonl"
 FIX3="fixtures/demo/deeper_thread_bookmarks.jsonl"
 
+# Shot 1: print the "Saved != read" beat.
 shot1() {
   echo "==== Shot 1/14: Saved != read ===="
   run count "$FIX1" "$FIX2"
 }
 
+# Shot 2: print the "Rust rebuild" beat.
 shot2() {
   echo "==== Shot 2/14: Rust rebuild ===="
   echo "WordCraft (public post, handle blurred) -> repo tree:"
@@ -56,6 +60,7 @@ shot2() {
   echo "crates/demo-runner"
 }
 
+# Shot 3: print the "Governed agent core" beat.
 shot3() {
   echo "==== Shot 3/14: Governed agent core ===="
   echo "scheduler -> gate -> decision_log"
@@ -63,12 +68,14 @@ shot3() {
   echo "fail-closed gate; append-only, hash-chained decision log"
 }
 
+# Shot 4: print the "Read-only sync" beat.
 shot4() {
   echo "==== Shot 4/14: Read-only sync ===="
   run sync "$FIX1"
   run sync "$FIX2"
 }
 
+# Shot 5: print the "Morning brief" beat.
 shot5() {
   echo "==== Shot 5/14: Morning brief ===="
   run brief-rich 3
@@ -76,11 +83,13 @@ shot5() {
   run translate-demo
 }
 
+# Shot 6: print the "Privacy routing" beat.
 shot6() {
   echo "==== Shot 6/14: Privacy routing ===="
   run routing
 }
 
+# Shot 7: print the "Voting and thresholds" beat.
 shot7() {
   echo "==== Shot 7/14: Voting and thresholds ===="
   run vote-demo
@@ -88,22 +97,26 @@ shot7() {
   run author-demo
 }
 
+# Shot 8: print the "Delegate to idea" beat.
 shot8() {
   echo "==== Shot 8/14: Delegate to idea ===="
   run delegate-demo demo-2001
 }
 
+# Shot 9: print the "Try it" beat.
 shot9() {
   echo "==== Shot 9/14: Try it ===="
   run try-demo
 }
 
+# Shot 10: print the "Provable log" beat.
 shot10() {
   echo "==== Shot 10/14: Provable log ===="
   run log
   run tamper-demo
 }
 
+# Shot 11: print the "Agent proposes, you approve" beat.
 shot11() {
   echo "==== Shot 11/14: Agent proposes, you approve ===="
   echo "Paid is simulated via a mock (no network, ANCIENTOS_ALLOW_PAID unset):"
@@ -121,11 +134,13 @@ shot11() {
   ./target/debug/bookmarks-agent approve "$APPROVAL_ID" --now "2030-01-01T00:00:02Z" 2>&1 || true
 }
 
+# Shot 12: print the "Try it, decided in stages" beat.
 shot12() {
   echo "==== Shot 12/14: Try it, decided in stages ===="
   run cascade-demo
 }
 
+# Shot 13: print the "Built with Meta" beat.
 shot13() {
   echo "==== Shot 13/14: Built with Meta ===="
   RUNS=$(grep -E '^\| [0-9]+[a-z]? ' docs/muse-code-log.md | grep -vc 'Not used')
@@ -134,6 +149,7 @@ shot13() {
   cat docs/muse-code-log.md
 }
 
+# Shot 14: print the "Roadmap" beat.
 shot14() {
   echo "==== Shot 14/14: Roadmap ===="
   echo "Roadmap: more agents on core, custom X feed ranking, go-deeper sessions."
@@ -146,6 +162,7 @@ shot14() {
   ./target/debug/bookmarks-agent deeper demo-3001 --offline "$FIX3" | grep -v '^Saved: ' | head -n 8
 }
 
+# Prepare synced fixture data without printing anything.
 setup_sync_silent() {
   run sync "$FIX1" >/dev/null 2>&1
   run sync "$FIX2" >/dev/null 2>&1

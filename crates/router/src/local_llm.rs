@@ -51,10 +51,12 @@ impl LocalLlmClient {
         }
     }
 
+    /// Base URL, if set.
     pub fn base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
     }
 
+    /// Model name.
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -134,10 +136,12 @@ impl LocalLlmClient {
 }
 
 impl ModelClient for LocalLlmClient {
+    /// Test helper: destination.
     fn destination(&self) -> Destination {
         Destination::LocalLlama
     }
 
+    /// Complete a prompt on the local LLM.
     fn complete(&self, prompt: &str) -> Result<String, RouterError> {
         // Cheap preflight before sensitive dispatch: fail closed with the
         // fix hint instead of attempting the chat call against a dead server.
@@ -154,6 +158,7 @@ impl ModelClient for LocalLlmClient {
     }
 }
 
+/// Non-empty env var.
 fn get_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
@@ -187,6 +192,7 @@ fn unavailable(url: &str, reason: &str) -> RouterError {
     ))
 }
 
+/// Map a ureq error to a router error.
 fn map_ureq_error(e: ureq::Error) -> RouterError {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -538,9 +544,11 @@ mod tests {
             seen: RefCell<Vec<String>>,
         }
         impl ModelClient for Recorder {
+            /// Test helper: destination.
             fn destination(&self) -> Destination {
                 self.dest
             }
+            /// Test helper: complete.
             fn complete(&self, p: &str) -> Result<String, RouterError> {
                 self.seen.borrow_mut().push(p.into());
                 Ok("muse reply".into())

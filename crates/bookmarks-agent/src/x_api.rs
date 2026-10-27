@@ -70,6 +70,7 @@ pub fn thread_root_url(id: &str) -> Result<String, String> {
     ))
 }
 
+/// Build the X recent-search query for a thread's replies by its author.
 fn search_query(conversation_id: &str, author_username: &str) -> Result<String, String> {
     validate_post_id(conversation_id).map_err(|_| "invalid conversation id".to_string())?;
     if author_username.is_empty()
@@ -139,6 +140,7 @@ fn full_text_of(tweet: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// True if the tweet has a note_tweet (long post) body.
 fn had_note_tweet(tweet: &serde_json::Value) -> bool {
     tweet
         .get("note_tweet")
@@ -275,10 +277,12 @@ pub struct ThreadFetch {
     pub search_note: Option<String>,
 }
 
+/// Error text shown when a paid call is blocked by `ANCIENTOS_ALLOW_PAID`.
 fn paid_error() -> String {
     "paid calls are disabled (set ANCIENTOS_ALLOW_PAID=1 to enable)".to_string()
 }
 
+/// Fail closed unless `ANCIENTOS_ALLOW_PAID=1`.
 fn require_paid() -> Result<(), String> {
     match std::env::var("ANCIENTOS_ALLOW_PAID") {
         Ok(v) if v == "1" => Ok(()),
@@ -395,6 +399,7 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
     Ok(Page { items, next_token })
 }
 
+/// GET a URL with a bearer token and parse the JSON body.
 fn get_json(url: &str, access_token: &str) -> Result<serde_json::Value, String> {
     ureq::get(url)
         .timeout(std::time::Duration::from_secs(30))
@@ -405,6 +410,7 @@ fn get_json(url: &str, access_token: &str) -> Result<serde_json::Value, String> 
         .map_err(|e| format!("bad X API response: {e}"))
 }
 
+/// Map a ureq error to a short message without leaking secrets.
 fn map_ureq_error(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -450,6 +456,7 @@ impl XApiSource {
         Self::new(tokens, client_id)
     }
 
+    /// Refresh the access token if it is near expiry.
     fn ensure_fresh_token(&mut self) -> Result<(), String> {
         if !self.tokens.is_expired() {
             return Ok(());
@@ -475,6 +482,7 @@ impl XApiSource {
         Ok(())
     }
 
+    /// Authenticated user's id (cached after first lookup).
     fn user_id(&mut self) -> Result<String, String> {
         if let Some(id) = &self.user_id {
             return Ok(id.clone());
@@ -599,6 +607,7 @@ pub fn hydrate(ids: &[String]) -> Result<HashMap<String, String>, String> {
     src.hydrate(ids)
 }
 
+/// Build an X API source from the local token store.
 fn source_from_store() -> Result<XApiSource, String> {
     require_paid()?;
     let client_id = std::env::var("X_CLIENT_ID")
@@ -686,6 +695,7 @@ pub fn liveness_url(ids: &[String]) -> Result<String, String> {
     hydrate_url(ids)
 }
 
+/// Post ids named in an X API error object.
 fn liveness_ids_of_error(err: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(id) = err.get("resource_id").and_then(|v| v.as_str()) {
@@ -715,6 +725,7 @@ fn liveness_ids_of_error(err: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Classify an X API error as deleted, protected, or unknown liveness.
 fn classify_liveness_error(err: &serde_json::Value) -> PostLiveness {
     let text = format!(
         "{} {} {}",
@@ -824,6 +835,7 @@ pub fn check_liveness(ids: &[String]) -> Result<HashMap<String, PostLiveness>, S
 }
 
 impl BookmarkSource for XApiSource {
+    /// Fetch one page of bookmarks from the X API (paid, gated).
     fn fetch(&mut self, pagination_token: Option<&str>) -> Result<Page, String> {
         require_paid()?;
         let uid = self.user_id()?;
@@ -842,10 +854,12 @@ impl BookmarkSource for XApiSource {
 mod tests {
     use super::*;
 
+    /// Test helper: env lock.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::lock_env()
     }
 
+    /// Test helper: tokens.
     fn tokens() -> StoredTokens {
         StoredTokens::new(
             "access".into(),

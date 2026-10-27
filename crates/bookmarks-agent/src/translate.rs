@@ -48,6 +48,7 @@ pub enum TranslationStatus {
 }
 
 impl TranslationStatus {
+    /// Stable string form of the translation status.
     pub fn as_str(self) -> &'static str {
         match self {
             TranslationStatus::Translated => "translated",
@@ -390,6 +391,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    /// Test helper: bm.
     fn bm(id: &str, text: &str, lang: Option<&str>) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -420,6 +422,7 @@ mod tests {
     }
 
     impl Mock {
+        /// Test helper: ok.
         fn ok(dest: ancientos_router::Destination, reply: &str) -> Self {
             Self {
                 dest,
@@ -428,6 +431,7 @@ mod tests {
             }
         }
 
+        /// Test helper: err.
         fn err(dest: ancientos_router::Destination) -> Self {
             Self {
                 dest,
@@ -436,16 +440,19 @@ mod tests {
             }
         }
 
+        /// Test helper: calls.
         fn calls(&self) -> usize {
             self.seen.borrow().len()
         }
     }
 
     impl ancientos_router::ModelClient for Mock {
+        /// Test helper: destination.
         fn destination(&self) -> ancientos_router::Destination {
             self.dest
         }
 
+        /// Test helper: complete.
         fn complete(&self, prompt: &str) -> Result<String, ancientos_router::RouterError> {
             self.seen.borrow_mut().push(prompt.to_string());
             match self.reply.as_ref().expect("mock reply") {
@@ -457,10 +464,12 @@ mod tests {
         }
     }
 
+    /// Test helper: muse mock.
     fn muse_mock(reply: &str) -> Mock {
         Mock::ok(ancientos_router::Destination::MuseSpark, reply)
     }
 
+    /// Test helper: local mock.
     fn local_mock(reply: &str) -> Mock {
         Mock::ok(ancientos_router::Destination::LocalLlama, reply)
     }

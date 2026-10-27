@@ -51,6 +51,7 @@ fn label_rank(label: Option<&Label>) -> u8 {
     }
 }
 
+/// Confidence score of an optional label, with a default when missing.
 fn confidence_of(label: Option<&Label>) -> f64 {
     label.and_then(|l| l.confidence).unwrap_or(-1.0)
 }
@@ -74,6 +75,7 @@ fn better_label(live: Option<&Label>, fixture: Option<&Label>) -> Option<Label> 
     }
 }
 
+/// Union of two optional folder lists.
 fn union_folders(a: Option<&Vec<String>>, b: Option<&Vec<String>>) -> Option<Vec<String>> {
     let mut set = BTreeSet::new();
     for list in [a, b].into_iter().flatten() {
@@ -86,6 +88,7 @@ fn union_folders(a: Option<&Vec<String>>, b: Option<&Vec<String>>) -> Option<Vec
     }
 }
 
+/// Merge a live bookmark with its fixture twin (live fields win, labels kept).
 fn merge_pair(live: &Bookmark, fixture: &Bookmark) -> Bookmark {
     let mut merged = live.clone();
     merged.label = better_label(live.label.as_ref(), fixture.label.as_ref());
@@ -175,6 +178,7 @@ pub fn load_merged(cli_fixture: Option<&str>) -> Result<MergeOutput, String> {
     load_merged_from(cli_fixture, None)
 }
 
+/// Load and merge live and fixture bookmarks from explicit paths.
 fn load_merged_from(
     cli_fixture: Option<&str>,
     live_path_override: Option<&Path>,
@@ -195,6 +199,7 @@ fn load_merged_from(
 mod tests {
     use super::*;
 
+    /// Test helper: bm.
     fn bm(id: &str, text: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -211,6 +216,7 @@ mod tests {
         }
     }
 
+    /// Test helper: labeled.
     fn labeled(
         mut b: Bookmark,
         method: Option<&str>,
@@ -486,6 +492,7 @@ mod tests {
         }
     }
 
+    /// Test helper: env lock.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
         ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())

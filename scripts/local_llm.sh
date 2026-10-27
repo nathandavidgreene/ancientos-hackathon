@@ -17,6 +17,7 @@ TAGS_URL="$API_BASE/api/tags"
 START_TIMEOUT_SECS=30
 CURL_TIMEOUT_SECS=3
 
+# Print an error and exit 1.
 die() { echo "error: $*" >&2; exit 1; }
 
 command -v curl >/dev/null 2>&1 || die "curl not found; install curl to manage the local LLM"
@@ -24,10 +25,13 @@ command -v curl >/dev/null 2>&1 || die "curl not found; install curl to manage t
 # --noproxy: loopback health checks must not depend on proxy config.
 api_up() { curl -sf --noproxy '*' --max-time "$CURL_TIMEOUT_SECS" "$TAGS_URL" >/dev/null 2>&1; }
 
+# Fetch the Ollama model list as JSON.
 tags_json() { curl -sf --noproxy '*' --max-time "$CURL_TIMEOUT_SECS" "$TAGS_URL" 2>/dev/null; }
 
+# True when the configured model is already pulled.
 model_present() { tags_json 2>/dev/null | grep -q -F "\"name\":\"$MODEL\""; }
 
+# Pull the configured model.
 pull_model() {
   if model_present; then
     echo "model $MODEL present at $BASE_URL"
@@ -37,6 +41,7 @@ pull_model() {
   fi
 }
 
+# start: launch the server if it is down, then pull the model if missing.
 cmd_start() {
   if api_up; then
     echo "local LLM already running at $BASE_URL"
@@ -57,12 +62,14 @@ cmd_start() {
   echo "local LLM ready: $BASE_URL ($MODEL)"
 }
 
+# health: check the API is up and the model is present, changing nothing.
 cmd_health() {
   api_up || die "local LLM unavailable at $TAGS_URL; run scripts/local_llm.sh start (sensitive data was NOT sent elsewhere)"
   model_present || die "model $MODEL not present at $BASE_URL; run scripts/local_llm.sh start to pull it"
   echo "local LLM healthy: $BASE_URL ($MODEL)"
 }
 
+# ensure: idempotent start; restarts only when the API is down.
 cmd_ensure() {
   if api_up; then
     echo "local LLM already running at $BASE_URL"

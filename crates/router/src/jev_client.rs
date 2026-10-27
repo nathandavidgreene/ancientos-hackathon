@@ -73,6 +73,7 @@ pub enum JevBackend {
 }
 
 impl JevBackend {
+    /// Router destination for this backend.
     fn destination(self) -> Destination {
         match self {
             JevBackend::TypeSafe => Destination::Jev,
@@ -170,18 +171,22 @@ impl JevClient {
         }
     }
 
+    /// Configured backend (frontier or local).
     pub fn backend(&self) -> JevBackend {
         self.backend
     }
 
+    /// Base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
+    /// Model name.
     pub fn model(&self) -> &str {
         &self.model
     }
 
+    /// True if paid calls are allowed.
     pub fn allow_paid(&self) -> bool {
         self.allow_paid
     }
@@ -314,6 +319,7 @@ impl SystemOneReply {
 }
 
 impl ModelClient for JevClient {
+    /// Destination of the configured backend.
     fn destination(&self) -> Destination {
         self.backend.destination()
     }
@@ -325,6 +331,7 @@ impl ModelClient for JevClient {
         JevClient::complete_with_class(self, DataClass::Restricted, "jev.complete", None, prompt)
     }
 
+    /// Complete a prompt, checking sensitivity first.
     fn complete_with_sensitivity(
         &self,
         s: Sensitivity,
@@ -333,6 +340,7 @@ impl ModelClient for JevClient {
         JevClient::complete_with_sensitivity(self, s, prompt)
     }
 
+    /// Complete a prompt, checking the data class against the route and logging egress.
     fn complete_with_class(
         &self,
         class: DataClass,
@@ -400,16 +408,19 @@ fn post_systemone(
     })
 }
 
+/// Non-empty env var.
 fn get_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// True when `ANCIENTOS_ALLOW_PAID=1`.
 fn is_paid_allowed() -> bool {
     std::env::var(ALLOW_PAID_ENV)
         .map(|v| v == "1")
         .unwrap_or(false)
 }
 
+/// Map a ureq error to a router error.
 fn map_ureq_error(e: ureq::Error) -> RouterError {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -441,6 +452,7 @@ mod tests {
     }
 
     impl EnvGuard {
+        /// Test helper: set.
         fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
             let mut saved = Vec::with_capacity(pairs.len());
             for (key, value) in pairs {
@@ -455,6 +467,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
+        /// Test helper: drop.
         fn drop(&mut self) {
             for (key, value) in self.saved.drain(..) {
                 match value {
@@ -559,14 +572,17 @@ mod tests {
 
     const OK_BODY: &str = r#"{"model":"jev-1.14.0","answers":{"q":{"type":"noul","noul":0.9}},"usage":{"input_tokens":304,"output_tokens":21}}"#;
 
+    /// Test helper: qs.
     fn qs() -> serde_json::Value {
         serde_json::json!({"q": {"type": "noul", "instructions": "yes?"}})
     }
 
+    /// Test helper: typesafe client.
     fn typesafe_client(base_url: String, allow_paid: bool) -> JevClient {
         JevClient::new(JevBackend::TypeSafe, base_url, "test-jevo", allow_paid)
     }
 
+    /// Test helper: localjev client.
     fn localjev_client(base_url: String) -> JevClient {
         // allow_paid=false on purpose: localjev must never be paid-gated.
         JevClient::new(JevBackend::LocalJev, base_url, "test-localjev", false)

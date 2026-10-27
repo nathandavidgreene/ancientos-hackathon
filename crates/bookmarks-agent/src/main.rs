@@ -59,6 +59,7 @@ use std::path::PathBuf;
 
 const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | rank [--top N] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> [--now <rfc3339>] | deny <id> [reason] [--now <rfc3339>] | run [--once] [--now <rfc3339>] [--offline <fixture>] | wiki ingest <post_id> | wiki ingest --delegated | wiki query \"<question>\" [--file-back] | wiki lint | wiki show <slug> | stats";
 
+/// X OAuth client id from the environment.
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
         .ok()
@@ -66,6 +67,7 @@ fn client_id() -> Result<String, String> {
         .ok_or_else(|| "X_CLIENT_ID not set".to_string())
 }
 
+/// `auth-url`: print the X OAuth authorize URL.
 fn cmd_auth_url() -> Result<(), String> {
     let id = client_id()?;
     let verifier = oauth::generate_verifier().map_err(|e| e.to_string())?;
@@ -74,6 +76,7 @@ fn cmd_auth_url() -> Result<(), String> {
     Ok(())
 }
 
+/// `login`: run the X OAuth PKCE flow and store tokens locally.
 fn cmd_login() -> Result<(), String> {
     let id = client_id()?;
     let verifier = oauth::generate_verifier().map_err(|e| e.to_string())?;
@@ -101,6 +104,7 @@ fn cmd_login() -> Result<(), String> {
     Ok(())
 }
 
+/// Parse `--max-pages N` for `sync` (fails closed on bad values).
 fn parse_max_pages(args: &[String]) -> Result<usize, String> {
     if args.is_empty() {
         return Ok(1);
@@ -134,6 +138,7 @@ fn parse_max_pages(args: &[String]) -> Result<usize, String> {
     Err(USAGE.to_string())
 }
 
+/// `sync`: incremental bookmark sync from the X API (paid, gated).
 fn cmd_sync(args: &[String]) -> Result<(), String> {
     let max_pages = parse_max_pages(args)?;
     let id = client_id()?;
@@ -150,6 +155,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `load`: load bookmarks from a JSONL fixture into the store.
 fn cmd_load(args: &[String]) -> Result<(), String> {
     let path = args
         .first()
@@ -163,6 +169,7 @@ fn cmd_load(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Parse `brief` flags: (fixture, date, dry-run).
 fn parse_brief_args(args: &[String]) -> Result<(Option<String>, Option<String>, bool), String> {
     let mut fixture: Option<String> = None;
     let mut out: Option<String> = None;
@@ -202,6 +209,7 @@ fn parse_brief_args(args: &[String]) -> Result<(Option<String>, Option<String>, 
     Ok((fixture, out, offline))
 }
 
+/// `brief`: build today's brief.
 fn cmd_brief(args: &[String]) -> Result<(), String> {
     let (fixture, out, offline) = parse_brief_args(args)?;
     let merged = merge::load_merged(fixture.as_deref())?;
@@ -308,6 +316,7 @@ fn cmd_rank(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse `vote` arguments: (post id, verdict, reasons, note).
 fn parse_vote_args(
     args: &[String],
 ) -> Result<(String, String, Vec<String>, Option<String>), String> {
@@ -356,6 +365,7 @@ fn parse_vote_args(
     Ok((post_id, verdict, tags, fixture))
 }
 
+/// `vote`: record a feedback vote on a pick.
 fn cmd_vote(args: &[String]) -> Result<(), String> {
     let (post_id, verdict_s, tags, fixture) = parse_vote_args(args)?;
     let verdict: bookmarks_agent::feedback::Verdict = verdict_s.parse().map_err(|e: String| e)?;
@@ -376,6 +386,7 @@ fn cmd_vote(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `unhide-author`: remove an author from the never-this-author list.
 fn cmd_unhide_author(args: &[String]) -> Result<(), String> {
     if args.len() != 1 || args[0].trim().is_empty() {
         return Err(USAGE.to_string());
@@ -386,6 +397,7 @@ fn cmd_unhide_author(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `hidden-authors`: list hidden authors.
 fn cmd_hidden_authors(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err(USAGE.to_string());
@@ -526,6 +538,7 @@ fn parse_deeper_args(args: &[String]) -> Result<DeeperArgs, String> {
     }
 }
 
+/// `deeper`: read a post's thread and links in more depth.
 fn cmd_deeper(args: &[String]) -> Result<(), String> {
     let parsed = parse_deeper_args(args)?;
     if let Some(at) = parsed.later_at {
@@ -546,6 +559,7 @@ fn cmd_deeper(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `deeper-queue`: list or work the queue of deeper requests.
 fn cmd_deeper_queue(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err(USAGE.to_string());
@@ -569,6 +583,7 @@ fn cmd_deeper_queue(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `delegate`: hand an idea off to another agent (proposal only).
 fn cmd_delegate(args: &[String]) -> Result<(), String> {
     if args.len() != 1 || args[0].is_empty() {
         return Err(USAGE.to_string());
@@ -583,6 +598,7 @@ fn cmd_delegate(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Format one idea card as a single summary line.
 fn format_idea_line(card: &idea_card::IdeaCard) -> String {
     format!(
         "{} {:?} {} {} {}",
@@ -604,6 +620,7 @@ fn bookmarks_for_filtering() -> Vec<fixture::Bookmark> {
         .unwrap_or_default()
 }
 
+/// `ideas`: list idea cards.
 fn cmd_ideas(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err(USAGE.to_string());
@@ -624,6 +641,7 @@ fn cmd_ideas(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse a triage verb (`adopt`, `park`, `drop`).
 fn parse_triage_decision(s: &str) -> Result<idea_card::Triage, String> {
     match s {
         "adopt" => Ok(idea_card::Triage::Adopt),
@@ -642,6 +660,7 @@ fn backlog_path_for(value: &str) -> PathBuf {
     }
 }
 
+/// Backlog file for adopted ideas, from `IDEA_BACKLOG_PATH` or the default.
 fn backlog_path() -> PathBuf {
     backlog_path_for(&std::env::var("IDEA_BACKLOG_PATH").unwrap_or_default())
 }
@@ -656,6 +675,7 @@ fn status_str(status: idea_card::Status) -> &'static str {
     }
 }
 
+/// `triage`: apply a triage decision to an idea card.
 fn cmd_triage(args: &[String]) -> Result<(), String> {
     if args.len() != 2 || args[0].is_empty() || args[1].is_empty() {
         return Err(USAGE.to_string());
@@ -691,6 +711,7 @@ fn cmd_triage(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `tried`: mark a try-it item as tried or not.
 fn cmd_tried(args: &[String]) -> Result<(), String> {
     if args.len() < 2 || args[0].is_empty() {
         return Err(USAGE.to_string());
@@ -712,6 +733,7 @@ fn cmd_tried(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `try-pending`: list try-it items still waiting for a result.
 fn cmd_try_pending(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err(USAGE.to_string());
@@ -784,6 +806,7 @@ fn parse_digest_args(args: &[String]) -> Result<DigestArgs, String> {
     Ok(DigestArgs { now, dry_run })
 }
 
+/// `digest`: write the periodic digest.
 fn cmd_digest(args: &[String]) -> Result<(), String> {
     let parsed = parse_digest_args(args)?;
     let now_override = parsed.now.is_some();
@@ -819,6 +842,7 @@ fn one_line_summary(summary: &str) -> String {
         .join(" ")
 }
 
+/// `approvals`: list pending and decided approvals.
 fn cmd_approvals(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err(USAGE.to_string());
@@ -905,6 +929,7 @@ fn parse_decide_args(args: &[String], is_deny: bool) -> Result<DecideArgs, Strin
     })
 }
 
+/// `approve`: approve a pending approval by id.
 fn cmd_approve(args: &[String]) -> Result<(), String> {
     let parsed = parse_decide_args(args, false)?;
     let log_path = brief::decision_log_path()?;
@@ -920,6 +945,7 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `deny`: deny a pending approval by id.
 fn cmd_deny(args: &[String]) -> Result<(), String> {
     let parsed = parse_decide_args(args, true)?;
     let log_path = brief::decision_log_path()?;
@@ -1016,6 +1042,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     Ok(RunArgs { once, now, offline })
 }
 
+/// `run`: start the daemon with its scheduled agents.
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let parsed = parse_run_args(args)?;
     if let Some(fixture) = &parsed.offline {
@@ -1060,6 +1087,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// `wiki ingest`: add sources to the wiki raw store.
 fn cmd_wiki_ingest(args: &[String]) -> Result<(), String> {
     if args.len() == 1 && args[0] == "--delegated" {
         let reports = wiki::ingest_delegated()?;
@@ -1093,6 +1121,7 @@ fn cmd_wiki_ingest(args: &[String]) -> Result<(), String> {
     Err(USAGE.to_string())
 }
 
+/// `wiki query`: answer a question from cited wiki pages.
 fn cmd_wiki_query(args: &[String]) -> Result<(), String> {
     let (question, file_back) = match args {
         [q] if !q.trim().is_empty() => (q.as_str(), false),
@@ -1114,6 +1143,7 @@ fn cmd_wiki_query(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `wiki lint`: check the wiki and propose fixes.
 fn cmd_wiki_lint(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err(USAGE.to_string());
@@ -1125,6 +1155,7 @@ fn cmd_wiki_lint(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `wiki show`: print one wiki page.
 fn cmd_wiki_show(args: &[String]) -> Result<(), String> {
     if args.len() != 1 || args[0].is_empty() {
         return Err(USAGE.to_string());
@@ -1134,6 +1165,7 @@ fn cmd_wiki_show(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `wiki`: dispatch to the wiki subcommands.
 fn cmd_wiki(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("ingest") => cmd_wiki_ingest(&args[1..]),
@@ -1209,6 +1241,7 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Test helper: sample card.
     fn sample_card() -> idea_card::IdeaCard {
         idea_card::IdeaCard {
             id: "abc123".to_string(),

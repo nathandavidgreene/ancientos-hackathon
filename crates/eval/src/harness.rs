@@ -33,6 +33,7 @@ pub fn load_labels(path: impl AsRef<Path>) -> Result<Vec<Label>, String> {
     parse_labels(&text)
 }
 
+/// Parse labels JSONL.
 fn parse_labels(text: &str) -> Result<Vec<Label>, String> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
@@ -55,6 +56,7 @@ pub struct Confusion {
     pub tn: usize,
 }
 
+/// Divide, 0.0 when `den` is 0.
 fn safe_div(num: usize, den: usize) -> f64 {
     if den == 0 {
         0.0
@@ -270,6 +272,7 @@ pub fn load_verdicts(path: impl AsRef<Path>) -> Result<Vec<VerdictEntry>, String
     Ok(out)
 }
 
+/// Map a logged verdict to a ranker training signal; `None` for verdicts that carry no preference, error for unknown ones.
 fn signal_of(
     verdict: &str,
     line_hint: &str,
@@ -312,6 +315,7 @@ pub struct RankingComparison {
     pub ranker_active: bool,
 }
 
+/// Share of numbered picks that are labeled worthy (precision at 5).
 fn precision_at_5(
     candidates: &[bookmarks_agent::brief::Candidate],
     picks: &[(usize, String)],
@@ -522,6 +526,7 @@ pub fn render_markdown(report: &EvalReport) -> String {
 mod tests {
     use super::*;
 
+    /// Test helper: approx.
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
     }
@@ -629,10 +634,12 @@ mod tests {
         assert_eq!(negatives.accuracy(), 1.0);
     }
 
+    /// Test helper: fixture path.
     fn fixture_path(name: &str) -> String {
         format!("{}/../../fixtures/eval/{name}", env!("CARGO_MANIFEST_DIR"))
     }
 
+    /// Test helper: load synthetic.
     fn load_synthetic() -> (Vec<Bookmark>, Vec<Label>) {
         let bookmarks =
             bookmarks_agent::fixture::load(fixture_path("synthetic_bookmarks.jsonl")).unwrap();
@@ -685,6 +692,7 @@ mod tests {
 
     #[test]
     fn non_english_bookmarks_are_sampled_and_scored_on_translation() {
+        /// Test helper: bm.
         fn bm(id: &str, text: &str, lang: Option<&str>) -> Bookmark {
             Bookmark {
                 post_id: id.to_string(),

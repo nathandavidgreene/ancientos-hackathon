@@ -68,6 +68,7 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
+    /// Cache entry for a liveness status checked at `checked_at`.
     fn for_status(status: PostLiveness, checked_at: u64) -> Self {
         let (s, reason) = match status {
             PostLiveness::Live => ("live", None),
@@ -81,6 +82,7 @@ impl CacheEntry {
         }
     }
 
+    /// Convert a cache entry back into a liveness status.
     fn to_liveness(&self) -> PostLiveness {
         match self.status.as_str() {
             "live" => PostLiveness::Live,
@@ -309,6 +311,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    /// Test helper: bm.
     fn bm(id: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -325,6 +328,7 @@ mod tests {
         }
     }
 
+    /// Test helper: mock lookup.
     fn mock_lookup(
         map: HashMap<String, PostLiveness>,
         calls: &RefCell<Vec<Vec<String>>>,
@@ -342,6 +346,7 @@ mod tests {
         }
     }
 
+    /// Test helper: cached status.
     fn cached_status(cache_path: &Path, id: &str) -> Option<(String, Option<String>, u64)> {
         load_cache(cache_path)
             .get(id)

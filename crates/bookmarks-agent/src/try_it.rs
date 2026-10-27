@@ -60,6 +60,7 @@ impl Tried {
 
 impl std::str::FromStr for Tried {
     type Err = String;
+    /// Parse a tried value: `yes`, `no` or `later`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "yes" => Ok(Self::Yes),
@@ -384,6 +385,7 @@ const TIGHT_VERBS: &[&str] = &[
     "drill",
 ];
 
+/// True if the lowercased text contains any of `TIGHT_VERBS`.
 fn has_tight_verb(lower: &str) -> bool {
     has_any_phrase(lower, TIGHT_VERBS)
 }
@@ -603,6 +605,7 @@ pub fn pending_followups(log: &DecisionLog) -> Vec<String> {
         .collect()
 }
 
+/// Clean a user note: trim and collapse whitespace.
 fn clean_note(note: &str) -> String {
     crate::sanitize::sanitize_uncapped(note)
         .chars()
@@ -644,6 +647,7 @@ const HANDS_ON_TOPICS: &[&str] = &[
     "cook",
 ];
 
+/// True if the topic contains one of `HANDS_ON_TOPICS`.
 fn topic_is_hands_on(topic: &str) -> bool {
     let lower = topic.to_lowercase();
     HANDS_ON_TOPICS.iter().any(|k| lower.contains(k))
@@ -1029,6 +1033,7 @@ fn has_day_cycle(lower: &str) -> bool {
     has_days_on_off(lower, "on") && has_days_on_off(lower, "off")
 }
 
+/// True if the text has an `<N> days <on_off>` pattern (e.g. `5 days on`).
 fn has_days_on_off(lower: &str, on_off: &str) -> bool {
     let h = lower.as_bytes();
     let mut i = 0;
@@ -1158,10 +1163,12 @@ fn contains_phrase(hay: &str, phrase: &str) -> bool {
     false
 }
 
+/// True if `hay` contains any of `phrases`.
 fn has_any_phrase(hay: &str, phrases: &[&str]) -> bool {
     phrases.iter().any(|p| contains_phrase(hay, p))
 }
 
+/// True if the text has bullet-point lines.
 fn has_bullets(text: &str) -> bool {
     text.lines().any(|line| {
         let t = line.trim_start();
@@ -1488,6 +1495,7 @@ const IMPERATIVE_VERBS: &[&str] = &[
 /// Filler words skipped before the first content word ("just paste this").
 const SKIP_WORDS: &[&str] = &["please", "just", "simply", "then", "and", "also"];
 
+/// Normalize a word: trim non-alphanumerics and lowercase.
 fn word_key(word: &str) -> String {
     word.trim_matches(|c: char| !c.is_alphanumeric())
         .to_lowercase()
@@ -1644,6 +1652,7 @@ fn numbered_spans(chars: &[char]) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Clean one extracted step; `None` if empty.
 fn clean_step(raw: &str) -> Option<String> {
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = collapsed.trim();
@@ -1660,6 +1669,7 @@ fn clean_step(raw: &str) -> Option<String> {
     )
 }
 
+/// Split text into numbered steps (`1.`, `2)` ...).
 fn split_numbered(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let spans = numbered_spans(&chars);
@@ -1686,6 +1696,7 @@ fn split_numbered(text: &str) -> Vec<String> {
     out
 }
 
+/// Split text into bullet-point steps.
 fn split_bullets(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -1711,6 +1722,7 @@ mod tests {
     use super::*;
     use crate::fixture::Label;
 
+    /// Test helper: bm.
     fn bm(id: &str, text: &str, topic: Option<&str>) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -1734,6 +1746,7 @@ mod tests {
         }
     }
 
+    /// Test helper: demo fixture.
     fn demo_fixture() -> Vec<Bookmark> {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2101,10 +2114,12 @@ mod tests {
     struct FailingModel;
 
     impl crate::brief::BriefModel for FailingModel {
+        /// Test helper: model id.
         fn model_id(&self) -> String {
             "test-failing".to_string()
         }
 
+        /// Test helper: call.
         fn call(
             &self,
             _class: ancientos_router::data_class::DataClass,

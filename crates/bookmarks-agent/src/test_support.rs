@@ -18,6 +18,7 @@ pub(crate) struct EnvHold {
 }
 
 impl EnvHold {
+    /// Lock the env mutex and snapshot the env vars tests may change.
     fn capture() -> (MutexGuard<'static, ()>, Vec<(&'static str, Option<String>)>) {
         let lock = lock_env();
         let keys = [
@@ -38,6 +39,7 @@ impl EnvHold {
         (lock, saved)
     }
 
+    /// Clear link_context env overrides so tests start clean.
     fn clear_link_overrides() {
         std::env::remove_var(crate::liveness::OFFLINE_ENV_VAR);
         std::env::remove_var(crate::liveness::CACHE_ENV_VAR);
@@ -78,6 +80,7 @@ impl EnvHold {
 }
 
 impl Drop for EnvHold {
+    /// Restore the captured env vars and release the lock.
     fn drop(&mut self) {
         for (key, value) in self.saved.drain(..) {
             match value {

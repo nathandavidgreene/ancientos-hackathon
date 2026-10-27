@@ -52,6 +52,7 @@ enum OneOrMany {
     Many(Vec<String>),
 }
 
+/// Deserialize the AncientOS mapping from either a string or a list of strings.
 fn de_mapping<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     Ok(match OneOrMany::deserialize(d)? {
         OneOrMany::One(s) => s
@@ -70,6 +71,7 @@ enum TimeRepr {
     Text(String),
 }
 
+/// Convert a time given as a number or a numeric string into unix seconds.
 fn time_from(t: TimeRepr) -> Result<u64, String> {
     match t {
         TimeRepr::Secs(n) => Ok(n),
@@ -77,10 +79,12 @@ fn time_from(t: TimeRepr) -> Result<u64, String> {
     }
 }
 
+/// Deserialize a time that may be a number or a numeric string.
 fn de_time<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     time_from(TimeRepr::deserialize(d)?).map_err(serde::de::Error::custom)
 }
 
+/// Deserialize an optional time that may be a number or a numeric string.
 fn de_opt_time<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     match Option::<TimeRepr>::deserialize(d)? {
         None => Ok(None),
@@ -180,12 +184,14 @@ pub fn known_modules() -> Vec<&'static str> {
     out
 }
 
+/// Path of the idea cards file under the data dir.
 pub fn idea_cards_path() -> Result<PathBuf, String> {
     Ok(crate::token_store::data_dir()
         .map_err(|e| e.to_string())?
         .join(IDEA_CARDS_FILE_NAME))
 }
 
+/// Current time in unix seconds.
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -239,6 +245,7 @@ pub fn extract_ideas(output: &str) -> Vec<String> {
     out
 }
 
+/// Stable card id derived from the source URL and idea text.
 fn card_id(source_url: &str, idea: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -249,6 +256,7 @@ fn card_id(source_url: &str, idea: &str) -> String {
     d[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Create a new idea card in the `new` status.
 pub fn new_card(source_url: &str, idea: &str, now: u64) -> IdeaCard {
     let mapping = map_modules(idea);
     IdeaCard {
@@ -263,6 +271,7 @@ pub fn new_card(source_url: &str, idea: &str, now: u64) -> IdeaCard {
     }
 }
 
+/// Append one idea card as a JSON line to `path`.
 pub fn append(path: &Path, card: &IdeaCard) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {

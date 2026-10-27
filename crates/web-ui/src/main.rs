@@ -22,6 +22,7 @@ struct Args {
     demo: bool,
 }
 
+/// Parse eval CLI arguments.
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut out = Args {
         data: None,
@@ -124,6 +125,7 @@ struct DemoGuard {
 }
 
 impl Drop for DemoGuard {
+    /// Remove the demo data dir.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
@@ -160,6 +162,7 @@ fn cleanup_stale_demo_dirs() {
     }
 }
 
+/// Run one demo-runner command against a `--data` workspace.
 fn run(args: &[String]) -> Result<(), String> {
     let parsed = parse_args(args)?;
     let dir: std::path::PathBuf = if parsed.demo {
@@ -185,6 +188,7 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Eval entry point; exit 1 on error.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = run(&args) {

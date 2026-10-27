@@ -25,6 +25,7 @@ pub struct ModalLlamaClient {
 }
 
 impl ModalLlamaClient {
+    /// Config from env.
     pub fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
@@ -40,6 +41,7 @@ impl ModalLlamaClient {
         }
     }
 
+    /// True if paid calls are allowed.
     pub fn allow_paid(&self) -> bool {
         self.allow_paid
     }
@@ -69,6 +71,7 @@ impl ModalLlamaClient {
 }
 
 impl ModelClient for ModalLlamaClient {
+    /// Hosted destination.
     fn destination(&self) -> Destination {
         Destination::LocalLlama
     }
@@ -78,6 +81,7 @@ impl ModelClient for ModalLlamaClient {
     fn complete(&self, _prompt: &str) -> Result<String, RouterError> {
         self.complete_with_class(DataClass::Restricted, "modal.complete", None, _prompt)
     }
+    /// Complete a prompt, checking sensitivity first.
     fn complete_with_sensitivity(
         &self,
         s: Sensitivity,
@@ -85,6 +89,7 @@ impl ModelClient for ModalLlamaClient {
     ) -> Result<String, RouterError> {
         self.complete_with_class(DataClass::from(s), "modal", None, prompt)
     }
+    /// Complete a prompt, checking the data class and logging egress.
     fn complete_with_class(
         &self,
         class: DataClass,
@@ -105,6 +110,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Test helper: client.
     fn client(pairs: &[(&str, &str)]) -> ModalLlamaClient {
         let m: HashMap<String, String> = pairs
             .iter()

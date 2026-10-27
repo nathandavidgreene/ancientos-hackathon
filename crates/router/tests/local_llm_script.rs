@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// Test helper: script path.
 fn script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/local_llm.sh")
 }
 
+/// Test helper: curl present.
 fn curl_present() -> bool {
     Command::new("curl")
         .arg("--version")
@@ -73,6 +75,7 @@ fn closed_url() -> String {
     url
 }
 
+/// Test helper: run health.
 fn run_health(base_url: &str, model: &str) -> (Option<i32>, String, String) {
     assert!(curl_present(), "curl is required by scripts/local_llm.sh");
     let out = Command::new("bash")

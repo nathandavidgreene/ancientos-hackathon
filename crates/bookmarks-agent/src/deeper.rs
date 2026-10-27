@@ -93,6 +93,7 @@ pub enum QueueStatus {
 }
 
 impl QueueStatus {
+    /// Stable string form of the queue status, as written to the log.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -152,6 +153,7 @@ pub fn queue_later_at_path(
     queue_later(&mut log, post_id, at, now)
 }
 
+/// Dedup key for a queued deeper request: (post id, queued-at time).
 fn queued_key(post_id: &str, at: u64) -> (String, u64) {
     (post_id.to_string(), at)
 }
@@ -892,6 +894,7 @@ fn strip_bullet(line: &str) -> Option<&str> {
 /// Sequence words marking a sentence as a procedure step. Pure.
 const ORDER_MARKERS: &[&str] = &["first", "then", "next", "finally", "after that", "lastly"];
 
+/// True if lowercased text contains one of `ORDER_MARKERS` as a word.
 fn has_order_marker(lower: &str) -> bool {
     ORDER_MARKERS.iter().any(|m| contains_word(lower, m))
 }
@@ -1543,6 +1546,7 @@ pub fn run_paid_with_paths(
 mod tests {
     use super::*;
 
+    /// Test helper: post.
     fn post(id: &str, text: &str) -> ThreadPost {
         ThreadPost {
             id: id.into(),
@@ -1555,6 +1559,7 @@ mod tests {
         }
     }
 
+    /// Test helper: quoted post.
     fn quoted_post(id: &str, text: &str, quote_id: &str) -> ThreadPost {
         let mut p = post(id, text);
         p.referenced_tweets.push(ReferencedTweet {
@@ -1564,6 +1569,7 @@ mod tests {
         p
     }
 
+    /// Test helper: fetch.
     fn fetch(posts: Vec<ThreadPost>) -> crate::x_api::ThreadFetch {
         crate::x_api::ThreadFetch {
             root: posts[0].clone(),
@@ -1574,6 +1580,7 @@ mod tests {
         }
     }
 
+    /// Test helper: write fixture.
     fn write_fixture(dir: &tempfile::TempDir, name: &str, lines: &[serde_json::Value]) -> PathBuf {
         let path = dir.path().join(name);
         let body = lines
@@ -1586,6 +1593,7 @@ mod tests {
         path
     }
 
+    /// Test helper: row.
     fn row(
         id: &str,
         text: &str,
@@ -1610,14 +1618,17 @@ mod tests {
         v
     }
 
+    /// Test helper: no thread fetch.
     fn no_thread_fetch(_: &str) -> Result<crate::x_api::ThreadFetch, String> {
         panic!("network thread fetch used in offline mode")
     }
 
+    /// Test helper: no post fetch.
     fn no_post_fetch(_: &str) -> Result<ThreadPost, String> {
         panic!("network post fetch used in offline mode")
     }
 
+    /// Test helper: no call.
     fn no_call(
         _: &str,
         _: Option<&str>,
@@ -1625,6 +1636,7 @@ mod tests {
         panic!("model call used in local mode")
     }
 
+    /// Test helper: thread fixture.
     fn thread_fixture() -> Vec<serde_json::Value> {
         vec![
             row(
@@ -2852,11 +2864,13 @@ mod tests {
         );
     }
 
+    /// Test helper: queue log.
     fn queue_log(dir: &tempfile::TempDir) -> (DecisionLog, PathBuf) {
         let path = dir.path().join("q.jsonl");
         (DecisionLog::open(&path).unwrap(), path)
     }
 
+    /// Test helper: queue entries.
     fn queue_entries(path: &Path) -> Vec<Entry> {
         DecisionLog::open(path).unwrap().verify_or_empty().unwrap()
     }

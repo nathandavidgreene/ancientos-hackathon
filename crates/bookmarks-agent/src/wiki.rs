@@ -146,6 +146,7 @@ pub fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Create the wiki directory layout (raw, pages).
 fn ensure_wiki_dirs(wiki: &Path) -> Result<(), String> {
     crate::token_store::ensure_dir_0700(&wiki.join(RAW_DIR_NAME))
         .map_err(|e| format!("wiki raw dir failed: {e}"))?;
@@ -154,6 +155,7 @@ fn ensure_wiki_dirs(wiki: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Write a file and set its mode to 0600.
 fn write_0600(path: &Path, data: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -166,6 +168,7 @@ fn write_0600(path: &Path, data: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Set file mode 0600 (unix).
 #[cfg(unix)]
 fn chmod_0600(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -174,6 +177,7 @@ fn chmod_0600(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// No-op on non-unix platforms.
 #[cfg(not(unix))]
 fn chmod_0600(_path: &Path) -> Result<(), String> {
     Ok(())
@@ -794,12 +798,14 @@ enum OneOrMany {
 }
 
 impl Default for OneOrMany {
+    /// Empty list.
     fn default() -> Self {
         Self::Many(Vec::new())
     }
 }
 
 impl OneOrMany {
+    /// Convert into a list of strings.
     fn into_vec(self) -> Vec<String> {
         match self {
             Self::One(s) => vec![s],
@@ -969,6 +975,7 @@ pub fn is_paid_allowed() -> bool {
         .unwrap_or(false)
 }
 
+/// Truncate source text to `MAX_SOURCE_CHARS`.
 fn cap(s: &str) -> String {
     truncate_chars(s, MAX_SOURCE_CHARS)
 }
@@ -2398,6 +2405,7 @@ mod tests {
     const DATE: &str = "2026-10-27";
     const NOW: u64 = 1_793_577_600;
 
+    /// Test helper: setup.
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let wiki = dir.path().join(WIKI_DIR_NAME);
@@ -2405,6 +2413,7 @@ mod tests {
         (dir, wiki, log)
     }
 
+    /// Test helper: public input.
     fn public_input(post_id: &str) -> IngestInput {
         IngestInput {
             post_id: post_id.to_string(),
@@ -2420,6 +2429,7 @@ mod tests {
         }
     }
 
+    /// Test helper: card.
     fn card(id: &str, post_id: &str, idea: &str, mapping: &[&str]) -> crate::idea_card::IdeaCard {
         crate::idea_card::IdeaCard {
             id: id.to_string(),
@@ -2433,6 +2443,7 @@ mod tests {
         }
     }
 
+    /// Test helper: ctx.
     fn ctx<'a>(wiki: &'a Path, log: &'a Path, allow_paid: bool) -> IngestCtx<'a> {
         IngestCtx {
             wiki,
@@ -2919,6 +2930,7 @@ mod tests {
         std::fs::write(pages.join(format!("{slug}.md")), md).unwrap();
     }
 
+    /// Test helper: seed raw.
     fn seed_raw(wiki: &Path, id: &str) {
         write_raw(
             wiki,

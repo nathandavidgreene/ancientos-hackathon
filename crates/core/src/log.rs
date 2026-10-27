@@ -26,6 +26,7 @@ pub struct Entry {
 
 const GENESIS: &str = "0";
 
+/// Hash-chain digest of a log entry (seq, previous hash, kind, payload).
 fn digest(seq: u64, prev: &str, kind: &str, payload: &serde_json::Value) -> String {
     let mut h = Sha256::new();
     h.update(format!("{seq}|{prev}|{kind}|{payload}"));

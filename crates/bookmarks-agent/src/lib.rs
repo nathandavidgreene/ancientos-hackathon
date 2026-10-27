@@ -99,6 +99,7 @@ mod tests {
     const AGENT: &str = "bookmarks-agent";
     const NOW: u64 = 1_700_000_000;
 
+    /// Test helper: p.
     fn p(action: &str) -> Proposal {
         Proposal {
             agent: "t".into(),
@@ -106,6 +107,7 @@ mod tests {
         }
     }
 
+    /// Test helper: a fresh decision log in a temp dir.
     fn open_log() -> (tempfile::TempDir, DecisionLog) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("decision_log.jsonl");

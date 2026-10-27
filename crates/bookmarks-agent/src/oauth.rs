@@ -58,6 +58,7 @@ fn b64url(bytes: &[u8]) -> String {
     out
 }
 
+/// Random base64url string from `nbytes` of OS randomness.
 fn random_b64url(nbytes: usize) -> Result<String, OAuthError> {
     let mut buf = vec![0u8; nbytes];
     getrandom::getrandom(&mut buf).map_err(|e| OAuthError::Random(e.to_string()))?;
@@ -80,6 +81,7 @@ pub fn code_challenge(verifier: &str) -> String {
     b64url(&Sha256::digest(verifier.as_bytes()))
 }
 
+/// Percent-encode a string for use in a URL or form body.
 pub(crate) fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -131,6 +133,7 @@ pub fn refresh_form<'a>(
     ]
 }
 
+/// POST a form to the X token endpoint and parse the token response.
 fn post_token_form(form: &[(&str, &str)]) -> Result<TokenResponse, OAuthError> {
     let parsed: TokenResponse = ureq::post(TOKEN_URL)
         .timeout(std::time::Duration::from_secs(30))
@@ -170,6 +173,7 @@ pub fn refresh_tokens(client_id: &str, refresh_token: &str) -> Result<TokenRespo
     post_token_form(&refresh_form(refresh_token, client_id))
 }
 
+/// Map a ureq error to an OAuth error without leaking secrets.
 fn map_ureq_error(e: ureq::Error) -> OAuthError {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -185,6 +189,7 @@ fn map_ureq_error(e: ureq::Error) -> OAuthError {
 mod tests {
     use super::*;
 
+    /// Test helper: is verifier char.
     fn is_verifier_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~')
     }

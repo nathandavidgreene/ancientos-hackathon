@@ -32,6 +32,7 @@ pub struct Backends<'a> {
     pub jev_local: Option<&'a dyn ModelClient>,
 }
 
+/// Route by sensitivity and call the chosen backend; see [`dispatch_with_class`].
 pub fn dispatch(
     b: &Backends<'_>,
     s: Sensitivity,
@@ -222,6 +223,7 @@ mod tests {
         seen: RefCell<Vec<String>>,
     }
     impl Recorder {
+        /// Test helper: new.
         fn new(dest: Destination) -> Self {
             Self {
                 dest,
@@ -230,9 +232,11 @@ mod tests {
         }
     }
     impl ModelClient for Recorder {
+        /// Test helper: destination.
         fn destination(&self) -> Destination {
             self.dest
         }
+        /// Test helper: complete.
         fn complete(&self, p: &str) -> Result<String, RouterError> {
             self.seen.borrow_mut().push(p.into());
             Ok("ok".into())
@@ -315,6 +319,7 @@ mod tests {
         assert!(spark.seen.borrow().is_empty());
     }
 
+    /// Test helper: jev backends.
     fn jev_backends<'a>(
         local: &'a Recorder,
         spark: &'a Recorder,
@@ -568,6 +573,7 @@ mod tests {
         assert_eq!(d, Destination::MuseSpark);
     }
 
+    /// Test helper: plain backends.
     fn plain_backends<'a>(
         local: &'a Recorder,
         spark: &'a Recorder,

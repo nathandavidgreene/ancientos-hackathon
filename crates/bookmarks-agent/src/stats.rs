@@ -747,6 +747,7 @@ mod tests {
         assert_eq!(normalize_stage("nope"), None);
     }
 
+    /// Test helper: write a file, creating parent dirs.
     fn write(path: &Path, text: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();

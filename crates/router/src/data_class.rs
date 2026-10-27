@@ -76,6 +76,7 @@ impl DataClass {
 }
 
 impl std::fmt::Display for DataClass {
+    /// Route name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -157,6 +158,7 @@ impl Route {
 }
 
 impl std::fmt::Display for Route {
+    /// Route name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -413,6 +415,7 @@ mod tests {
     }
 
     impl EnvGuard {
+        /// Test helper: set.
         fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
             let mut saved = Vec::with_capacity(pairs.len());
             for (key, value) in pairs {
@@ -427,6 +430,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
+        /// Test helper: drop.
         fn drop(&mut self) {
             for (key, value) in self.saved.drain(..) {
                 match value {

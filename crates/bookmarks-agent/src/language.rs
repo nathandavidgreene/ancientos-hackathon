@@ -191,6 +191,7 @@ pub fn post_id_from_status_url(url: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Test helper: bm.
     fn bm(id: &str, text: &str, lang: Option<&str>) -> Bookmark {
         Bookmark {
             post_id: id.into(),

@@ -7,6 +7,7 @@
 //! sanitized text is ever sent to a hosted model.
 pub const MAX_CHARS: usize = 200;
 
+/// True if the token looks like a URL.
 fn is_url_token(token: &str) -> bool {
     let lower = token.to_lowercase();
     lower.contains("://")
@@ -17,6 +18,7 @@ fn is_url_token(token: &str) -> bool {
             .starts_with("www.")
 }
 
+/// True if the token looks like an email address.
 fn looks_like_email(token: &str) -> bool {
     let t = token.trim_matches(|c: char| {
         c.is_ascii_punctuation() && c != '@' && c != '.' && c != '_' && c != '-' && c != '+'
@@ -55,6 +57,7 @@ fn strip_url_and_email_tokens(text: &str) -> String {
         .join(" ")
 }
 
+/// True for characters allowed in an @handle.
 fn is_handle_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
@@ -81,6 +84,7 @@ fn strip_handles(text: &str) -> String {
     out
 }
 
+/// True for characters allowed in a phone number.
 fn is_phone_char(c: char) -> bool {
     c.is_ascii_digit() || matches!(c, ' ' | '-' | '.' | '(' | ')' | '+')
 }
@@ -136,10 +140,12 @@ fn strip_phones(text: &str) -> String {
     out
 }
 
+/// Collapse every run of whitespace to a single space and trim the ends.
 pub(crate) fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Keep at most `max` characters, trimming trailing whitespace.
 pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     let out: String = text.chars().take(max).collect();
     out.trim_end().to_string()

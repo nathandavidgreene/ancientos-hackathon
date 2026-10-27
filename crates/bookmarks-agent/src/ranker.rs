@@ -137,6 +137,7 @@ struct Features {
     words: Vec<String>,
 }
 
+/// Ranker features of a bookmark: topic, author, media, link, thread length and sanitized words.
 fn features_of(b: &Bookmark) -> Features {
     let sanitized = crate::sanitize::sanitize_uncapped(&b.text);
     let words: BTreeSet<String> = tokenize(&sanitized).into_iter().collect();
@@ -181,6 +182,7 @@ fn bool_log_odds(yes: bool, yes_counts: (u32, u32), n_pos: usize, n_neg: usize) 
     log_odds(p, n_pos, n, n_neg, 2.0)
 }
 
+/// Plain-language reason for the topic's contribution to a score.
 fn category_reason(cat: &str, p: u32, n: u32, contrib: f64) -> String {
     let t = p + n;
     if t == 0 {
@@ -192,6 +194,7 @@ fn category_reason(cat: &str, p: u32, n: u32, contrib: f64) -> String {
     }
 }
 
+/// Plain-language reason for the author's contribution to a score.
 fn author_reason(p: u32, n: u32, contrib: f64) -> String {
     if p + n == 0 {
         "new author for you".to_string()
@@ -202,6 +205,7 @@ fn author_reason(p: u32, n: u32, contrib: f64) -> String {
     }
 }
 
+/// Plain-language reason for the media feature's contribution to a score.
 fn media_reason(has: bool, contrib: f64) -> String {
     match (has, contrib >= 0.0) {
         (true, true) => "has media like posts you approve".to_string(),
@@ -211,6 +215,7 @@ fn media_reason(has: bool, contrib: f64) -> String {
     }
 }
 
+/// Plain-language reason for the link feature's contribution to a score.
 fn link_reason(has: bool, contrib: f64) -> String {
     match (has, contrib >= 0.0) {
         (true, true) => "has a link like posts you approve".to_string(),
@@ -220,6 +225,7 @@ fn link_reason(has: bool, contrib: f64) -> String {
     }
 }
 
+/// Plain-language reason for the thread-length feature's contribution to a score.
 fn thread_reason(bucket: &str, contrib: f64) -> String {
     let desc = match bucket {
         "1" => "single post",
@@ -233,6 +239,7 @@ fn thread_reason(bucket: &str, contrib: f64) -> String {
     }
 }
 
+/// Plain-language reason for one word's contribution to a score.
 fn word_reason(word: &str, contrib: f64) -> String {
     if contrib >= 0.0 {
         format!("mentions '{word}' which you often approve")
@@ -515,6 +522,7 @@ pub fn events_from_log(
 mod tests {
     use super::*;
 
+    /// Test helper: a bookmark with the given id, optional topic and author, and text.
     fn bm(id: &str, topic: Option<&str>, author: Option<&str>, text: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -536,6 +544,7 @@ mod tests {
         }
     }
 
+    /// Test helper: pair a bookmark with a training signal.
     fn ev(b: Bookmark, signal: Signal) -> LabeledEvent {
         LabeledEvent {
             bookmark: b,

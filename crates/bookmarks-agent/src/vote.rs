@@ -51,6 +51,7 @@ pub fn author_for(merged: &crate::merge::MergeOutput, post_id: &str) -> Option<S
     }
 }
 
+/// Create the vote log's parent directory if needed.
 fn ensure_log_dir(log_path: &Path) -> Result<(), String> {
     if let Some(parent) = log_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -160,6 +161,7 @@ pub fn list_hidden_authors(log_path: &Path) -> Result<BTreeSet<String>, String> 
 mod tests {
     use super::*;
 
+    /// Test helper: fixture with labeled post.
     fn fixture_with_labeled_post(dir: &Path) -> String {
         let path = dir.join("fix.jsonl");
         std::fs::write(
@@ -242,6 +244,7 @@ mod tests {
         assert!(err.contains("non-empty"), "{err}");
     }
 
+    /// Test helper: fixture with authors.
     fn fixture_with_authors(dir: &Path) -> String {
         let path = dir.join("authors.jsonl");
         std::fs::write(

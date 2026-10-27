@@ -47,6 +47,7 @@ use std::path::PathBuf;
 
 const USAGE: &str = "usage: try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>] [--jev-threshold <f>] [--enrich]";
 
+/// Try-it cascade eval entry point.
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let args = match parse_args(&argv) {
@@ -166,6 +167,7 @@ fn parse_label(value: &serde_json::Value) -> Option<Label> {
     Some(Label { id, try_it })
 }
 
+/// Bookmark id as a string (accepts number or string).
 fn id_string(value: &serde_json::Value) -> Option<String> {
     if let Some(s) = value.as_str() {
         if s.is_empty() {
@@ -230,6 +232,7 @@ struct Prf {
     fn_: usize,
 }
 
+/// Precision, recall and F1 from (predicted, actual) pairs.
 fn prf(pairs: &[(bool, bool)]) -> Prf {
     let mut tp = 0;
     let mut fp = 0;
@@ -269,6 +272,7 @@ fn prf(pairs: &[(bool, bool)]) -> Prf {
     }
 }
 
+/// Run the cascade over the labeled set and write the report.
 fn run(args: &Args) -> Result<(), String> {
     let labels_text = std::fs::read_to_string(&args.labels)
         .map_err(|e| format!("cannot read labels file: {e}"))?;
@@ -507,6 +511,7 @@ fn run(args: &Args) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Test helper: argv.
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
     }
@@ -665,6 +670,7 @@ mod tests {
     }
 
     impl EnvGuard {
+        /// Test helper: set.
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let saved = std::env::var(key).ok();
             match value {
@@ -676,6 +682,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
+        /// Test helper: drop.
         fn drop(&mut self) {
             match self.saved.take() {
                 Some(v) => std::env::set_var(self.key, v),

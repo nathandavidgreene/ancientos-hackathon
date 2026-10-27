@@ -4,6 +4,7 @@ use ancientos_eval::jev_label_bookmark;
 use ancientos_router::{jev_client::JevClient, Sensitivity};
 use std::io::{BufRead, Write};
 
+/// Example: label sample bookmarks with Jev.
 fn main() {
     let client = JevClient::from_env().expect("jev backend selection");
     let mut out = std::io::stdout().lock();

@@ -79,6 +79,7 @@ pub struct AgentCtx {
 }
 
 impl AgentCtx {
+    /// Current unix seconds: the fixed test clock when set, else the system clock.
     pub fn now_secs(&self) -> u64 {
         self.now_override.unwrap_or_else(crate::idea_card::now_secs)
     }
@@ -102,6 +103,7 @@ pub struct DaemonConfig {
 }
 
 impl Default for DaemonConfig {
+    /// Default daemon intervals and settings.
     fn default() -> Self {
         Self {
             ctx: AgentCtx {
@@ -124,6 +126,7 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Read a seconds value from env var `var`, falling back to `default`; errors on junk.
 fn secs_from_env(var: &str, default: u64) -> Result<u64, String> {
     match std::env::var(var).ok().filter(|v| !v.is_empty()) {
         None => Ok(default),
@@ -157,6 +160,7 @@ impl DaemonConfig {
         })
     }
 
+    /// Current unix seconds: the fixed test clock when set, else the system clock.
     pub fn now_secs(&self) -> u64 {
         self.ctx.now_secs()
     }
@@ -596,20 +600,24 @@ pub struct BriefAgent {
 }
 
 impl BriefAgent {
+    /// Create the wiki lint agent with its tick interval.
     pub fn new(ctx: AgentCtx, interval: Duration) -> Self {
         Self { ctx, interval }
     }
 }
 
 impl Agent for BriefAgent {
+    /// Scheduler name of this agent.
     fn name(&self) -> &str {
         "brief"
     }
 
+    /// How often the scheduler runs this agent.
     fn interval(&self) -> Duration {
         self.interval
     }
 
+    /// Run one tick: lint the wiki and propose fixes through approvals.
     fn tick(&mut self) -> Result<(), String> {
         let now = self.ctx.now_secs();
         let summary = brief_tick(&self.ctx, now, allow_paid())?;
@@ -634,20 +642,24 @@ pub struct DigestAgent {
 }
 
 impl DigestAgent {
+    /// Create the wiki lint agent with its tick interval.
     pub fn new(ctx: AgentCtx, interval: Duration) -> Self {
         Self { ctx, interval }
     }
 }
 
 impl Agent for DigestAgent {
+    /// Scheduler name of this agent.
     fn name(&self) -> &str {
         "digest"
     }
 
+    /// How often the scheduler runs this agent.
     fn interval(&self) -> Duration {
         self.interval
     }
 
+    /// Run one tick: lint the wiki and propose fixes through approvals.
     fn tick(&mut self) -> Result<(), String> {
         let now = self.ctx.now_secs();
         let summary = digest_tick(&self.ctx, now)?;
@@ -667,20 +679,24 @@ pub struct TryFollowupAgent {
 }
 
 impl TryFollowupAgent {
+    /// Create the wiki lint agent with its tick interval.
     pub fn new(ctx: AgentCtx, interval: Duration) -> Self {
         Self { ctx, interval }
     }
 }
 
 impl Agent for TryFollowupAgent {
+    /// Scheduler name of this agent.
     fn name(&self) -> &str {
         "try_followup"
     }
 
+    /// How often the scheduler runs this agent.
     fn interval(&self) -> Duration {
         self.interval
     }
 
+    /// Run one tick: lint the wiki and propose fixes through approvals.
     fn tick(&mut self) -> Result<(), String> {
         let now = self.ctx.now_secs();
         let pending = try_followup_tick(&self.ctx, now)?;
@@ -699,20 +715,24 @@ pub struct DeeperQueueAgent {
 }
 
 impl DeeperQueueAgent {
+    /// Create the wiki lint agent with its tick interval.
     pub fn new(ctx: AgentCtx, interval: Duration) -> Self {
         Self { ctx, interval }
     }
 }
 
 impl Agent for DeeperQueueAgent {
+    /// Scheduler name of this agent.
     fn name(&self) -> &str {
         "deeper_queue"
     }
 
+    /// How often the scheduler runs this agent.
     fn interval(&self) -> Duration {
         self.interval
     }
 
+    /// Run one tick: lint the wiki and propose fixes through approvals.
     fn tick(&mut self) -> Result<(), String> {
         let now = self.ctx.now_secs();
         let summary = deeper_queue_tick(&self.ctx, now, allow_paid())?;
@@ -735,20 +755,24 @@ pub struct ApprovalsSweepAgent {
 }
 
 impl ApprovalsSweepAgent {
+    /// Create the wiki lint agent with its tick interval.
     pub fn new(ctx: AgentCtx, interval: Duration) -> Self {
         Self { ctx, interval }
     }
 }
 
 impl Agent for ApprovalsSweepAgent {
+    /// Scheduler name of this agent.
     fn name(&self) -> &str {
         "approvals_sweep"
     }
 
+    /// How often the scheduler runs this agent.
     fn interval(&self) -> Duration {
         self.interval
     }
 
+    /// Run one tick: lint the wiki and propose fixes through approvals.
     fn tick(&mut self) -> Result<(), String> {
         let now = self.ctx.now_secs();
         let swept = approvals_sweep_tick(&self.ctx, now)?;
@@ -764,20 +788,24 @@ pub struct WikiLintAgent {
 }
 
 impl WikiLintAgent {
+    /// Create the wiki lint agent with its tick interval.
     pub fn new(ctx: AgentCtx, interval: Duration) -> Self {
         Self { ctx, interval }
     }
 }
 
 impl Agent for WikiLintAgent {
+    /// Scheduler name of this agent.
     fn name(&self) -> &str {
         "wiki_lint"
     }
 
+    /// How often the scheduler runs this agent.
     fn interval(&self) -> Duration {
         self.interval
     }
 
+    /// Run one tick: lint the wiki and propose fixes through approvals.
     fn tick(&mut self) -> Result<(), String> {
         let now = self.ctx.now_secs();
         let report = wiki_lint_tick(&self.ctx, now)?;
@@ -896,6 +924,7 @@ mod tests {
 
     const NOW: u64 = 1_791_000_000;
 
+    /// Test helper: bookmark.
     fn bookmark(id: &str, text: &str) -> crate::fixture::Bookmark {
         crate::fixture::Bookmark {
             post_id: id.into(),
@@ -917,6 +946,7 @@ mod tests {
         }
     }
 
+    /// Test helper: write brief fixture.
     fn write_brief_fixture(path: &Path) {
         let rows = [
             bookmark("b1", "synthetic note about local file tooling"),
@@ -930,6 +960,7 @@ mod tests {
         std::fs::write(path, body.join("\n") + "\n").unwrap();
     }
 
+    /// Test helper: test ctx.
     fn test_ctx(dir: &tempfile::TempDir, fixture: bool) -> AgentCtx {
         let fixture_path = dir.path().join("brief.jsonl");
         if fixture {
@@ -945,6 +976,7 @@ mod tests {
         }
     }
 
+    /// Test helper: test config.
     fn test_config(dir: &tempfile::TempDir) -> DaemonConfig {
         DaemonConfig {
             ctx: test_ctx(dir, true),
@@ -952,10 +984,12 @@ mod tests {
         }
     }
 
+    /// Test helper: entries of.
     fn entries_of(path: &Path) -> Vec<Entry> {
         DecisionLog::open(path).unwrap().verify_or_empty().unwrap()
     }
 
+    /// Test helper: kinds of.
     fn kinds_of(path: &Path) -> Vec<String> {
         entries_of(path).iter().map(|e| e.kind.clone()).collect()
     }
@@ -1094,6 +1128,7 @@ mod tests {
         assert_eq!(model_call.payload["model"], "local");
     }
 
+    /// Test helper: panicking fetchers.
     #[allow(clippy::type_complexity)]
     fn panicking_fetchers() -> (
         impl Fn(&str) -> Result<crate::x_api::ThreadFetch, String>,
@@ -1121,6 +1156,7 @@ mod tests {
         (ft, fp, call)
     }
 
+    /// Test helper: queue job.
     fn queue_job(ctx: &AgentCtx, post_id: &str, at: u64, now: u64) {
         let mut log = DecisionLog::open(&ctx.log_path).unwrap();
         crate::deeper::queue_later(&mut log, post_id, at, now).unwrap();
@@ -1145,6 +1181,7 @@ mod tests {
             .any(|e| e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND));
     }
 
+    /// Test helper: mock thread.
     fn mock_thread(id: &str) -> crate::x_api::ThreadFetch {
         let post = crate::unroll::ThreadPost {
             id: id.into(),
@@ -1309,6 +1346,7 @@ mod tests {
             .any(|e| e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND));
     }
 
+    /// Test helper: write thread fixture.
     fn write_thread_fixture(path: &Path) {
         let row = |id: &str, text: &str, conv: &str| {
             serde_json::json!({

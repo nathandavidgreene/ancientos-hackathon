@@ -38,6 +38,7 @@ pub struct StoredTokens {
 }
 
 impl std::fmt::Debug for StoredTokens {
+    /// Debug output with tokens redacted.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StoredTokens")
             .field("access_token", &"[redacted]")
@@ -49,6 +50,7 @@ impl std::fmt::Debug for StoredTokens {
 }
 
 impl StoredTokens {
+    /// Build stored tokens from an OAuth token response.
     pub fn new(
         access_token: String,
         refresh_token: String,
@@ -75,6 +77,7 @@ impl StoredTokens {
     }
 }
 
+/// Current unix time in seconds.
 pub fn unix_now() -> Result<u64, TokenStoreError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -101,6 +104,7 @@ pub fn token_path() -> Result<PathBuf, TokenStoreError> {
     Ok(data_dir()?.join(TOKENS_FILE_NAME))
 }
 
+/// Create `dir` (and parents) with mode 0700.
 pub(crate) fn ensure_dir_0700(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -174,11 +178,13 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
+    /// Test helper: env lock.
     fn env_lock() -> MutexGuard<'static, ()> {
         static ENV_MUTEX: Mutex<()> = Mutex::new(());
         ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Test helper: sample.
     fn sample() -> StoredTokens {
         StoredTokens::new(
             "access-123".into(),

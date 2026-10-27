@@ -29,6 +29,7 @@ pub struct MuseUsage {
 }
 
 impl std::fmt::Display for MuseUsage {
+    /// Token usage as `prompt/completion/total`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -40,6 +41,7 @@ impl std::fmt::Display for MuseUsage {
     }
 }
 
+/// Format an optional count, `?` when unknown.
 fn fmt_opt(v: Option<u64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "-".into())
 }
@@ -116,22 +118,27 @@ impl MuseClient {
         self
     }
 
+    /// Model name.
     pub fn model(&self) -> &str {
         &self.model
     }
 
+    /// Base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
+    /// Max completion tokens per call.
     pub fn max_completion_tokens(&self) -> u32 {
         self.max_completion_tokens
     }
 
+    /// Reasoning effort setting.
     pub fn reasoning_effort(&self) -> &str {
         &self.reasoning_effort
     }
 
+    /// True if paid calls are allowed.
     pub fn allow_paid(&self) -> bool {
         self.allow_paid
     }
@@ -280,11 +287,13 @@ impl MuseClient {
     }
 }
 
+/// Read a JSON number as u64.
 fn as_u64(v: &serde_json::Value) -> Option<u64> {
     v.as_u64()
 }
 
 impl ModelClient for MuseClient {
+    /// Hosted destination.
     fn destination(&self) -> Destination {
         Destination::MuseSpark
     }
@@ -296,6 +305,7 @@ impl ModelClient for MuseClient {
         self.chat(prompt).map(|r| r.content)
     }
 
+    /// Complete a prompt, checking sensitivity first.
     fn complete_with_sensitivity(
         &self,
         s: Sensitivity,
@@ -304,6 +314,7 @@ impl ModelClient for MuseClient {
         self.complete_with_class(DataClass::from(s), "muse", None, prompt)
     }
 
+    /// Complete a prompt, checking the data class and logging egress.
     fn complete_with_class(
         &self,
         class: DataClass,
@@ -316,6 +327,7 @@ impl ModelClient for MuseClient {
     }
 }
 
+/// Non-empty env var.
 fn get_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
@@ -329,12 +341,14 @@ fn normalize_reasoning_effort(value: Option<String>) -> String {
     }
 }
 
+/// True when `ANCIENTOS_ALLOW_PAID=1`.
 fn is_paid_allowed() -> bool {
     std::env::var("ANCIENTOS_ALLOW_PAID")
         .map(|v| v == "1")
         .unwrap_or(false)
 }
 
+/// Map a ureq error to a router error.
 fn map_ureq_error(e: ureq::Error) -> RouterError {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -357,6 +371,7 @@ mod tests {
         crate::test_env_lock()
     }
 
+    /// Test helper: test client.
     fn test_client(allow_paid: bool) -> MuseClient {
         MuseClient::new("test-model", "http://127.0.0.1:9", 16, allow_paid)
     }
@@ -636,6 +651,7 @@ mod tests {
     }
 
     impl EnvGuard {
+        /// Test helper: set.
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let saved = std::env::var(key).ok();
             match value {
@@ -647,6 +663,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
+        /// Test helper: drop.
         fn drop(&mut self) {
             match self.saved.take() {
                 Some(v) => std::env::set_var(self.key, v),
@@ -738,6 +755,7 @@ mod tests {
         (url, hits, handle)
     }
 
+    /// Test helper: chat ok body.
     fn chat_ok_body() -> String {
         serde_json::json!({
             "model": "muse-spark-1.3",

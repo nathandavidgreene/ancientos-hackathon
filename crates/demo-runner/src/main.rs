@@ -25,6 +25,7 @@ fn parse_route_args(args: &[String]) -> Result<(bool, String), String> {
     Ok((sensitive, text))
 }
 
+/// Run one demo-runner command against a `--data` workspace.
 fn run(args: &[String]) -> Result<(), String> {
     let (dir, rest) = match args {
         [flag, dir, rest @ ..] if flag == "--data" => (dir, rest),
@@ -339,6 +340,7 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Eval entry point; exit 1 on error.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = run(&args) {

@@ -250,6 +250,7 @@ mod tests {
     use super::*;
     use crate::unroll::ThreadPost;
 
+    /// Test helper: post.
     fn post(id: &str, text: &str) -> ThreadPost {
         ThreadPost {
             id: id.into(),
@@ -262,6 +263,7 @@ mod tests {
         }
     }
 
+    /// Test helper: fetch.
     fn fetch(posts: Vec<ThreadPost>, search_ok: bool) -> crate::x_api::ThreadFetch {
         crate::x_api::ThreadFetch {
             root: posts[0].clone(),

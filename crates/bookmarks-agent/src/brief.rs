@@ -77,7 +77,9 @@ pub struct ModelReply {
 /// highest data class across the candidates' original texts; the client
 /// refuses anything above its route ceiling.
 pub trait BriefModel {
+    /// Model id reported in the brief footer and decision log.
     fn model_id(&self) -> String;
+    /// Test helper: call.
     fn call(
         &self,
         class: ancientos_router::data_class::DataClass,
@@ -96,10 +98,12 @@ pub type ThreadExpander<'a> =
     dyn Fn(&str) -> Result<Option<Vec<crate::unroll::ThreadPost>>, String> + 'a;
 
 impl BriefModel for MuseClient {
+    /// Test helper: model id.
     fn model_id(&self) -> String {
         self.model().to_string()
     }
 
+    /// Test helper: call.
     fn call(
         &self,
         class: ancientos_router::data_class::DataClass,
@@ -119,6 +123,7 @@ impl BriefModel for MuseClient {
     }
 }
 
+/// Topic for a bookmark: its parent label, else its first folder, else `Unlabeled`.
 pub fn topic_of(b: &Bookmark) -> String {
     if let Some(t) = b.label.as_ref().and_then(|l| l.parent_label.clone()) {
         let t = t.trim().to_string();
@@ -135,6 +140,7 @@ pub fn topic_of(b: &Bookmark) -> String {
     "Unlabeled".to_string()
 }
 
+/// Label confidence of a bookmark, -1.0 when unlabeled (sorts last).
 fn confidence_of(b: &Bookmark) -> f64 {
     b.label.as_ref().and_then(|l| l.confidence).unwrap_or(-1.0)
 }
@@ -159,6 +165,7 @@ pub fn select_candidates_ranked(
     select_candidates_inner(rows, live_ids, Some(scores))
 }
 
+/// Shared candidate selection: live posts first, then optional personal score, then topic round-robin.
 fn select_candidates_inner(
     rows: &[Bookmark],
     live_ids: &BTreeSet<String>,
@@ -265,6 +272,7 @@ struct RawPick {
     why: String,
 }
 
+/// Slice out the first top-level JSON array in a model reply, if any.
 fn extract_json_array(reply: &str) -> Option<&str> {
     let start = reply.find('[')?;
     let end = reply.rfind(']')?;
@@ -274,6 +282,7 @@ fn extract_json_array(reply: &str) -> Option<&str> {
     Some(&reply[start..=end])
 }
 
+/// Collapse a string onto one line (newlines become spaces).
 fn one_line(s: &str) -> String {
     let first = s.lines().next().unwrap_or("").trim();
     let collapsed: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -352,6 +361,7 @@ pub fn local_picks(candidates: &[Candidate]) -> Vec<(usize, String)> {
         .collect()
 }
 
+/// Human-readable label for a feedback verdict.
 fn verdict_label(v: &Verdict) -> &'static str {
     match v {
         Verdict::Allow => "allow",
@@ -398,6 +408,7 @@ pub fn date_from_days(days: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Split optional Muse usage into (prompt, completion, total) token counts.
 fn tokens_opt(usage: Option<&MuseUsage>) -> (Option<u64>, Option<u64>, Option<u64>) {
     match usage {
         Some(u) => (u.prompt_tokens, u.completion_tokens, u.total_tokens),
@@ -405,6 +416,7 @@ fn tokens_opt(usage: Option<&MuseUsage>) -> (Option<u64>, Option<u64>, Option<u6
     }
 }
 
+/// Format an optional token count, `?` when unknown.
 fn fmt_tok(v: Option<u64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
 }
@@ -489,6 +501,7 @@ fn render_pick_text(p: &BriefPick) -> String {
     )
 }
 
+/// Render the daily brief as markdown: picks, merge counts, model and token usage.
 pub fn render_markdown(
     date: &str,
     picks: &[BriefPick],
@@ -1044,6 +1057,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    /// Test helper: bm.
     fn bm(id: &str, created: Option<&str>, topic: Option<&str>, conf: Option<f64>) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -1067,6 +1081,7 @@ mod tests {
         }
     }
 
+    /// Test helper: merged of.
     fn merged_of(rows: Vec<Bookmark>, live_ids: &[&str]) -> MergeOutput {
         let counts = MergeCounts {
             live: live_ids.len(),
@@ -1090,6 +1105,7 @@ mod tests {
     }
 
     impl FakeModel {
+        /// Test helper: ok.
         fn ok(content: &str) -> Self {
             Self {
                 content: Some(content.into()),
@@ -1103,6 +1119,7 @@ mod tests {
             }
         }
 
+        /// Test helper: failing.
         fn failing() -> Self {
             Self {
                 content: None,
@@ -1114,10 +1131,12 @@ mod tests {
     }
 
     impl BriefModel for FakeModel {
+        /// Test helper: model id.
         fn model_id(&self) -> String {
             self.model.clone()
         }
 
+        /// Test helper: call.
         fn call(
             &self,
             _class: ancientos_router::data_class::DataClass,
@@ -1428,9 +1447,11 @@ mod tests {
             seen: RefCell<Vec<String>>,
         }
         impl BriefModel for EnforcingModel {
+            /// Test helper: model id.
             fn model_id(&self) -> String {
                 "enforcing".to_string()
             }
+            /// Test helper: call.
             fn call(&self, class: DataClass, prompt: &str) -> Result<ModelReply, RouterError> {
                 check_egress(class, Route::MuseSpark, "test", None)?;
                 self.seen.borrow_mut().push(prompt.to_string());
@@ -1900,6 +1921,7 @@ mod tests {
         assert_eq!(res.picks[0].full_text, "synthetic HYDRATED-ONLY full text");
     }
 
+    /// Test helper: seed hidden.
     fn seed_hidden(log_path: &Path, post_id: &str) {
         use crate::feedback::{record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict};
         let mut log = DecisionLog::open(log_path).unwrap();
@@ -1947,6 +1969,7 @@ mod tests {
         assert_eq!(cands.payload["count"], 3);
     }
 
+    /// Test helper: seed author hide.
     fn seed_author_hide(log_path: &Path, username: &str, hide: bool) {
         use crate::feedback::{record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict};
         let mut log = DecisionLog::open(log_path).unwrap();
@@ -1967,6 +1990,7 @@ mod tests {
         .unwrap();
     }
 
+    /// Test helper: bm authored.
     fn bm_authored(id: &str, author: Option<&str>) -> Bookmark {
         let mut b = bm(id, None, Some("TopicA"), Some(0.9));
         b.author_username = author.map(str::to_string);
@@ -2057,6 +2081,7 @@ mod tests {
         assert!(err.contains("no bookmarks to brief"), "{err}");
     }
 
+    /// Test helper: thread post.
     fn thread_post(id: &str, text: &str) -> crate::unroll::ThreadPost {
         crate::unroll::ThreadPost {
             id: id.into(),
@@ -2536,6 +2561,7 @@ mod tests {
         assert_eq!(via_local.model, "local");
     }
 
+    /// Test helper: a Rust-topic bookmark with the given id, date, author and text.
     fn rank_bm(id: &str, created: &str, author: &str, text: &str) -> Bookmark {
         let mut b = bm(id, Some(created), Some("Rust"), Some(0.5));
         b.author_username = Some(author.into());
@@ -2564,6 +2590,7 @@ mod tests {
         rows
     }
 
+    /// Test helper: record one feedback vote for a Rust-topic post.
     fn seed_vote(log: &mut DecisionLog, post_id: &str, verdict: feedback::Verdict) {
         feedback::record(
             log,

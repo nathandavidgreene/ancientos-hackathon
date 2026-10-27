@@ -30,6 +30,7 @@ pub enum CallbackError {
     MissingCode,
 }
 
+/// Percent-decode a URL query value; fails closed on malformed escapes.
 fn percent_decode(s: &str) -> Result<String, CallbackError> {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -112,6 +113,7 @@ pub fn parse_callback_request(
     }
 }
 
+/// Build a minimal HTTP/1.1 response string with the given status and body.
 fn http_response(status: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -119,6 +121,7 @@ fn http_response(status: &str, body: &str) -> String {
     )
 }
 
+/// Serve one OAuth callback connection and return the code if `state` matches.
 fn handle_connection(
     stream: std::net::TcpStream,
     expected_state: &str,
@@ -197,6 +200,7 @@ fn read_all(stream: &std::net::TcpStream) -> String {
 mod tests {
     use super::*;
 
+    /// Test helper: req.
     fn req(target: &str) -> String {
         format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
     }

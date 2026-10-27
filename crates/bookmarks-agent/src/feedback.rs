@@ -53,6 +53,7 @@ impl Verdict {
 
 impl std::str::FromStr for Verdict {
     type Err = String;
+    /// Parse a feedback verdict (`approve`, `skip`, `never_post`, `never_category`, `delegate`, `never_author`, `unhide_author`).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "approve" => Ok(Self::Approve),
@@ -84,6 +85,7 @@ pub struct ThresholdPolicy {
 }
 
 impl Default for ThresholdPolicy {
+    /// Default auto-approve thresholds.
     fn default() -> Self {
         Self {
             min_votes: 3,
@@ -101,11 +103,13 @@ pub struct CategoryStats {
 }
 
 impl CategoryStats {
+    /// Total votes in this category.
     pub fn total(&self) -> u32 {
         self.approve + self.skip + self.never_category + self.delegate
     }
 }
 
+/// True if the category is non-empty and not `unknown`.
 fn valid_category(c: &str) -> bool {
     let c = c.trim();
     !c.is_empty() && !c.eq_ignore_ascii_case("unknown")
@@ -204,11 +208,13 @@ pub struct ThresholdShift {
 }
 
 impl ThresholdShift {
+    /// True if nothing changed.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty()
     }
 }
 
+/// Categories added and removed between two auto-approve sets.
 pub fn diff(before: &BTreeSet<String>, after: &BTreeSet<String>) -> ThresholdShift {
     ThresholdShift {
         added: after.difference(before).cloned().collect(),
@@ -259,6 +265,7 @@ pub fn record(
 mod tests {
     use super::*;
 
+    /// Test helper: r.
     fn r(cat: &str, v: Verdict) -> FeedbackRecord {
         FeedbackRecord {
             pick_id: format!("{cat}-{v:?}"),

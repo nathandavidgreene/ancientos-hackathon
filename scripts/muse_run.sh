@@ -29,6 +29,7 @@ for line in sys.stdin:
         i+=m.get("input_tokens",0); c+=m.get("cached_tokens",0); o+=m.get("output_tokens",0)
 print(i,c,o)')
 COST=$(python3 -c "i,c,o=$IN,$CACHED,$OUTT;print(f'{((i-c)*1.25+c*0.15+o*4.25)/1e6:.2f}')")
+# Format an integer with thousands separators.
 fmt(){ python3 -c "print(f'{$1:,}')"; }
 OUTCOME=$([[ $status -eq 0 ]] && echo "exit 0" || echo "exit $status (FAILED)")
 printf '| %s | %s | %s | muse_run.sh: %s, ~%d min (%ds), `--trust-workspace`; tokens in/cached/out %s/%s/%s; est. cost $%s. |\n' \

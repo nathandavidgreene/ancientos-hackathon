@@ -19,6 +19,7 @@ pub struct LabeledExample {
 }
 
 impl LabeledExample {
+    /// New labeled example.
     pub fn new(text: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -28,6 +29,7 @@ impl LabeledExample {
 }
 
 impl From<(&str, &str)> for LabeledExample {
+    /// Labeled example from a (text, label) pair.
     fn from((text, label): (&str, &str)) -> Self {
         Self::new(text, label)
     }
@@ -74,6 +76,7 @@ pub struct EvalReport {
 }
 
 impl EvalReport {
+    /// Metrics for one label.
     pub fn metric_for(&self, label: &str) -> Option<&LabelMetrics> {
         self.per_label.iter().find(|m| m.label == label)
     }
@@ -89,6 +92,7 @@ pub enum EvalError {
 }
 
 impl From<RouterError> for EvalError {
+    /// Wrap a router error.
     fn from(e: RouterError) -> Self {
         EvalError::Backend(e.to_string())
     }
@@ -96,6 +100,7 @@ impl From<RouterError> for EvalError {
 
 /// Classifier backend: map input text to exactly one label.
 pub trait ClassifierBackend {
+    /// Classify text into one label.
     fn classify(&self, text: &str) -> Result<String, EvalError>;
 }
 
@@ -106,6 +111,7 @@ where
     F: Fn(&str) -> Result<String, E>,
     E: std::fmt::Display,
 {
+    /// Test helper: classify.
     fn classify(&self, text: &str) -> Result<String, EvalError> {
         (self)(text).map_err(|e| EvalError::Backend(e.to_string()))
     }
@@ -142,6 +148,7 @@ pub fn evaluate_backend(
     evaluate(|text| backend.classify(text), examples)
 }
 
+/// Build the eval report from scored examples.
 fn summarize(scored: Vec<ScoredExample>) -> EvalReport {
     let total = scored.len();
     let correct = scored.iter().filter(|s| s.correct).count();
@@ -258,14 +265,17 @@ impl JevClassifier {
         self
     }
 
+    /// Underlying Jev client.
     pub fn client(&self) -> &JevClient {
         &self.client
     }
 
+    /// Sensitivity used for calls.
     pub fn sensitivity(&self) -> Sensitivity {
         self.sensitivity
     }
 
+    /// Allowed labels.
     pub fn labels(&self) -> &[String] {
         &self.labels
     }
@@ -373,10 +383,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    /// Test helper: approx eq.
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-12
     }
 
+    /// Test helper: examples.
     fn examples(pairs: &[(&str, &str)]) -> Vec<LabeledExample> {
         pairs.iter().copied().map(LabeledExample::from).collect()
     }
@@ -519,6 +531,7 @@ mod tests {
     fn trait_object_path_matches_closure_path() {
         struct Always(String);
         impl ClassifierBackend for Always {
+            /// Test helper: classify.
             fn classify(&self, text: &str) -> Result<String, EvalError> {
                 let _ = text;
                 Ok(self.0.clone())
@@ -626,6 +639,7 @@ mod tests {
         url
     }
 
+    /// Test helper: localjev classifier.
     fn localjev_classifier(base_url: String, sensitivity: Sensitivity) -> JevClassifier {
         let client = JevClient::new(JevBackend::LocalJev, base_url, "test-localjev", false);
         JevClassifier::new(client, sensitivity).with_labels(&["tech", "sports"])

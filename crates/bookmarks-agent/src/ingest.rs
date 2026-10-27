@@ -16,6 +16,7 @@ pub struct Page {
 }
 
 pub trait BookmarkSource {
+    /// Fetch one page of bookmarks, continuing from `pagination_token`.
     fn fetch(&mut self, pagination_token: Option<&str>) -> Result<Page, String>;
 }
 
@@ -119,6 +120,7 @@ pub fn sync(
 pub struct StubXSource;
 
 impl BookmarkSource for StubXSource {
+    /// Test helper: fetch.
     fn fetch(&mut self, _t: Option<&str>) -> Result<Page, String> {
         Err("X API source not implemented".into())
     }
@@ -128,6 +130,7 @@ impl BookmarkSource for StubXSource {
 mod tests {
     use super::*;
 
+    /// Test helper: bm.
     fn bm(id: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -146,6 +149,7 @@ mod tests {
 
     struct OnePage(Vec<&'static str>);
     impl BookmarkSource for OnePage {
+        /// Test helper: fetch.
         fn fetch(&mut self, _t: Option<&str>) -> Result<Page, String> {
             Ok(Page {
                 items: self.0.iter().map(|i| bm(i)).collect(),

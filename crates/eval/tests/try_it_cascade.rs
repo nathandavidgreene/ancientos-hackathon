@@ -104,6 +104,7 @@ fn closed_url() -> String {
     url
 }
 
+/// Test helper: jev noul body.
 fn jev_noul_body(noul: f64) -> String {
     format!(
         "{{\"model\":\"m\",\"answers\":{{\"try_it\":{{\"type\":\"noul\",\"noul\":{noul}}}}},\
@@ -111,6 +112,7 @@ fn jev_noul_body(noul: f64) -> String {
     )
 }
 
+/// Test helper: muse body.
 fn muse_body(content: &str) -> String {
     serde_json::json!({
         "model": "muse-spark-1.3",
@@ -167,6 +169,7 @@ fn run_bin(args: &[&str], env: &[(&str, &str)], remove_env: &[&str]) -> (bool, S
     }
 }
 
+/// Test helper: bookmark.
 fn bookmark(id: &str, topic: &str, text: &str) -> String {
     bookmark_lang(id, topic, text, None)
 }
@@ -246,10 +249,12 @@ fn link_mock_server(routes: Vec<(&str, &str, String)>, max_hits: usize) -> (Stri
     (url, seen)
 }
 
+/// Test helper: link hits.
 fn link_hits(seen: &SeenBodies) -> usize {
     seen.lock().expect("seen").len()
 }
 
+/// Test helper: bookmark lang.
 fn bookmark_lang(id: &str, topic: &str, text: &str, lang: Option<&str>) -> String {
     let mut row = serde_json::json!({
         "post_id": id,
@@ -302,6 +307,7 @@ fn single_unsure_fixture() -> (String, String) {
     (labels, bookmarks)
 }
 
+/// Test helper: read out rows.
 fn read_out_rows(out_path: &str) -> Vec<serde_json::Value> {
     let out = std::fs::read_to_string(out_path).expect("read out");
     out.lines()
@@ -309,6 +315,7 @@ fn read_out_rows(out_path: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Test helper: write fixtures.
 fn write_fixtures(
     dir: &std::path::Path,
     labels: &str,
@@ -1001,6 +1008,7 @@ const ENRICH_URL_TEXT: &str =
 const ENRICH_PAGE: &str =
     "<title>ZestfulQuokkaStretch</title><p>Bend gently left and hold ten seconds.</p>";
 
+/// Test helper: enrich fixtures.
 fn enrich_fixtures(text: &str, page_url: &str) -> (String, String) {
     let bookmarks = bookmark_with_urls("e1", "AI Agents", text, &[page_url.to_string()]) + "\n";
     let labels = "{\"post_id\":\"e1\",\"try_it\":true}\n".to_string();

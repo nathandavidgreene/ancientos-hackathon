@@ -68,6 +68,7 @@ pub struct Response {
 }
 
 impl Response {
+    /// 200 HTML response.
     fn ok(body: String) -> Self {
         Self {
             status: 200,
@@ -76,6 +77,7 @@ impl Response {
         }
     }
 
+    /// 303 redirect response.
     fn redirect(to: String) -> Self {
         Self {
             status: 303,
@@ -169,22 +171,27 @@ impl State {
         })
     }
 
+    /// Bookmark store path.
     pub fn store_path(&self) -> PathBuf {
         resolve_store(&self.data_dir)
     }
 
+    /// Decision log path.
     pub fn log_path(&self) -> PathBuf {
         self.data_dir.join("decision_log.jsonl")
     }
 
+    /// Idea cards path.
     pub fn cards_path(&self) -> PathBuf {
         self.data_dir.join("idea_cards.jsonl")
     }
 
+    /// Path for the demo backlog file (inside the temp data dir).
     pub fn backlog_path(&self) -> PathBuf {
         self.data_dir.join("backlog.md")
     }
 
+    /// Liveness cache path.
     pub fn liveness_cache_path(&self) -> PathBuf {
         self.data_dir
             .join(bookmarks_agent::liveness::CACHE_FILE_NAME)
@@ -242,6 +249,7 @@ pub fn escape(s: &str) -> String {
     out
 }
 
+/// Value of a hex digit.
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -292,6 +300,7 @@ pub fn parse_pairs(s: &str) -> BTreeMap<String, String> {
     out
 }
 
+/// Split a request target into path and query map.
 fn split_target(target: &str) -> (String, BTreeMap<String, String>) {
     match target.split_once('?') {
         Some((p, q)) => (percent_decode(p), parse_pairs(q)),
@@ -299,6 +308,7 @@ fn split_target(target: &str) -> (String, BTreeMap<String, String>) {
     }
 }
 
+/// Parse a form-encoded body.
 fn parse_body(body: &[u8]) -> BTreeMap<String, String> {
     parse_pairs(&String::from_utf8_lossy(body))
 }
@@ -328,6 +338,7 @@ const CSS: &str = ":root{color-scheme:light}\
      table{border-collapse:collapse;width:100%}th{background:#f5f5f5}\
      td,th{border:1px solid #ddd;padding:.35em .6em;text-align:left;vertical-align:top}";
 
+/// Current unix time.
 fn now_secs() -> u64 {
     bookmarks_agent::idea_card::now_secs()
 }
@@ -364,6 +375,7 @@ fn layout(title: &str, body: &str, state: &State) -> String {
     )
 }
 
+/// Error page.
 fn error_page(title: &str, msg: &str, state: &State) -> String {
     layout(
         title,
@@ -372,6 +384,7 @@ fn error_page(title: &str, msg: &str, state: &State) -> String {
     )
 }
 
+/// 404 page.
 fn not_found(state: &State) -> Response {
     Response::status(404, error_page("Not found", "Unknown route.", state))
 }
@@ -393,6 +406,7 @@ fn thread_post_of(b: &Bookmark) -> bookmarks_agent::unroll::ThreadPost {
     }
 }
 
+/// Render a thread as HTML.
 fn thread_html(chain: &[bookmarks_agent::unroll::ThreadPost]) -> String {
     let mut out = format!("<h2>Thread ({} post{})</h2><ol>", chain.len(), {
         if chain.len() == 1 {
@@ -602,6 +616,7 @@ fn mark_shown(state: &State, post_id: &str) {
     }
 }
 
+/// `/brief` page.
 fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
     let raw = query.get("i").map(String::as_str).unwrap_or("0");
     let idx: usize = match raw.parse() {
@@ -699,6 +714,7 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
     Response::ok(layout("Brief", &body, state))
 }
 
+/// POST vote handler.
 fn do_vote(state: &State, body: &[u8]) -> Response {
     let form = parse_body(body);
     let post_id = form.get("post_id").map(String::as_str).unwrap_or("");
@@ -736,6 +752,7 @@ fn do_vote(state: &State, body: &[u8]) -> Response {
     Response::redirect(format!("/?i={}", (idx + 1) % visible))
 }
 
+/// `/ideas` page.
 fn page_ideas(state: &State) -> Response {
     use bookmarks_agent::idea_card::list_due_for_triage;
     let now = now_secs();
@@ -781,6 +798,7 @@ fn page_ideas(state: &State) -> Response {
     Response::ok(layout("Ideas", &body, state))
 }
 
+/// POST triage handler.
 fn do_triage(state: &State, body: &[u8]) -> Response {
     use bookmarks_agent::idea_card::Triage;
     let form = parse_body(body);
@@ -839,6 +857,7 @@ fn do_triage(state: &State, body: &[u8]) -> Response {
     }
 }
 
+/// `/try` page.
 fn page_try(state: &State) -> Response {
     let pending: Vec<String> = match ancientos_core::log::DecisionLog::open(state.log_path()) {
         Ok(log) => bookmarks_agent::try_it::pending_followups(&log),
@@ -904,6 +923,7 @@ fn page_try(state: &State) -> Response {
     Response::ok(layout("Try it", &body, state))
 }
 
+/// POST try handler.
 fn do_try(state: &State, body: &[u8]) -> Response {
     let form = parse_body(body);
     let post_id = form.get("post_id").map(String::as_str).unwrap_or("");
@@ -921,6 +941,7 @@ fn do_try(state: &State, body: &[u8]) -> Response {
     Response::redirect("/try".to_string())
 }
 
+/// `/hidden-authors` page.
 fn page_hidden_authors(state: &State) -> Response {
     use ancientos_core::log::{DecisionLog, LogError};
     let hidden = match DecisionLog::open(state.log_path()) {
@@ -970,6 +991,7 @@ fn page_hidden_authors(state: &State) -> Response {
     Response::ok(layout("Hidden authors", &body, state))
 }
 
+/// POST unhide-author handler.
 fn do_unhide_author(state: &State, body: &[u8]) -> Response {
     let form = parse_body(body);
     let username = form.get("username").map(String::as_str).unwrap_or("");
@@ -982,6 +1004,7 @@ fn do_unhide_author(state: &State, body: &[u8]) -> Response {
     Response::redirect("/hidden-authors".to_string())
 }
 
+/// Page shown when the log fails its hash check at `row`.
 fn tampered_page(row: usize, state: &State) -> Response {
     Response::ok(layout(
         "Decision log",
@@ -993,6 +1016,7 @@ fn tampered_page(row: usize, state: &State) -> Response {
     ))
 }
 
+/// `/log` page.
 fn page_log(state: &State) -> Response {
     use ancientos_core::log::{DecisionLog, LogError};
     let log = match DecisionLog::open(state.log_path()) {
@@ -1043,6 +1067,7 @@ fn valid_deeper_id(id: &str) -> bool {
 /// headings, `- ` bullets, `N. ` steps, paragraphs). Every line is
 /// HTML-escaped before wrapping, so output is safe by construction.
 fn markdown_html(md: &str) -> String {
+    /// Text after a leading list number, if any.
     fn numbered(line: &str) -> Option<&str> {
         let (n, rest) = line.split_once('.')?;
         if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
@@ -1095,6 +1120,7 @@ fn markdown_html(md: &str) -> String {
     out
 }
 
+/// `/deeper` page for one post.
 fn page_deeper(state: &State, post_id: &str) -> Response {
     if !valid_deeper_id(post_id) {
         return Response::status(400, error_page("Bad id", "Invalid post id.", state));
@@ -1132,6 +1158,7 @@ fn page_deeper(state: &State, post_id: &str) -> Response {
 /// links to `/wiki/<slug>` (invalid slugs stay plain text), so output is
 /// safe by construction.
 fn wiki_markdown_html(md: &str) -> String {
+    /// Turn URLs in escaped text into links.
     fn linkify(escaped: &str) -> String {
         let mut out = String::new();
         let mut rest = escaped;
@@ -1348,6 +1375,7 @@ fn do_deeper(state: &State, post_id: &str, body: &[u8]) -> Response {
 /// no login, so the channel is the identity (mirroring the CLI's `cli`).
 const WEB_DECIDER: &str = "web-ui";
 
+/// Approvals page shown when the log fails its hash check at `row`.
 fn tampered_approvals_page(row: usize, state: &State) -> Response {
     Response::ok(layout(
         "Approvals",
@@ -1359,6 +1387,7 @@ fn tampered_approvals_page(row: usize, state: &State) -> Response {
     ))
 }
 
+/// `/approvals` page.
 fn page_approvals(state: &State) -> Response {
     use ancientos_core::approvals::{decided, pending, ApprovalError};
     use ancientos_core::log::{DecisionLog, LogError};
@@ -1789,10 +1818,12 @@ pub fn handle(req: &Request, state: &State) -> Response {
     }
 }
 
+/// End of the HTTP headers.
 fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// 400 response.
 fn bad_request(msg: &str) -> Response {
     Response::status(400, format!("<h1>Bad request</h1><p>{}</p>", escape(msg)))
 }
@@ -1882,6 +1913,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Response> {
     })
 }
 
+/// HTTP reason phrase.
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -1895,6 +1927,7 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// Serve one HTTP request.
 fn serve_one(stream: &mut std::net::TcpStream, state: &State) {
     use std::io::Write;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
@@ -1968,6 +2001,7 @@ pub fn serve(listener: std::net::TcpListener, state: &State, max_connections: Op
 mod tests {
     use super::*;
 
+    /// Test helper: bookmark.
     fn bookmark(
         id: &str,
         text: &str,
@@ -2002,10 +2036,12 @@ mod tests {
         )
     }
 
+    /// Test helper: photo.
     fn photo(url: &str) -> serde_json::Value {
         serde_json::json!({"type": "photo", "url": url, "alt_text": "synthetic chart"})
     }
 
+    /// Test helper: video.
     fn video(preview: &str, mp4: &str) -> serde_json::Value {
         serde_json::json!({"type": "video", "preview_image_url": preview, "video_url": mp4})
     }
@@ -2040,6 +2076,7 @@ mod tests {
         (dir, state)
     }
 
+    /// Test helper: log entries.
     fn log_entries(state: &State) -> Vec<ancientos_core::log::Entry> {
         ancientos_core::log::DecisionLog::open(state.log_path())
             .unwrap()
@@ -2067,6 +2104,7 @@ mod tests {
         assert!(resp.body.contains("action=\"/vote\""), "{}", resp.body);
     }
 
+    /// Test helper: record feedback votes into the state's decision log.
     fn seed_feedback(state: &State, votes: &[(&str, &str, bookmarks_agent::feedback::Verdict)]) {
         let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
         for (id, cat, verdict) in votes {
@@ -2815,6 +2853,7 @@ mod tests {
         assert!(!form.contains_key("flag"));
     }
 
+    /// Test helper: http roundtrip.
     fn http_roundtrip(addr: &std::net::SocketAddr, raw: &str) -> String {
         use std::io::{Read, Write};
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
@@ -3108,6 +3147,7 @@ mod tests {
     }
 
     impl PaidGuard {
+        /// Test helper: capture.
         fn capture() -> (
             std::sync::MutexGuard<'static, ()>,
             Vec<(&'static str, Option<String>)>,
@@ -3125,6 +3165,7 @@ mod tests {
             (lock, saved)
         }
 
+        /// Test helper: paid on.
         fn paid_on() -> Self {
             let (lock, saved) = Self::capture();
             std::env::set_var("ANCIENTOS_ALLOW_PAID", "1");
@@ -3135,6 +3176,7 @@ mod tests {
             Self { _lock: lock, saved }
         }
 
+        /// Test helper: paid off.
         fn paid_off() -> Self {
             let (lock, saved) = Self::capture();
             std::env::remove_var("ANCIENTOS_ALLOW_PAID");
@@ -3146,6 +3188,7 @@ mod tests {
     }
 
     impl Drop for PaidGuard {
+        /// Test helper: drop.
         fn drop(&mut self) {
             for (key, value) in self.saved.drain(..) {
                 match value {
@@ -3156,6 +3199,7 @@ mod tests {
         }
     }
 
+    /// Test helper: seed cache.
     fn seed_cache(dir: &Path, entries: &[(&str, &str, Option<&str>, u64)]) {
         let mut map = serde_json::Map::new();
         for (id, status, reason, checked_at) in entries {

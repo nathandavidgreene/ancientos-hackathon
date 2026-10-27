@@ -4,10 +4,12 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// Test helper: bin.
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bookmarks-agent"))
 }
 
+/// Test helper: now secs.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -15,6 +17,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Test helper: run.
 fn run(args: &[&str], log_path: &Path) -> Output {
     Command::new(bin())
         .args(args)
@@ -26,10 +29,12 @@ fn run(args: &[&str], log_path: &Path) -> Output {
         .expect("run bookmarks-agent")
 }
 
+/// Test helper: seed.
 fn seed(summary: &str, draft: &str, log_path: &Path) -> ancientos_core::approvals::ApprovalRequest {
     seed_at(summary, draft, log_path, now_secs())
 }
 
+/// Test helper: seed at.
 fn seed_at(
     summary: &str,
     draft: &str,
@@ -50,14 +55,17 @@ fn seed_at(
     .unwrap()
 }
 
+/// Test helper: stdout.
 fn stdout(out: &Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()
 }
 
+/// Test helper: stderr.
 fn stderr(out: &Output) -> String {
     String::from_utf8(out.stderr.clone()).unwrap()
 }
 
+/// Test helper: setup.
 fn setup() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("decision_log.jsonl");

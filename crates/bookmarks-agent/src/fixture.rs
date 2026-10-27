@@ -57,6 +57,7 @@ pub enum FixtureError {
     },
 }
 
+/// Parse bookmarks from JSONL text, one bookmark per non-empty line.
 pub fn parse_jsonl(s: &str) -> Result<Vec<Bookmark>, FixtureError> {
     s.lines()
         .enumerate()
@@ -70,6 +71,7 @@ pub fn parse_jsonl(s: &str) -> Result<Vec<Bookmark>, FixtureError> {
         .collect()
 }
 
+/// Load bookmarks from a JSONL fixture file.
 pub fn load(path: impl AsRef<Path>) -> Result<Vec<Bookmark>, FixtureError> {
     parse_jsonl(&std::fs::read_to_string(path)?)
 }

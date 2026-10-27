@@ -61,6 +61,7 @@ pub fn safe_media_url(raw: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+/// Trim media alt text; `None` when empty.
 fn clean_alt(s: &str) -> Option<String> {
     let stripped: String = s
         .chars()
@@ -189,6 +190,7 @@ fn pick_best_mp4(candidates: &[(u64, Option<u32>, String)]) -> Option<String> {
         .map(|(_, _, u)| u.clone())
 }
 
+/// Parse one X API media object into a `Media`.
 fn parse_one(m: &serde_json::Value) -> Option<Media> {
     let kind = clean_kind(m.get("type")?.as_str()?);
     let get = |k: &str| m.get(k).and_then(|v| v.as_str()).and_then(safe_media_url);
@@ -294,6 +296,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Test helper: sample.
     fn sample() -> serde_json::Value {
         json!({
             "data": [{"id": "1", "attachments": {"media_keys": ["3_a", "7_b", "3_bad"]}}],

@@ -9,16 +9,19 @@ struct Args {
     verdicts: Option<String>,
 }
 
+/// Usage text.
 fn usage() -> &'static str {
     "usage: eval --bookmarks <jsonl> --labels <jsonl> [--out <md>] [--name <dataset>] [--verdicts <jsonl>]"
 }
 
+/// Value after flag `flag` at position `i`.
 fn take_value(args: &[String], i: usize, flag: &str) -> Result<String, String> {
     args.get(i)
         .cloned()
         .ok_or_else(|| format!("{flag} needs a value\n{}", usage()))
 }
 
+/// Parse eval CLI arguments.
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut bookmarks = None;
     let mut labels = None;
@@ -65,6 +68,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     })
 }
 
+/// Run the eval CLI.
 fn real_main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = parse_args(&args)?;
@@ -92,6 +96,7 @@ fn real_main() -> Result<(), String> {
     Ok(())
 }
 
+/// Eval entry point; exit 1 on error.
 fn main() {
     if let Err(e) = real_main() {
         eprintln!("eval: {e}");

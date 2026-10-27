@@ -6,6 +6,7 @@
 use ancientos_router::data_class::DataClass;
 use ancientos_router::muse::MuseClient;
 
+/// Example: send one ping to Muse (paid, gated).
 fn main() {
     let client = MuseClient::from_env().with_max_completion_tokens(256);
     // The ping prompt is a fixed public string, so Public is honest here.

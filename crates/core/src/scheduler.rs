@@ -2,8 +2,11 @@
 use std::time::{Duration, Instant};
 
 pub trait Agent {
+    /// Agent name, used in logs.
     fn name(&self) -> &str;
+    /// How often the scheduler runs this agent.
     fn interval(&self) -> Duration;
+    /// Do one unit of work.
     fn tick(&mut self) -> Result<(), String>;
 }
 
@@ -12,16 +15,19 @@ pub struct Scheduler {
 }
 
 impl Default for Scheduler {
+    /// Empty scheduler.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Scheduler {
+    /// Empty scheduler.
     pub fn new() -> Self {
         Self { agents: Vec::new() }
     }
 
+    /// Add an agent.
     pub fn add(&mut self, a: Box<dyn Agent>) {
         self.agents.push((a, None));
     }
@@ -46,12 +52,15 @@ mod tests {
 
     struct Counter(u32);
     impl Agent for Counter {
+        /// Test helper: name.
         fn name(&self) -> &str {
             "counter"
         }
+        /// Test helper: interval.
         fn interval(&self) -> Duration {
             Duration::from_secs(60)
         }
+        /// Test helper: tick.
         fn tick(&mut self) -> Result<(), String> {
             self.0 += 1;
             Ok(())

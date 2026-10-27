@@ -78,12 +78,14 @@ impl Kind {
         }
     }
 
+    /// Placeholder text that replaces a secret of this kind.
     fn replacement(self) -> String {
         format!("[redacted:{}]", self.as_str())
     }
 }
 
 impl std::fmt::Display for Kind {
+    /// Short name of the secret kind.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -165,22 +167,27 @@ pub fn is_placeholder(value: &str) -> bool {
     )
 }
 
+/// True for ASCII word bytes.
 fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// True for bytes allowed in a vendor key.
 fn is_vendor_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
 }
 
+/// True for bytes allowed in a bearer token.
 fn is_bearer_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
 }
 
+/// True for base64 bytes.
 fn is_b64(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'/' | b'+' | b'=')
 }
 
+/// True for base64url bytes.
 fn is_b64url(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
 }
@@ -226,6 +233,7 @@ fn find_ci(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 struct Spans(Vec<(usize, usize, Kind)>);
 
 impl Spans {
+    /// Claim a byte span for redaction unless it overlaps an earlier claim.
     fn claim(&mut self, start: usize, end: usize, kind: Kind) {
         if end <= start {
             return;
@@ -237,6 +245,7 @@ impl Spans {
     }
 }
 
+/// Find PEM private key blocks.
 fn scan_private_keys(text: &str, spans: &mut Spans) {
     let bytes = text.as_bytes();
     let mut from = 0;
@@ -277,6 +286,7 @@ fn scan_private_keys(text: &str, spans: &mut Spans) {
     }
 }
 
+/// Find passwords inside URLs (`scheme://user:pass@host`).
 fn scan_url_passwords(input: &str, bytes: &[u8], spans: &mut Spans) {
     let mut from = 0;
     while let Some(i) = find_bytes(bytes, b"://", from) {
@@ -326,6 +336,7 @@ fn scan_url_passwords(input: &str, bytes: &[u8], spans: &mut Spans) {
     }
 }
 
+/// Find `Bearer` tokens.
 fn scan_bearers(input: &str, bytes: &[u8], spans: &mut Spans) {
     let mut from = 0;
     while let Some(i) = find_ci(bytes, b"bearer", from) {
@@ -359,6 +370,7 @@ fn scan_bearers(input: &str, bytes: &[u8], spans: &mut Spans) {
     }
 }
 
+/// Find JWTs (three base64url parts).
 fn scan_jwts(bytes: &[u8], spans: &mut Spans) {
     let mut from = 0;
     while let Some(i) = find_bytes(bytes, b"eyJ", from) {
@@ -391,6 +403,7 @@ fn scan_jwts(bytes: &[u8], spans: &mut Spans) {
     }
 }
 
+/// Find vendor keys that start with one of `prefixes`.
 fn scan_prefixed(
     input: &str,
     bytes: &[u8],
@@ -423,6 +436,7 @@ fn scan_prefixed(
     }
 }
 
+/// Find AWS access key ids.
 fn scan_aws_access_keys(input: &str, bytes: &[u8], spans: &mut Spans) {
     for p in ["AKIA", "ASIA"] {
         let pb = p.as_bytes();
@@ -445,6 +459,7 @@ fn scan_aws_access_keys(input: &str, bytes: &[u8], spans: &mut Spans) {
     }
 }
 
+/// True if the bytes contain an AWS access key id.
 fn has_aws_access_key(bytes: &[u8]) -> bool {
     for p in ["AKIA", "ASIA"] {
         let pb = p.as_bytes();
@@ -511,6 +526,7 @@ const ASSIGN_KEYS: &[&str] = &[
     "token",
 ];
 
+/// Find secret-looking `key=value` assignments.
 fn scan_assignments(input: &str, bytes: &[u8], spans: &mut Spans) {
     for key in ASSIGN_KEYS {
         let kb = key.as_bytes();
@@ -657,6 +673,7 @@ pub fn redact_text(input: &str) -> Redacted {
     Redacted { text: out, hits }
 }
 
+/// Redact every string in a JSON value, collecting hit kinds.
 fn walk_json(value: &Value, hits: &mut Vec<Kind>) -> Value {
     match value {
         Value::Object(map) => Value::Object(
@@ -716,27 +733,35 @@ mod tests {
     use serde_json::json;
 
     // Scanner-safe fakes, built at runtime (never literal secrets in source).
+    /// Test helper: aws id.
     fn aws_id() -> String {
         format!("AKIA{}", "A".repeat(16))
     }
+    /// Test helper: aws secret.
     fn aws_secret() -> String {
         "B".repeat(40)
     }
+    /// Test helper: ghp.
     fn ghp(prefix: &str) -> String {
         format!("{prefix}{}", "C".repeat(36))
     }
+    /// Test helper: slack.
     fn slack(prefix: &str) -> String {
         format!("{prefix}{}", "D".repeat(24))
     }
+    /// Test helper: sk.
     fn sk() -> String {
         format!("sk-{}", "E".repeat(32))
     }
+    /// Test helper: google.
     fn google() -> String {
         format!("AIza{}", "F".repeat(35))
     }
+    /// Test helper: stripe.
     fn stripe(prefix: &str) -> String {
         format!("{prefix}{}", "G".repeat(24))
     }
+    /// Test helper: jwt.
     fn jwt() -> String {
         format!(
             "eyJ{}.{}.{}",
@@ -745,9 +770,11 @@ mod tests {
             "k".repeat(10)
         )
     }
+    /// Test helper: bearer.
     fn bearer() -> String {
         format!("Authorization: Bearer {}", "L".repeat(32))
     }
+    /// Test helper: pem.
     fn pem() -> String {
         format!(
             "-----BEGIN RSA PRIVATE KEY-----\n{}\n{}\n-----END RSA PRIVATE KEY-----",
@@ -756,6 +783,7 @@ mod tests {
         )
     }
 
+    /// Test helper: assert redacted.
     fn assert_redacted(input: &str, kind: Kind, secret_part: &str) {
         let r = redact_text(input);
         assert!(
@@ -771,6 +799,7 @@ mod tests {
         );
     }
 
+    /// Test helper: assert clean.
     fn assert_clean(input: &str) {
         let r = redact_text(input);
         assert!(r.hits.is_empty(), "false hit on {input:?}: {:?}", r.hits);

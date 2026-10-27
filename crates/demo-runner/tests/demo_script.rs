@@ -3,10 +3,12 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Test helper: script path.
 fn script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/demo.sh")
 }
 
+/// Test helper: run demo.
 fn run_demo(args: &[&str]) -> (Option<i32>, String, String) {
     let out = Command::new("bash")
         .arg(script_path())
@@ -21,6 +23,7 @@ fn run_demo(args: &[&str]) -> (Option<i32>, String, String) {
     )
 }
 
+/// Test helper: storyboard path.
 fn storyboard_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/demo-storyboard.md")
 }
@@ -84,6 +87,7 @@ fn muse_code_runs_from_log() -> usize {
         .count()
 }
 
+/// Test helper: has 15plus digits.
 fn has_15plus_digits(s: &str) -> bool {
     let mut run = 0usize;
     for c in s.chars() {
@@ -99,6 +103,7 @@ fn has_15plus_digits(s: &str) -> bool {
     false
 }
 
+/// Test helper: is handle char.
 fn is_handle_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }

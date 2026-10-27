@@ -692,6 +692,7 @@ pub fn fetch_caption(url: &str, timeout: Duration) -> Result<String, String> {
     Ok(clean)
 }
 
+/// Find `needle` in `haystack` starting at byte offset `from`.
 fn find_bytes(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || from >= haystack.len() {
         return None;
@@ -1273,6 +1274,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    /// Test helper: bm.
     fn bm(id: &str, text: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -1404,6 +1406,7 @@ mod tests {
         (url, hits)
     }
 
+    /// Test helper: page route.
     fn page_route(path: &str, body: &str) -> Route {
         Route {
             path: path.to_string(),
@@ -1415,6 +1418,7 @@ mod tests {
         }
     }
 
+    /// Test helper: hits of.
     fn hits_of(hits: &Hits) -> usize {
         *hits.lock().expect("hits lock")
     }

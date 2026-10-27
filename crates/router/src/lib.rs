@@ -54,7 +54,9 @@ pub enum RouterError {
 }
 
 pub trait ModelClient {
+    /// Where this client sends data.
     fn destination(&self) -> Destination;
+    /// Complete a prompt.
     fn complete(&self, prompt: &str) -> Result<String, RouterError>;
     /// Sensitivity-aware completion. The default delegates to [`Self::complete`]
     /// (existing clients rely on route-then-call). [`jev_client::JevClient`]
@@ -120,6 +122,7 @@ impl JevTask {
 
 impl std::str::FromStr for JevTask {
     type Err = RouterError;
+    /// Parse a Jev task name.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
     }
@@ -145,14 +148,17 @@ impl JevTasks {
         }
     }
 
+    /// True if the task is enabled.
     pub fn contains(&self, task: JevTask) -> bool {
         self.tasks.contains(&task)
     }
 
+    /// True if no tasks are enabled.
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
 
+    /// Number of enabled tasks.
     pub fn len(&self) -> usize {
         self.tasks.len()
     }
@@ -211,6 +217,7 @@ pub struct RouterConfig {
 }
 
 impl RouterConfig {
+    /// Config from env without validation.
     fn base_from_env() -> Self {
         let get = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
         Self {
@@ -298,9 +305,11 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 pub struct StubClient(pub Destination);
 
 impl ModelClient for StubClient {
+    /// Mock destination.
     fn destination(&self) -> Destination {
         self.0
     }
+    /// Canned reply.
     fn complete(&self, _prompt: &str) -> Result<String, RouterError> {
         Err(RouterError::NotImplemented(self.0))
     }
@@ -310,9 +319,11 @@ impl ModelClient for StubClient {
 pub struct MockClient(pub Destination);
 
 impl ModelClient for MockClient {
+    /// Mock destination.
     fn destination(&self) -> Destination {
         self.0
     }
+    /// Reply derived from the prompt.
     fn complete(&self, prompt: &str) -> Result<String, RouterError> {
         Ok(format!("[{:?}] {}", self.0, prompt.len()))
     }
@@ -483,6 +494,7 @@ mod tests {
     }
 
     impl EnvGuard {
+        /// Test helper: set.
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let saved = std::env::var(key).ok();
             match value {
@@ -494,6 +506,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
+        /// Test helper: drop.
         fn drop(&mut self) {
             match self.saved.take() {
                 Some(v) => std::env::set_var(self.key, v),

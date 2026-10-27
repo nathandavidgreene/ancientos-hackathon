@@ -5,10 +5,12 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// Test helper: bin.
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bookmarks-agent"))
 }
 
+/// Test helper: fixture.
 fn fixture(name: &str) -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/demo")
@@ -24,6 +26,7 @@ struct Setup {
 }
 
 impl Setup {
+    /// Test helper: new.
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -36,6 +39,7 @@ impl Setup {
         }
     }
 
+    /// Test helper: run.
     fn run(&self, args: &[&str], paid: bool) -> Output {
         let mut cmd = Command::new(bin());
         cmd.args(args)
@@ -60,10 +64,12 @@ impl Setup {
         cmd.output().expect("run bookmarks-agent")
     }
 
+    /// Test helper: log text.
     fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    /// Test helper: log kinds.
     fn log_kinds(&self) -> Vec<String> {
         self.log_text()
             .lines()
@@ -78,10 +84,12 @@ impl Setup {
     }
 }
 
+/// Test helper: stdout.
 fn stdout(out: &Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()
 }
 
+/// Test helper: stderr.
 fn stderr(out: &Output) -> String {
     String::from_utf8(out.stderr.clone()).unwrap()
 }

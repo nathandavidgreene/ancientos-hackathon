@@ -28,14 +28,17 @@ pub struct Gate {
 }
 
 impl Gate {
+    /// Create an empty gate.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register an action with its risk level.
     pub fn register(&mut self, action: impl Into<String>, risk: Risk) {
         self.policies.insert(action.into(), risk);
     }
 
+    /// Decide a proposal: auto-allow, needs approval, or deny (unknown actions deny).
     pub fn evaluate(&self, p: &Proposal) -> Verdict {
         match self.policies.get(&p.action) {
             Some(Risk::Low) => Verdict::Allow,
@@ -51,6 +54,7 @@ impl Gate {
 mod tests {
     use super::*;
 
+    /// Test helper: p.
     fn p(action: &str) -> Proposal {
         Proposal {
             agent: "t".into(),
