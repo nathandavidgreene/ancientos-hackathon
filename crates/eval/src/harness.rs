@@ -243,6 +243,199 @@ pub fn evaluate_with_cache(
     }
 }
 
+/// One synthetic verdict for ranker training, as one JSONL line:
+/// `{"post_id": "...", "verdict": "approve"|"skip"|..., "voted_at": <unix secs>}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct VerdictEntry {
+    pub post_id: String,
+    pub verdict: String,
+    pub voted_at: u64,
+}
+
+/// Load verdicts from a JSONL file. Blank lines are skipped; a malformed
+/// line fails the whole load naming its line number.
+pub fn load_verdicts(path: impl AsRef<Path>) -> Result<Vec<VerdictEntry>, String> {
+    let path = path.as_ref();
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: VerdictEntry =
+            serde_json::from_str(line).map_err(|e| format!("verdicts line {}: {e}", i + 1))?;
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+fn signal_of(
+    verdict: &str,
+    line_hint: &str,
+) -> Result<Option<bookmarks_agent::ranker::Signal>, String> {
+    use bookmarks_agent::ranker::Signal;
+    match verdict {
+        "approve" => Ok(Some(Signal::Approve)),
+        "delegate" => Ok(Some(Signal::Delegate)),
+        "skip" => Ok(Some(Signal::Skip)),
+        "never_post" => Ok(Some(Signal::NeverPost)),
+        "never_category" | "never" => Ok(Some(Signal::NeverCategory)),
+        "never_author" => Ok(Some(Signal::NeverAuthor)),
+        // A hide-undo carries no preference: skip, like the log reader.
+        "unhide_author" => Ok(None),
+        other => Err(format!("{line_hint}: unknown verdict: {other}")),
+    }
+}
+
+/// Local-picks P@5 with and without the personal ranker, on a
+/// leave-later-out split by vote time. Aggregate numbers only: never post
+/// text, ids or urls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankingComparison {
+    pub name: String,
+    /// Verdicts resolved to a bookmark and used in the split.
+    pub n_verdicts: usize,
+    /// Verdicts for unknown post ids (counted, never an error).
+    pub n_unmatched: usize,
+    /// Earlier verdicts the ranker trains on.
+    pub n_train: usize,
+    /// Later posts the local picks are scored on.
+    pub n_test: usize,
+    /// Brief-worthy labels among the later posts.
+    pub n_test_worthy: usize,
+    /// Local picks P@5 without the ranker (today's order).
+    pub baseline_precision_at_5: f64,
+    /// Local picks P@5 after the ranker re-ranks candidates.
+    pub ranked_precision_at_5: f64,
+    /// Whether the ranker trained on enough labels to activate.
+    pub ranker_active: bool,
+}
+
+fn precision_at_5(
+    candidates: &[bookmarks_agent::brief::Candidate],
+    picks: &[(usize, String)],
+    worthy: &HashSet<&str>,
+) -> f64 {
+    let mut hits = 0usize;
+    for (n, _) in picks {
+        if *n == 0 {
+            continue;
+        }
+        if let Some(candidate) = candidates.get(n - 1) {
+            if worthy.contains(candidate.post_id.as_str()) {
+                hits += 1;
+            }
+        }
+    }
+    safe_div(hits, picks.len())
+}
+
+/// Compare local-picks P@5 with and without the ranker. Verdicts resolving
+/// to a bookmark split by `voted_at` (ties break by post id): the earlier
+/// two thirds train the ranker (minimum `min_records` labels to activate),
+/// the later third is the scored pool. `now` is the latest vote time, so
+/// the run is deterministic with no wall clock. Offline: no network, no
+/// paid calls.
+pub fn compare_ranking(
+    bookmarks: &[Bookmark],
+    labels: &[Label],
+    verdicts: &[VerdictEntry],
+    name: &str,
+    min_records: usize,
+) -> Result<RankingComparison, String> {
+    let by_id: HashMap<&str, &Bookmark> =
+        bookmarks.iter().map(|b| (b.post_id.as_str(), b)).collect();
+    let worthy: HashSet<&str> = labels
+        .iter()
+        .filter(|l| l.brief_worthy)
+        .map(|l| l.post_id.as_str())
+        .collect();
+    let mut resolved: Vec<(&Bookmark, bookmarks_agent::ranker::Signal, u64)> = Vec::new();
+    let mut unmatched = 0usize;
+    for v in verdicts {
+        let Some(bookmark) = by_id.get(v.post_id.as_str()) else {
+            unmatched += 1;
+            continue;
+        };
+        let hint = format!("verdict for {}", v.post_id);
+        if let Some(signal) = signal_of(&v.verdict, &hint)? {
+            resolved.push((bookmark, signal, v.voted_at));
+        }
+    }
+    resolved.sort_by(|a, b| (a.2, a.0.post_id.as_str()).cmp(&(b.2, b.0.post_id.as_str())));
+    let test_n = if resolved.len() < 2 {
+        resolved.len()
+    } else {
+        (resolved.len() / 3).clamp(1, resolved.len() - 1)
+    };
+    let split = resolved.len() - test_n;
+    let now = resolved.iter().map(|(_, _, t)| *t).max().unwrap_or(0);
+    let events: Vec<bookmarks_agent::ranker::LabeledEvent> = resolved[..split]
+        .iter()
+        .map(|(b, s, t)| bookmarks_agent::ranker::LabeledEvent {
+            bookmark: (*b).clone(),
+            signal: *s,
+            at: Some(*t),
+        })
+        .collect();
+    let ranker = bookmarks_agent::ranker::Ranker::train(&events, now, min_records);
+    let test_rows: Vec<Bookmark> = resolved[split..]
+        .iter()
+        .map(|(b, _, _)| (*b).clone())
+        .collect();
+    let test_ids: HashSet<&str> = test_rows.iter().map(|b| b.post_id.as_str()).collect();
+    let n_test_worthy = worthy.intersection(&test_ids).count();
+    let candidates = bookmarks_agent::brief::select_candidates(&test_rows, &BTreeSet::new());
+    let baseline_picks = bookmarks_agent::brief::local_picks(&candidates);
+    let baseline = precision_at_5(&candidates, &baseline_picks, &worthy);
+    let ranked = if ranker.is_active() {
+        let scores = ranker.score_all(test_rows.iter());
+        let reranked =
+            bookmarks_agent::brief::select_candidates_ranked(&test_rows, &BTreeSet::new(), &scores);
+        let picks = bookmarks_agent::brief::local_picks(&reranked);
+        precision_at_5(&reranked, &picks, &worthy)
+    } else {
+        baseline
+    };
+    Ok(RankingComparison {
+        name: name.to_string(),
+        n_verdicts: resolved.len(),
+        n_unmatched: unmatched,
+        n_train: split,
+        n_test: test_rows.len(),
+        n_test_worthy,
+        baseline_precision_at_5: baseline,
+        ranked_precision_at_5: ranked,
+        ranker_active: ranker.is_active(),
+    })
+}
+
+/// Render the ranking comparison as markdown. Aggregate numbers only: no
+/// post text, ids or urls ever appear.
+pub fn render_comparison_markdown(c: &RankingComparison) -> String {
+    format!(
+        "# Ranking comparison — {name}\n\
+         \n\
+         Leave-later-out by vote time: {n_train} earlier verdicts train the ranker, \
+         {n_test} later posts score it ({n_worthy} brief-worthy). \
+         {n_unmatched} verdicts matched no bookmark.\n\
+         \n\
+         | Picks | P@5 |\n\
+         | --- | --- |\n\
+         | Baseline (today's order) | {base:.3} |\n\
+         | Ranked (personal ranker{inactive}) | {ranked:.3} |\n",
+        name = c.name,
+        n_train = c.n_train,
+        n_test = c.n_test,
+        n_worthy = c.n_test_worthy,
+        n_unmatched = c.n_unmatched,
+        base = c.baseline_precision_at_5,
+        ranked = c.ranked_precision_at_5,
+        inactive = if c.ranker_active { "" } else { ", inactive" },
+    )
+}
+
 /// Load bookmarks and labels from JSONL files and score both tasks.
 /// Translations come from `$TRANSLATIONS_CACHE_PATH` when set, else
 /// `translations.json` next to the bookmarks file, else none (every
@@ -351,6 +544,75 @@ mod tests {
         let p = 5.0 / 8.0;
         let r = 5.0 / 7.0;
         assert!(approx(c.f1(), 2.0 * p * r / (p + r)));
+    }
+
+    #[test]
+    fn ranking_comparison_runs_offline_on_synthetic_verdicts() {
+        let (bookmarks, labels) = load_synthetic();
+        let verdicts = load_verdicts(fixture_path("synthetic_verdicts.jsonl")).unwrap();
+        assert_eq!(verdicts.len(), 24);
+        let c = compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10).unwrap();
+        assert_eq!(c.n_verdicts, 24);
+        assert_eq!(c.n_unmatched, 0);
+        assert_eq!(c.n_train, 16);
+        assert_eq!(c.n_test, 8);
+        assert_eq!(c.n_test_worthy, 4);
+        assert!(c.ranker_active);
+        assert!((0.0..=1.0).contains(&c.baseline_precision_at_5));
+        assert!((0.0..=1.0).contains(&c.ranked_precision_at_5));
+        // Deterministic: same inputs give the same comparison.
+        let again = compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10).unwrap();
+        assert_eq!(c, again);
+        let md = render_comparison_markdown(&c);
+        assert!(md.contains("Baseline (today's order)"), "{md}");
+        assert!(md.contains("Ranked (personal ranker)"), "{md}");
+        assert!(!md.contains("eval-"), "{md}");
+        for b in &bookmarks {
+            assert!(!md.contains(&b.text), "leaked post text");
+            assert!(!md.contains(&b.url), "leaked url");
+        }
+    }
+
+    #[test]
+    fn ranking_comparison_skips_unmatched_and_unknown_labels() {
+        let (bookmarks, labels) = load_synthetic();
+        let mut verdicts = load_verdicts(fixture_path("synthetic_verdicts.jsonl")).unwrap();
+        verdicts.push(VerdictEntry {
+            post_id: "ghost".to_string(),
+            verdict: "approve".to_string(),
+            voted_at: 9_999_999_999,
+        });
+        // A hide-undo carries no preference: skipped, not an error.
+        verdicts.push(VerdictEntry {
+            post_id: "eval-1".to_string(),
+            verdict: "unhide_author".to_string(),
+            voted_at: 9_999_999_998,
+        });
+        let c = compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10).unwrap();
+        assert_eq!(c.n_unmatched, 1);
+        assert_eq!(c.n_verdicts, 24);
+        let bad = vec![VerdictEntry {
+            post_id: "eval-1".to_string(),
+            verdict: "maybe".to_string(),
+            voted_at: 1,
+        }];
+        assert!(compare_ranking(&bookmarks, &labels, &bad, "synthetic", 10).is_err());
+    }
+
+    #[test]
+    fn ranking_comparison_fails_closed_on_small_inputs() {
+        let (bookmarks, labels) = load_synthetic();
+        // Too few labels to activate: ranked equals baseline.
+        let verdicts = load_verdicts(fixture_path("synthetic_verdicts.jsonl")).unwrap();
+        let c = compare_ranking(&bookmarks, &labels, &verdicts[..5], "tiny", 10).unwrap();
+        assert!(!c.ranker_active);
+        assert_eq!(c.ranked_precision_at_5, c.baseline_precision_at_5);
+        // Empty verdicts: zeros, no panic.
+        let c = compare_ranking(&bookmarks, &labels, &[], "empty", 10).unwrap();
+        assert_eq!(c.n_train, 0);
+        assert_eq!(c.n_test, 0);
+        assert_eq!(c.baseline_precision_at_5, 0.0);
+        assert_eq!(c.ranked_precision_at_5, 0.0);
     }
 
     #[test]

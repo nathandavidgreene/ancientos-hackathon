@@ -515,6 +515,29 @@ fn try_it_html(b: &Bookmark, text: &str) -> String {
     out
 }
 
+/// "Why this is here" for one post: the personal ranker's top reasons,
+/// trained on this data dir's verdict history. Best-effort like
+/// `hidden_authors_of`: a missing or unreadable log, or too few labels,
+/// renders no section at all.
+fn rank_reasons_html(state: &State, bm: &Bookmark) -> Option<String> {
+    let log = ancientos_core::log::DecisionLog::open(state.log_path()).ok()?;
+    let ranker =
+        bookmarks_agent::ranker::Ranker::train_from_log(&log, &state.all_bookmarks, now_secs())
+            .ok()?;
+    if !ranker.is_active() {
+        return None;
+    }
+    let reasons = ranker.score(bm).top_reasons;
+    if reasons.is_empty() {
+        return None;
+    }
+    let items: String = reasons
+        .iter()
+        .map(|r| format!("<li>{}</li>", escape(r)))
+        .collect();
+    Some(format!("<h2>Why this is here</h2><ul>{items}</ul>"))
+}
+
 /// Currently hidden authors from this data dir's decision log.
 /// Best-effort like `mark_shown` below: a missing or unreadable log means
 /// no hides (tampering is still surfaced on `/log`).
@@ -616,6 +639,9 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
     body.push_str(&thread_html(&chain));
     body.push_str(&media_html(&bm.media));
     body.push_str(&try_section);
+    if let Some(why) = rank_reasons_html(state, bm) {
+        body.push_str(&why);
+    }
     body.push_str(&format!(
         "<h2>Vote</h2><form method=\"post\" action=\"/vote\">\
          <input type=\"hidden\" name=\"post_id\" value=\"{}\">\
@@ -1746,6 +1772,58 @@ mod tests {
             assert!(resp.body.contains(&format!("value=\"{v}\"")), "{v} missing");
         }
         assert!(resp.body.contains("action=\"/vote\""), "{}", resp.body);
+    }
+
+    fn seed_feedback(state: &State, votes: &[(&str, &str, ancientos_core::feedback::Verdict)]) {
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        for (id, cat, verdict) in votes {
+            ancientos_core::feedback::record(
+                &mut log,
+                ancientos_core::feedback::FeedbackRecord {
+                    pick_id: (*id).to_string(),
+                    category: (*cat).to_string(),
+                    verdict: *verdict,
+                    tags: Vec::new(),
+                },
+                ancientos_core::feedback::ThresholdPolicy::default(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn brief_shows_why_this_is_here_with_reasons_when_ranker_active() {
+        use ancientos_core::feedback::Verdict;
+        let (_dir, state) = test_state();
+        // Enough resolving votes to activate whatever the env minimum is.
+        let min = bookmarks_agent::ranker::min_records_from_env().max(1);
+        let mut votes = Vec::new();
+        for i in 0..min {
+            let (id, cat, verdict) = match i % 3 {
+                0 => ("p1", "Health & Wellness", Verdict::Approve),
+                1 => ("p3", "Rust & Systems", Verdict::Approve),
+                _ => ("p2", "Rust & Systems", Verdict::Skip),
+            };
+            votes.push((id, cat, verdict));
+        }
+        seed_feedback(&state, &votes);
+        let resp = handle(&Request::get("/"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("Why this is here"), "{}", resp.body);
+        assert!(resp.body.contains("<li>"), "{}", resp.body);
+        assert!(
+            resp.body.contains("you approved") || resp.body.contains("author you often"),
+            "{}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn brief_omits_why_this_is_here_when_ranker_inactive() {
+        let (_dir, state) = test_state();
+        let resp = handle(&Request::get("/"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(!resp.body.contains("Why this is here"), "{}", resp.body);
     }
 
     #[test]

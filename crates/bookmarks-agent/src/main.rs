@@ -1,5 +1,6 @@
 //! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`
 //! | `brief [--fixture PATH] [--out PATH] [--offline] [--demo]`
+//! | `rank [--top N]`
 //! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
 //! | `unhide-author <username>` | `hidden-authors`
 //! | `delegate <post_id>` | `deeper <post_id> [--offline <fixture.jsonl>]`
@@ -15,7 +16,9 @@
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
-//! merges the live store with a fixture and prints a daily brief. `vote`
+//! merges the live store with a fixture and prints a daily brief. `rank`
+//! prints the personal ranked list with reasons (trained on past verdicts,
+//! inactive without enough labels). `vote`
 //! records a feedback verdict (`never_author` hides every post by that
 //! post's author); `unhide-author` undoes an author hide and
 //! `hidden-authors` lists the currently hidden authors (read-only).
@@ -47,11 +50,12 @@
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
     author_filter, brief, callback, daemon, deeper, delegate, digest, fixture, idea_card, ingest,
-    merge, oauth, token_store, try_it, vote, wiki, x_api,
+    merge, oauth, ranker, token_store, try_it, vote, wiki, x_api,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> [--now <rfc3339>] | deny <id> [reason] [--now <rfc3339>] | run [--once] [--now <rfc3339>] [--offline <fixture>] | wiki ingest <post_id> | wiki ingest --delegated | wiki query \"<question>\" [--file-back] | wiki lint | wiki show <slug>";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | rank [--top N] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> [--now <rfc3339>] | deny <id> [reason] [--now <rfc3339>] | run [--once] [--now <rfc3339>] [--offline <fixture>] | wiki ingest <post_id> | wiki ingest --delegated | wiki query \"<question>\" [--file-back] | wiki lint | wiki show <slug>";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -209,6 +213,95 @@ fn cmd_brief(args: &[String]) -> Result<(), String> {
     if let Some(path) = out {
         std::fs::write(&path, &result.markdown)
             .map_err(|e| format!("brief write failed for {path}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// `rank` limit: `--top N` / `--top=N` with N >= 1, else usage.
+/// `Ok(None)` means no limit (print every ranked candidate).
+fn parse_rank_args(args: &[String]) -> Result<Option<usize>, String> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    let value = if args.len() == 2 && args[0] == "--top" {
+        args[1].as_str()
+    } else if args.len() == 1 {
+        args[0]
+            .strip_prefix("--top=")
+            .ok_or_else(|| USAGE.to_string())?
+    } else {
+        return Err(USAGE.to_string());
+    };
+    let n: usize = value.parse().map_err(|_| USAGE.to_string())?;
+    if n == 0 {
+        return Err(USAGE.to_string());
+    }
+    Ok(Some(n))
+}
+
+/// Print the personal ranked candidate list with reasons. Hidden posts and
+/// hidden authors never surface. Local only: no model call, no log writes;
+/// an inactive ranker prints today's order plus an inactive note.
+fn cmd_rank(args: &[String]) -> Result<(), String> {
+    let top = parse_rank_args(args)?;
+    let merged = merge::load_merged(None)?;
+    if merged.rows.is_empty() {
+        return Err("no bookmarks to rank".to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let records = ancientos_core::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
+    let hidden_posts = ancientos_core::feedback::hidden_posts(&records);
+    let hidden_authors = ancientos_core::feedback::hidden_authors(&records);
+    let rows: Vec<fixture::Bookmark> = merged
+        .rows
+        .iter()
+        .filter(|b| !hidden_posts.contains(&b.post_id))
+        .filter(|b| !author_filter::is_hidden(b, &hidden_authors))
+        .cloned()
+        .collect();
+    if rows.is_empty() {
+        return Err("no bookmarks to rank".to_string());
+    }
+    let trained = ranker::Ranker::train_from_log(&log, &merged.rows, idea_card::now_secs())?;
+    let candidates = if trained.is_active() {
+        let scores = trained.score_all(merged.rows.iter());
+        brief::select_candidates_ranked(&rows, &merged.live_ids, &scores)
+    } else {
+        brief::select_candidates(&rows, &merged.live_ids)
+    };
+    let by_id: HashMap<&str, &fixture::Bookmark> = merged
+        .rows
+        .iter()
+        .map(|b| (b.post_id.as_str(), b))
+        .collect();
+    let n = top.unwrap_or(candidates.len());
+    for c in candidates.iter().take(n) {
+        if trained.is_active() {
+            let score = by_id
+                .get(c.post_id.as_str())
+                .map(|b| trained.score(b))
+                .unwrap_or(ranker::RankScore {
+                    score: 0.0,
+                    top_reasons: Vec::new(),
+                });
+            println!(
+                "{}. {} [{}] score {:.3}",
+                c.index, c.post_id, c.topic, score.score
+            );
+            for reason in &score.top_reasons {
+                println!("   - {reason}");
+            }
+        } else {
+            println!("{}. {} [{}]", c.index, c.post_id, c.topic);
+        }
+    }
+    if !trained.is_active() {
+        println!(
+            "ranker inactive: {} labeled records (min {})",
+            trained.n_labeled(),
+            trained.min_records()
+        );
     }
     Ok(())
 }
@@ -1057,6 +1150,7 @@ fn main() {
         Some("load") => cmd_load(&args[1..]),
         Some("auth-url") if args.len() == 1 => cmd_auth_url(),
         Some("brief") => cmd_brief(&args[1..]),
+        Some("rank") => cmd_rank(&args[1..]),
         Some("vote") => cmd_vote(&args[1..]),
         Some("unhide-author") => cmd_unhide_author(&args[1..]),
         Some("hidden-authors") => cmd_hidden_authors(&args[1..]),
@@ -1452,6 +1546,30 @@ mod tests {
     #[test]
     fn deeper_queue_rejects_args() {
         assert_eq!(cmd_deeper_queue(&["extra".to_string()]).unwrap_err(), USAGE);
+    }
+
+    #[test]
+    fn rank_top_parses_space_and_equals_forms() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_rank_args(&none).unwrap(), None);
+        let owned: Vec<String> = ["--top", "3"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_rank_args(&owned).unwrap(), Some(3));
+        let owned: Vec<String> = ["--top=5"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_rank_args(&owned).unwrap(), Some(5));
+        for bad in [
+            vec!["--top"],
+            vec!["--top="],
+            vec!["--top", "0"],
+            vec!["--top=0"],
+            vec!["--top", "many"],
+            vec!["--top", "3", "--top", "4"],
+            vec!["--top", "3", "extra"],
+            vec!["extra"],
+            vec!["3"],
+        ] {
+            let owned: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert_eq!(parse_rank_args(&owned).unwrap_err(), USAGE, "{bad:?}");
+        }
     }
 
     #[test]

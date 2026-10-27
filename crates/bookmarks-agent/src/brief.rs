@@ -143,6 +143,27 @@ fn confidence_of(b: &Bookmark) -> f64 {
 /// first, then higher confidence, then `post_id`. Topics are interleaved
 /// round-robin for diversity; at most [`MAX_CANDIDATES`] are kept.
 pub fn select_candidates(rows: &[Bookmark], live_ids: &BTreeSet<String>) -> Vec<Candidate> {
+    select_candidates_inner(rows, live_ids, None)
+}
+
+/// Personal-ranked candidate selection: like [`select_candidates`] with a
+/// personal score key after liveness (higher first), so preferred posts
+/// surface in earlier round-robin rounds while the topic spread rule still
+/// holds. Tie-safe: equal scores fall through to the existing keys, and
+/// post ids missing from `scores` count as 0.0.
+pub fn select_candidates_ranked(
+    rows: &[Bookmark],
+    live_ids: &BTreeSet<String>,
+    scores: &HashMap<String, f64>,
+) -> Vec<Candidate> {
+    select_candidates_inner(rows, live_ids, Some(scores))
+}
+
+fn select_candidates_inner(
+    rows: &[Bookmark],
+    live_ids: &BTreeSet<String>,
+    scores: Option<&HashMap<String, f64>>,
+) -> Vec<Candidate> {
     let mut ordered: Vec<&Bookmark> = rows.iter().collect();
     ordered.sort_by(|a, b| {
         let live = live_ids
@@ -150,6 +171,14 @@ pub fn select_candidates(rows: &[Bookmark], live_ids: &BTreeSet<String>) -> Vec<
             .cmp(&live_ids.contains(&a.post_id));
         if live != Ordering::Equal {
             return live;
+        }
+        if let Some(scores) = scores {
+            let sa = scores.get(&a.post_id).copied().unwrap_or(0.0);
+            let sb = scores.get(&b.post_id).copied().unwrap_or(0.0);
+            let rank = sb.total_cmp(&sa);
+            if rank != Ordering::Equal {
+                return rank;
+            }
         }
         let ts = match (&b.created_at, &a.created_at) {
             (Some(x), Some(y)) => x.cmp(y),
@@ -736,6 +765,28 @@ fn run_impl(
     if candidates.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
+    // Personal ranking: train on verdict history; when active, re-select
+    // with scores so preferred posts surface earlier (same round-robin
+    // spread, ties keep today's order). Inactive keeps `candidates`
+    // untouched. Hidden/never filtering above applied first.
+    let ranker = crate::ranker::Ranker::train_from_log(
+        &DecisionLog::open(log_path).map_err(|e| e.to_string())?,
+        &merged.rows,
+        now_secs,
+    )
+    .map_err(|e| e.to_string())?;
+    let candidates = if ranker.is_active() {
+        let scores = ranker.score_all(merged.rows.iter());
+        select_candidates_ranked(&rows, &merged.live_ids, &scores)
+    } else {
+        candidates
+    };
+    let base = select_candidates(&rows, &merged.live_ids);
+    let reordered = candidates
+        .iter()
+        .zip(base.iter())
+        .filter(|(c, b)| c.post_id != b.post_id)
+        .count();
 
     let stored: HashMap<&str, &Bookmark> = rows.iter().map(|b| (b.post_id.as_str(), b)).collect();
     // Only Public content may leave the device, and only as sanitized
@@ -914,6 +965,28 @@ fn run_impl(
         serde_json::json!({"count": candidates.len(), "ids": ids}),
     )
     .map_err(|e| e.to_string())?;
+    // Personal ranking outcome, exactly one per brief. Counts only: never
+    // post text, ids, or reasons.
+    if ranker.is_active() {
+        log.append(
+            crate::ranker::APPLIED_KIND,
+            serde_json::json!({
+                "labeled": ranker.n_labeled(),
+                "candidates": candidates.len(),
+                "reordered": reordered,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        log.append(
+            crate::ranker::INACTIVE_KIND,
+            serde_json::json!({
+                "labeled": ranker.n_labeled(),
+                "min_records": ranker.min_records(),
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let (pt, ct, tt) = tokens_opt(usage.as_ref());
     // Never log prompt text here: model id and token counts only.
     log.append(
@@ -1133,6 +1206,82 @@ mod tests {
     }
 
     #[test]
+    fn ranked_selection_matches_plain_on_ties_and_missing_scores() {
+        let rows = vec![
+            bm(
+                "a1",
+                Some("2026-02-01T00:00:00+00:00"),
+                Some("A"),
+                Some(0.9),
+            ),
+            bm(
+                "b1",
+                Some("2026-01-01T00:00:00+00:00"),
+                Some("B"),
+                Some(0.1),
+            ),
+            bm(
+                "a2",
+                Some("2026-03-01T00:00:00+00:00"),
+                Some("A"),
+                Some(0.1),
+            ),
+        ];
+        let live: BTreeSet<String> = rows.iter().map(|b| b.post_id.clone()).collect();
+        let plain = select_candidates(&rows, &live);
+        // Empty scores: identical order (tie-safe no-op).
+        let ranked = select_candidates_ranked(&rows, &live, &HashMap::new());
+        let ids = |cs: &[Candidate]| cs.iter().map(|c| c.post_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&ranked), ids(&plain));
+        // Equal scores: identical order (ties fall through to recency).
+        let tied: HashMap<String, f64> = rows.iter().map(|b| (b.post_id.clone(), 1.5)).collect();
+        assert_eq!(
+            ids(&select_candidates_ranked(&rows, &live, &tied)),
+            ids(&plain)
+        );
+        // Unknown ids in the map change nothing.
+        let ghost: HashMap<String, f64> = [("ghost".to_string(), 99.0)].into_iter().collect();
+        assert_eq!(
+            ids(&select_candidates_ranked(&rows, &live, &ghost)),
+            ids(&plain)
+        );
+    }
+
+    #[test]
+    fn ranked_selection_surfaces_boosted_posts_within_spread() {
+        let rows = vec![
+            bm(
+                "a1",
+                Some("2026-03-01T00:00:00+00:00"),
+                Some("A"),
+                Some(0.9),
+            ),
+            bm(
+                "b1",
+                Some("2026-02-01T00:00:00+00:00"),
+                Some("B"),
+                Some(0.9),
+            ),
+            bm(
+                "c1",
+                Some("2026-01-01T00:00:00+00:00"),
+                Some("C"),
+                Some(0.9),
+            ),
+        ];
+        let live: BTreeSet<String> = rows.iter().map(|b| b.post_id.clone()).collect();
+        // Boost the oldest post above the rest: it leads round 1, and the
+        // round still spans every topic exactly once.
+        let scores: HashMap<String, f64> = [("c1".to_string(), 5.0)].into_iter().collect();
+        let out = select_candidates_ranked(&rows, &live, &scores);
+        let ids: Vec<&str> = out.iter().map(|c| c.post_id.as_str()).collect();
+        assert_eq!(ids, vec!["c1", "a1", "b1"]);
+        let topics: BTreeSet<&str> = out.iter().map(|c| c.topic.as_str()).collect();
+        assert_eq!(topics.len(), 3, "round 1 still spans all topics");
+        assert!(out.iter().enumerate().all(|(i, c)| c.index == i + 1));
+    }
+
+    #[test]
     fn parses_strict_and_embedded_arrays() {
         let strict = r#"[{"n":2,"why":"good"},{"n":1,"why":"better"}]"#;
         assert_eq!(
@@ -1224,23 +1373,25 @@ mod tests {
 
         let log = DecisionLog::open(&log_path).unwrap();
         let entries = log.verify().unwrap();
-        assert_eq!(entries.len(), 1 + 1 + 3 + 1);
+        assert_eq!(entries.len(), 1 + 1 + 1 + 3 + 1);
         assert_eq!(entries[0].kind, "brief.candidates");
         assert_eq!(entries[0].payload["count"], 4);
-        assert_eq!(entries[1].kind, "brief.model_call");
-        assert_eq!(entries[1].payload["model"], "fake-spark");
-        assert_eq!(entries[1].payload["total_tokens"], 15);
+        assert_eq!(entries[1].kind, crate::ranker::INACTIVE_KIND);
+        assert_eq!(entries[1].payload["labeled"], 0);
+        assert_eq!(entries[2].kind, "brief.model_call");
+        assert_eq!(entries[2].payload["model"], "fake-spark");
+        assert_eq!(entries[2].payload["total_tokens"], 15);
         // No prompt text in the model-call entry.
-        let call_json = entries[1].payload.to_string();
+        let call_json = entries[2].payload.to_string();
         assert!(!call_json.contains("synthetic text"), "{call_json}");
-        assert_eq!(entries[2].kind, "brief.pick");
-        assert_eq!(entries[2].payload["post_id"], "id1");
-        assert_eq!(entries[2].payload["verdict"], "allow");
-        assert_eq!(entries[5].kind, "brief.hydrate");
-        assert_eq!(entries[5].payload["requested"], 0);
-        assert_eq!(entries[5].payload["hydrated"], 0);
+        assert_eq!(entries[3].kind, "brief.pick");
+        assert_eq!(entries[3].payload["post_id"], "id1");
+        assert_eq!(entries[3].payload["verdict"], "allow");
+        assert_eq!(entries[6].kind, "brief.hydrate");
+        assert_eq!(entries[6].payload["requested"], 0);
+        assert_eq!(entries[6].payload["hydrated"], 0);
         assert!(
-            !entries[5].payload.to_string().contains("synthetic text"),
+            !entries[6].payload.to_string().contains("synthetic text"),
             "no text in hydrate entry"
         );
     }
@@ -1264,7 +1415,8 @@ mod tests {
         assert!(res.markdown.contains("Model: local"));
         let log = DecisionLog::open(&log_path).unwrap();
         let entries = log.verify().unwrap();
-        assert_eq!(entries[1].payload["fallback"], true);
+        assert_eq!(entries[1].kind, crate::ranker::INACTIVE_KIND);
+        assert_eq!(entries[2].payload["fallback"], true);
     }
 
     #[test]
@@ -1743,12 +1895,13 @@ mod tests {
         assert!(!res.picks.iter().any(|p| p.post_id == "id2"));
         assert!(!res.markdown.contains("status/id0"), "{}", res.markdown);
         assert!(!res.markdown.contains("status/id2"), "{}", res.markdown);
-        // No log entry for the filtering itself (candidates/model/picks only).
+        // No log entry for the filtering itself (candidates/model/picks
+        // plus the one ranker outcome entry only).
         let log = DecisionLog::open(&log_path).unwrap();
         let entries = log.verify().unwrap();
-        assert!(entries
-            .iter()
-            .all(|e| e.kind.starts_with("brief.") || e.kind == "feedback"));
+        assert!(entries.iter().all(|e| e.kind.starts_with("brief.")
+            || e.kind == "feedback"
+            || e.kind.starts_with("ranker.")));
     }
 
     #[test]
@@ -2273,5 +2426,228 @@ mod tests {
         assert_eq!(via_model.markdown, via_local.markdown);
         assert_eq!(via_model.model, "local");
         assert_eq!(via_local.model, "local");
+    }
+
+    fn rank_bm(id: &str, created: &str, author: &str, text: &str) -> Bookmark {
+        let mut b = bm(id, Some(created), Some("Rust"), Some(0.5));
+        b.author_username = Some(author.into());
+        b.text = text.into();
+        b
+    }
+
+    /// 12 same-topic posts: `keep-*` (older) by syn_keep, `drop-*` (newer)
+    /// by syn_drop. Baseline order puts newer `drop-*` first.
+    fn rank_rows() -> Vec<Bookmark> {
+        let mut rows = Vec::new();
+        for i in 0..6 {
+            rows.push(rank_bm(
+                &format!("keep-{i}"),
+                &format!("2026-01-{:02}T00:00:00+00:00", i + 1),
+                "syn_keep",
+                "synthetic keepable alpha post",
+            ));
+            rows.push(rank_bm(
+                &format!("drop-{i}"),
+                &format!("2026-02-{:02}T00:00:00+00:00", i + 1),
+                "syn_drop",
+                "synthetic droppable beta post",
+            ));
+        }
+        rows
+    }
+
+    fn seed_vote(log: &mut DecisionLog, post_id: &str, verdict: feedback::Verdict) {
+        feedback::record(
+            log,
+            feedback::FeedbackRecord {
+                pick_id: post_id.into(),
+                category: "Rust".into(),
+                verdict,
+                tags: Vec::new(),
+            },
+            feedback::ThresholdPolicy::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ranker_inactive_logs_once_and_keeps_order() {
+        let _env = crate::test_support::lock_env();
+        let rows = rank_rows();
+        let live: Vec<String> = rows.iter().map(|b| b.post_id.clone()).collect();
+        let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+        let merged = merged_of(rows.clone(), &live_refs);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        // No votes at all: inactive no matter the env minimum.
+        let res = run_local_full(
+            &merged,
+            &log_path,
+            "2026-10-27",
+            None,
+            None,
+            true,
+            None,
+            7_777,
+        )
+        .unwrap();
+        let entries = DecisionLog::open(&log_path).unwrap().verify().unwrap();
+        let inactive: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == crate::ranker::INACTIVE_KIND)
+            .collect();
+        assert_eq!(inactive.len(), 1, "ranker.inactive exactly once");
+        assert_eq!(inactive[0].payload["labeled"], 0);
+        assert!(inactive[0].payload.get("min_records").is_some());
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.kind == crate::ranker::APPLIED_KIND),
+            "no ranker.applied when inactive"
+        );
+        // Order is today's order: select_candidates output unchanged.
+        let live_set: BTreeSet<String> = live.into_iter().collect();
+        let plain = select_candidates(&rows, &live_set);
+        let got: Vec<&str> = res.candidates.iter().map(|c| c.post_id.as_str()).collect();
+        let want: Vec<&str> = plain.iter().map(|c| c.post_id.as_str()).collect();
+        assert_eq!(got, want);
+        assert!(got[0].starts_with("drop-"), "baseline is newest first");
+    }
+
+    #[test]
+    fn ranker_applied_logs_counts_only_and_reorders_within_topic() {
+        let _env = crate::test_support::lock_env();
+        let rows = rank_rows();
+        let live: Vec<String> = rows.iter().map(|b| b.post_id.clone()).collect();
+        let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+        let merged = merged_of(rows, &live_refs);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        // Approve keep-* (older), skip drop-* (newer): the ranker must pull
+        // keep-* ahead within the shared topic.
+        let mut log = DecisionLog::open(&log_path).unwrap();
+        let min = crate::ranker::min_records_from_env().max(1);
+        for i in 0..min {
+            let id = if i % 2 == 0 {
+                format!("keep-{}", (i / 2) % 6)
+            } else {
+                format!("drop-{}", (i / 2) % 6)
+            };
+            let verdict = if i % 2 == 0 {
+                feedback::Verdict::Approve
+            } else {
+                feedback::Verdict::Skip
+            };
+            seed_vote(&mut log, &id, verdict);
+        }
+        drop(log);
+        let res = run_local_full(
+            &merged,
+            &log_path,
+            "2026-10-27",
+            None,
+            None,
+            true,
+            None,
+            7_777,
+        )
+        .unwrap();
+        let entries = DecisionLog::open(&log_path).unwrap().verify().unwrap();
+        let applied: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == crate::ranker::APPLIED_KIND)
+            .collect();
+        assert_eq!(applied.len(), 1, "ranker.applied exactly once");
+        let payload = &applied[0].payload;
+        assert_eq!(payload["labeled"], min as u64);
+        assert_eq!(payload["candidates"], res.candidates.len() as u64);
+        assert!(payload.get("reordered").and_then(|v| v.as_u64()).is_some());
+        assert_eq!(
+            payload.as_object().unwrap().len(),
+            3,
+            "counts only: {payload}"
+        );
+        let raw = payload.to_string();
+        for leak in [
+            "keepable",
+            "droppable",
+            "keep-",
+            "drop-",
+            "syn_keep",
+            "Rust",
+        ] {
+            assert!(!raw.contains(leak), "payload leaks {leak}: {raw}");
+        }
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.kind == crate::ranker::INACTIVE_KIND),
+            "no ranker.inactive when applied"
+        );
+        // Votes moved the older keep-* posts ahead of drop-*.
+        let first = &res.candidates[0].post_id;
+        assert!(first.starts_with("keep-"), "first candidate: {first}");
+        assert!(
+            res.picks.iter().any(|p| p.post_id.starts_with("keep-")),
+            "picks: {:?}",
+            res.picks.iter().map(|p| &p.post_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hidden_posts_never_resurface_via_ranking() {
+        let _env = crate::test_support::lock_env();
+        let rows = rank_rows();
+        let live: Vec<String> = rows.iter().map(|b| b.post_id.clone()).collect();
+        let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+        let merged = merged_of(rows, &live_refs);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&log_path).unwrap();
+        // Active ranker that loves keep-* posts...
+        let min = crate::ranker::min_records_from_env().max(1);
+        for i in 0..min {
+            seed_vote(
+                &mut log,
+                &format!("keep-{}", i % 6),
+                feedback::Verdict::Approve,
+            );
+        }
+        // ...but keep-0 is hidden by never_post and the whole syn_drop
+        // author line is hidden too.
+        seed_vote(&mut log, "keep-0", feedback::Verdict::NeverPost);
+        feedback::record(
+            &mut log,
+            feedback::FeedbackRecord {
+                pick_id: "syn_drop".into(),
+                category: "Rust".into(),
+                verdict: feedback::Verdict::NeverAuthor,
+                tags: Vec::new(),
+            },
+            feedback::ThresholdPolicy::default(),
+        )
+        .unwrap();
+        drop(log);
+        let res = run_local_full(
+            &merged,
+            &log_path,
+            "2026-10-27",
+            None,
+            None,
+            true,
+            None,
+            7_777,
+        )
+        .unwrap();
+        for gone in ["keep-0", "drop-0", "drop-5"] {
+            assert!(
+                !res.candidates.iter().any(|c| c.post_id == gone),
+                "candidate {gone}"
+            );
+            assert!(!res.picks.iter().any(|p| p.post_id == gone), "pick {gone}");
+            assert!(!res.markdown.contains(gone), "markdown mentions {gone}");
+        }
+        // keep-1..5 still surface: the hide is surgical, not a topic ban.
+        assert!(res.candidates.iter().any(|c| c.post_id == "keep-1"));
     }
 }

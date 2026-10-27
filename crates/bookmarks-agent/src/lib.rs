@@ -15,6 +15,7 @@ pub mod liveness;
 pub mod media;
 pub mod merge;
 pub mod oauth;
+pub mod ranker;
 pub mod sanitize;
 #[cfg(test)]
 pub(crate) mod test_support;
