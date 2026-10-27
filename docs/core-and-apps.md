@@ -18,6 +18,7 @@ flowchart BT
     agent[bookmarks-agent<br/>first app: X bookmarks curator + CLI]
     web[web-ui<br/>loopback view]
     muse[muse-runs<br/>second app: gated Muse Code runs + CLI]
+    wonder[wonder<br/>third app: gated Muse Wonder questions + CLI]
   end
   subgraph TOOLS[tools]
     demo[demo-runner<br/>offline demo]
@@ -30,6 +31,8 @@ flowchart BT
   web --> agent
   web --> eval
   muse --> core
+  wonder --> core
+  wonder --> router
   demo --> core
   demo --> router
   demo --> agent
@@ -39,13 +42,20 @@ flowchart BT
   eval --> agent
 ```
 
-## Two apps on one core
+## Apps on one core
 
 `bookmarks-agent` and `muse-runs` share the same gate, approvals and decision
 log without either depending on the other. `muse-runs` depends on
 `ancientos-core` only and registers one action, `muse.run`, in its own gate
 (anything else is denied). Its pending runs show on web-ui's `/approvals`
 page with no web-ui code specific to it.
+
+`wonder` is the third app: it depends on `ancientos-core` and
+`ancientos-router` only, registers one action, `wonder.ask`, and asks Muse
+Wonder (the router's creative route, sanitized text only) one approved
+question exactly once, behind `ANCIENTOS_ALLOW_PAID=1` and `WONDER_MODEL`.
+Its questions show on `/approvals` and the phone page `/m` with no web-ui
+code specific to it.
 
 ```mermaid
 sequenceDiagram

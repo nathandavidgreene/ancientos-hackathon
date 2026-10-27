@@ -1,0 +1,22 @@
+[package]
+name = "wonder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "wonder"
+path = "src/main.rs"
+
+[dependencies]
+ancientos-core = { path = "../core" }
+ancientos-router = { path = "../router" }
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

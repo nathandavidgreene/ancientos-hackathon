@@ -64,6 +64,7 @@ nav:
       - bookmarks-agent: reference/bookmarks-agent.md
       - web-ui: reference/web-ui.md
       - muse-runs: reference/muse-runs.md
+      - wonder: reference/wonder.md
       - demo-runner: reference/demo-runner.md
       - ancientos-eval: reference/ancientos-eval.md
       - Python build tools: reference/python-tools.md
