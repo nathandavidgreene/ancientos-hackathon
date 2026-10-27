@@ -50,7 +50,8 @@ impl Setup {
             .env_remove("DAEMON_DIGEST_SECS")
             .env_remove("DAEMON_TRY_FOLLOWUP_SECS")
             .env_remove("DAEMON_DEEPER_QUEUE_SECS")
-            .env_remove("DAEMON_SWEEP_SECS");
+            .env_remove("DAEMON_SWEEP_SECS")
+            .env_remove("DAEMON_WIKI_LINT_SECS");
         if paid {
             cmd.env("ANCIENTOS_ALLOW_PAID", "1");
         } else {
@@ -110,7 +111,7 @@ fn once_with_now_is_deterministic() {
             .iter()
             .filter(|k| k.as_str() == "daemon.tick")
             .count(),
-        5
+        6
     );
 }
 
@@ -118,7 +119,7 @@ fn once_with_now_is_deterministic() {
 fn once_fails_closed_when_brief_has_no_bookmarks() {
     let s = Setup::new();
     // No --offline fixture and an empty home: the brief agent errors, the
-    // other four still run, and the exit is non-zero.
+    // other five still run, and the exit is non-zero.
     let out = s.run(&["run", "--once", "--now", "2026-10-27T00:00:00Z"], false);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("brief"), "{}", stderr(&out));
@@ -127,7 +128,7 @@ fn once_fails_closed_when_brief_has_no_bookmarks() {
         .into_iter()
         .filter(|k| k == "daemon.tick")
         .count();
-    assert_eq!(ticks, 5, "every agent still ticks and logs");
+    assert_eq!(ticks, 6, "every agent still ticks and logs");
     assert!(
         s.log_text().contains("\"agent\":\"brief\"") && s.log_text().contains("\"ok\":false"),
         "{}",

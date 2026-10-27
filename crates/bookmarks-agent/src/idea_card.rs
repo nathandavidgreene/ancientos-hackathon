@@ -171,6 +171,15 @@ const MODULES: &[(&str, &[&str])] = &[
     ("delegate", &["agent", "delegate", "hand"]),
 ];
 
+/// Plain module names the keyword mapper can produce (plus `unmapped`).
+/// Shared with the wiki so lint's missing-concept check never drifts from
+/// the mapper.
+pub fn known_modules() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = MODULES.iter().map(|(m, _)| *m).collect();
+    out.push("unmapped");
+    out
+}
+
 pub fn idea_cards_path() -> Result<PathBuf, String> {
     Ok(crate::token_store::data_dir()
         .map_err(|e| e.to_string())?

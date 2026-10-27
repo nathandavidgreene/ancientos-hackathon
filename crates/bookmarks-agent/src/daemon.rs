@@ -1,4 +1,4 @@
-//! Agent scheduler daemon: five small agents ticking on a schedule.
+//! Agent scheduler daemon: six small agents ticking on a schedule.
 //!
 //! [`DaemonConfig::build_scheduler`] builds a [`Scheduler`] with one
 //! [`Agent`] impl per job; `bookmarks-agent run` ticks it once (`--once`)
@@ -49,16 +49,19 @@ pub const DIGEST_SECS_ENV: &str = "DAEMON_DIGEST_SECS";
 pub const TRY_FOLLOWUP_SECS_ENV: &str = "DAEMON_TRY_FOLLOWUP_SECS";
 pub const DEEPER_QUEUE_SECS_ENV: &str = "DAEMON_DEEPER_QUEUE_SECS";
 pub const SWEEP_SECS_ENV: &str = "DAEMON_SWEEP_SECS";
+pub const WIKI_LINT_SECS_ENV: &str = "DAEMON_WIKI_LINT_SECS";
 pub const TICK_SLEEP_SECS_ENV: &str = "DAEMON_TICK_SLEEP_SECS";
 pub const MAX_TICKS_ENV: &str = "DAEMON_MAX_TICKS";
 
-/// Sane defaults: brief and try-followup daily, digest weekly, queued
-/// go-deeper jobs every 15 minutes, expiry sweep hourly, 60s between ticks.
+/// Sane defaults: brief and try-followup daily, digest and wiki lint
+/// weekly, queued go-deeper jobs every 15 minutes, expiry sweep hourly, 60s
+/// between ticks.
 pub const DEFAULT_BRIEF_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_DIGEST_SECS: u64 = 7 * 24 * 60 * 60;
 pub const DEFAULT_TRY_FOLLOWUP_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_DEEPER_QUEUE_SECS: u64 = 15 * 60;
 pub const DEFAULT_SWEEP_SECS: u64 = 60 * 60;
+pub const DEFAULT_WIKI_LINT_SECS: u64 = 7 * 24 * 60 * 60;
 pub const DEFAULT_TICK_SLEEP_SECS: u64 = 60;
 
 /// Explicit file paths shared by every agent. Production fills these from
@@ -92,6 +95,7 @@ pub struct DaemonConfig {
     pub try_followup_secs: u64,
     pub deeper_queue_secs: u64,
     pub sweep_secs: u64,
+    pub wiki_lint_secs: u64,
     pub tick_sleep_secs: u64,
     /// Loop bound for tests (`None` loops until stopped).
     pub max_ticks: Option<u64>,
@@ -113,6 +117,7 @@ impl Default for DaemonConfig {
             try_followup_secs: DEFAULT_TRY_FOLLOWUP_SECS,
             deeper_queue_secs: DEFAULT_DEEPER_QUEUE_SECS,
             sweep_secs: DEFAULT_SWEEP_SECS,
+            wiki_lint_secs: DEFAULT_WIKI_LINT_SECS,
             tick_sleep_secs: DEFAULT_TICK_SLEEP_SECS,
             max_ticks: None,
         }
@@ -140,6 +145,7 @@ impl DaemonConfig {
             try_followup_secs: secs_from_env(TRY_FOLLOWUP_SECS_ENV, DEFAULT_TRY_FOLLOWUP_SECS)?,
             deeper_queue_secs: secs_from_env(DEEPER_QUEUE_SECS_ENV, DEFAULT_DEEPER_QUEUE_SECS)?,
             sweep_secs: secs_from_env(SWEEP_SECS_ENV, DEFAULT_SWEEP_SECS)?,
+            wiki_lint_secs: secs_from_env(WIKI_LINT_SECS_ENV, DEFAULT_WIKI_LINT_SECS)?,
             tick_sleep_secs: secs_from_env(TICK_SLEEP_SECS_ENV, DEFAULT_TICK_SLEEP_SECS)?,
             max_ticks: match std::env::var(MAX_TICKS_ENV).ok().filter(|v| !v.is_empty()) {
                 None => None,
@@ -155,9 +161,9 @@ impl DaemonConfig {
         self.ctx.now_secs()
     }
 
-    /// Build the scheduler with the five daemon agents. Order is fixed
-    /// (brief, digest, try_followup, deeper_queue, approvals_sweep) so
-    /// `--once` logs read deterministically.
+    /// Build the scheduler with the six daemon agents. Order is fixed
+    /// (brief, digest, try_followup, deeper_queue, approvals_sweep,
+    /// wiki_lint) so `--once` logs read deterministically.
     pub fn build_scheduler(&self) -> Scheduler {
         let mut s = Scheduler::new();
         s.add(Box::new(BriefAgent::new(
@@ -179,6 +185,10 @@ impl DaemonConfig {
         s.add(Box::new(ApprovalsSweepAgent::new(
             self.ctx.clone(),
             Duration::from_secs(self.sweep_secs),
+        )));
+        s.add(Box::new(WikiLintAgent::new(
+            self.ctx.clone(),
+            Duration::from_secs(self.wiki_lint_secs),
         )));
         s
     }
@@ -301,6 +311,14 @@ pub fn try_followup_tick(ctx: &AgentCtx, now: u64) -> Result<Vec<String>, String
 pub fn approvals_sweep_tick(ctx: &AgentCtx, now: u64) -> Result<usize, String> {
     let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
     approvals::sweep_expired(&mut log, now).map_err(|e| e.to_string())
+}
+
+/// Weekly wiki lint: [`crate::wiki::lint_and_propose`] against the wiki dir
+/// alongside the decision log. Findings become `wiki.edit` approvals; pages
+/// are never modified.
+pub fn wiki_lint_tick(ctx: &AgentCtx, now: u64) -> Result<crate::wiki::LintReport, String> {
+    let wiki = crate::wiki::wiki_dir_for_log(&ctx.log_path);
+    crate::wiki::lint_and_propose(&wiki, &ctx.log_path, now)
 }
 
 /// Outcome of one deeper-queue tick: post ids per path taken.
@@ -737,6 +755,39 @@ impl Agent for ApprovalsSweepAgent {
     }
 }
 
+/// Weekly wiki-lint agent (see [`wiki_lint_tick`]).
+pub struct WikiLintAgent {
+    ctx: AgentCtx,
+    interval: Duration,
+}
+
+impl WikiLintAgent {
+    pub fn new(ctx: AgentCtx, interval: Duration) -> Self {
+        Self { ctx, interval }
+    }
+}
+
+impl Agent for WikiLintAgent {
+    fn name(&self) -> &str {
+        "wiki_lint"
+    }
+
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    fn tick(&mut self) -> Result<(), String> {
+        let now = self.ctx.now_secs();
+        let report = wiki_lint_tick(&self.ctx, now)?;
+        println!(
+            "wiki_lint: {} findings, {} approvals",
+            report.findings.len(),
+            report.approvals.len()
+        );
+        Ok(())
+    }
+}
+
 /// Agent names in scheduler order.
 pub const AGENT_NAMES: &[&str] = &[
     "brief",
@@ -744,6 +795,7 @@ pub const AGENT_NAMES: &[&str] = &[
     "try_followup",
     "deeper_queue",
     "approvals_sweep",
+    "wiki_lint",
 ];
 
 /// Append one [`DAEMON_TICK_KIND`] entry: agent name, ok/error and the wall
@@ -915,6 +967,7 @@ mod tests {
             TRY_FOLLOWUP_SECS_ENV,
             DEEPER_QUEUE_SECS_ENV,
             SWEEP_SECS_ENV,
+            WIKI_LINT_SECS_ENV,
             TICK_SLEEP_SECS_ENV,
             MAX_TICKS_ENV,
         ] {
@@ -927,6 +980,7 @@ mod tests {
         assert_eq!(cfg.try_followup_secs, DEFAULT_TRY_FOLLOWUP_SECS);
         assert_eq!(cfg.deeper_queue_secs, DEFAULT_DEEPER_QUEUE_SECS);
         assert_eq!(cfg.sweep_secs, DEFAULT_SWEEP_SECS);
+        assert_eq!(cfg.wiki_lint_secs, DEFAULT_WIKI_LINT_SECS);
         assert_eq!(cfg.tick_sleep_secs, DEFAULT_TICK_SLEEP_SECS);
         assert_eq!(cfg.max_ticks, None);
         std::env::set_var(BRIEF_SECS_ENV, "7");
@@ -955,7 +1009,7 @@ mod tests {
         assert!(sched.run_due(t).is_empty());
         // Past every interval: all due again.
         let later = t + Duration::from_secs(DEFAULT_DIGEST_SECS + 1);
-        assert_eq!(sched.run_due(later).len(), 5);
+        assert_eq!(sched.run_due(later).len(), 6);
     }
 
     #[test]
@@ -975,7 +1029,7 @@ mod tests {
                 .iter()
                 .filter(|k| k.as_str() == DAEMON_TICK_KIND)
                 .count(),
-            5
+            6
         );
     }
 
@@ -992,7 +1046,7 @@ mod tests {
         };
         let report = run_once(&config);
         assert!(!report.ok());
-        assert_eq!(report.outcomes.len(), 5);
+        assert_eq!(report.outcomes.len(), 6);
         for o in &report.outcomes {
             assert!(o.tick_logged.is_ok(), "{}: {:?}", o.agent, o.tick_logged);
             if o.agent == "brief" {
@@ -1005,7 +1059,7 @@ mod tests {
             .into_iter()
             .filter(|e| e.kind == DAEMON_TICK_KIND)
             .collect();
-        assert_eq!(ticks.len(), 5);
+        assert_eq!(ticks.len(), 6);
         let brief = ticks
             .iter()
             .find(|e| e.payload["agent"] == "brief")
@@ -1394,11 +1448,52 @@ mod tests {
         let stop = AtomicBool::new(false);
         let reports = run_loop(&config, &stop);
         assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].outcomes.len(), 5);
+        assert_eq!(reports[0].outcomes.len(), 6);
         // Second tick runs nothing: no interval elapsed.
         assert!(reports[1].outcomes.is_empty());
         let stop = AtomicBool::new(true);
         assert!(run_loop(&config, &stop).is_empty());
+    }
+
+    #[test]
+    fn wiki_lint_tick_proposes_without_editing() {
+        let _env = crate::test_support::EnvHold::paid_off();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir, true);
+        let wiki = crate::wiki::wiki_dir_for_log(&ctx.log_path);
+        crate::wiki::write_raw(
+            &wiki,
+            "p1",
+            "https://x.com/i/status/p1",
+            ancientos_router::data_class::DataClass::Public,
+            "2026-10-27",
+            "synthetic source",
+            &[],
+            None,
+        )
+        .unwrap();
+        let pages = wiki.join(crate::wiki::PAGES_DIR_NAME);
+        std::fs::create_dir_all(&pages).unwrap();
+        std::fs::write(
+            pages.join("lonely.md"),
+            "# Lonely\nslug: lonely\nsources: p1\nclass: public\nsummary: Alone.\n\n## claims\n- Alone claim. [sources: p1]\n\n## links\nnone\n",
+        )
+        .unwrap();
+        let before = std::fs::read(pages.join("lonely.md")).unwrap();
+        let report = wiki_lint_tick(&ctx, NOW).unwrap();
+        assert!(!report.findings.is_empty());
+        assert_eq!(report.findings.len(), report.approvals.len());
+        assert_eq!(
+            std::fs::read(pages.join("lonely.md")).unwrap(),
+            before,
+            "lint never edits pages"
+        );
+        assert!(
+            entries_of(&ctx.log_path)
+                .iter()
+                .any(|e| e.kind == crate::wiki::WIKI_LINT_KIND),
+            "lint run is logged"
+        );
     }
 
     #[test]

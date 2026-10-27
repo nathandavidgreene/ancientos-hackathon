@@ -23,4 +23,5 @@ pub mod translate;
 pub mod try_it;
 pub mod unroll;
 pub mod vote;
+pub mod wiki;
 pub mod x_api;

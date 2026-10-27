@@ -9,7 +9,9 @@
 //! | `digest [--now SECS] [--dry-run]`
 //! | `approvals` | `approve <id> [--now <rfc3339>]`
 //! | `deny <id> [reason] [--now <rfc3339>]`
-//! | `run [--once] [--now <rfc3339>] [--offline <fixture>]`.
+//! | `run [--once] [--now <rfc3339>] [--offline <fixture>]`
+//! | `wiki ingest <post_id>|--delegated` | `wiki query "<question>" [--file-back]`
+//! | `wiki lint` | `wiki show <slug>`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
@@ -35,14 +37,21 @@
 //! `run`
 //! ticks the scheduled agents (`--once` runs every due agent once, exit
 //! non-zero on any agent error; otherwise loops until Ctrl-C).
+//! `wiki` compounds research bookmarks and idea cards into a cited wiki:
+//! `ingest` writes an immutable raw source then updates pages (paid path
+//! needs `ANCIENTOS_ALLOW_PAID=1` and Public sources; otherwise the local
+//! model or the deterministic fallback compiles), `query` answers with
+//! citations (`--file-back` files the answer as a new page), `lint`
+//! proposes hygiene fixes as `wiki.edit` approvals (never applied), and
+//! `show` prints one page.
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
     author_filter, brief, callback, daemon, deeper, delegate, digest, fixture, idea_card, ingest,
-    merge, oauth, token_store, try_it, vote, x_api,
+    merge, oauth, token_store, try_it, vote, wiki, x_api,
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> [--now <rfc3339>] | deny <id> [reason] [--now <rfc3339>] | run [--once] [--now <rfc3339>] [--offline <fixture>]";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> [--now <rfc3339>] | deny <id> [reason] [--now <rfc3339>] | run [--once] [--now <rfc3339>] [--offline <fixture>] | wiki ingest <post_id> | wiki ingest --delegated | wiki query \"<question>\" [--file-back] | wiki lint | wiki show <slug>";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -565,6 +574,24 @@ fn cmd_triage(args: &[String]) -> Result<(), String> {
         decision,
         idea_card::now_secs(),
     )?;
+    // An adopt queues a wiki ingest (logged); the adoption itself already
+    // landed, so a queue failure is reported honestly as both.
+    if decision == idea_card::Triage::Adopt {
+        let post_id = wiki::post_id_from_url(&card.source_url).unwrap_or_else(|| card.id.clone());
+        let log_path = brief::decision_log_path()?;
+        if let Err(e) = wiki::queue_ingest(
+            &log_path,
+            wiki::QUEUE_REASON_ADOPT,
+            &card.id,
+            &post_id,
+            idea_card::now_secs(),
+        ) {
+            return Err(format!(
+                "adopted {} but failed to queue wiki ingest: {e}",
+                card.id
+            ));
+        }
+    }
     println!("{}", status_str(card.status));
     Ok(())
 }
@@ -938,6 +965,90 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn cmd_wiki_ingest(args: &[String]) -> Result<(), String> {
+    if args.len() == 1 && args[0] == "--delegated" {
+        let reports = wiki::ingest_delegated()?;
+        for report in &reports {
+            println!(
+                "{}: {} pages via {} ({})",
+                report.raw.id,
+                report.pages.len(),
+                report.mode,
+                report.pages.join(", ")
+            );
+        }
+        return Ok(());
+    }
+    if args.len() == 1 && !args[0].is_empty() && !args[0].starts_with("--") {
+        let report = wiki::ingest_post(&args[0])?;
+        println!(
+            "{}: {} pages via {} ({})",
+            report.raw.id,
+            report.pages.len(),
+            report.mode,
+            report.pages.join(", ")
+        );
+        if !report.rejected.is_empty() {
+            for reason in &report.rejected {
+                println!("note: {reason}");
+            }
+        }
+        return Ok(());
+    }
+    Err(USAGE.to_string())
+}
+
+fn cmd_wiki_query(args: &[String]) -> Result<(), String> {
+    let (question, file_back) = match args {
+        [q] if !q.trim().is_empty() => (q.as_str(), false),
+        [q, flag] if !q.trim().is_empty() && flag == "--file-back" => (q.as_str(), true),
+        _ => return Err(USAGE.to_string()),
+    };
+    let log_path = brief::decision_log_path()?;
+    let wiki_dir = wiki::wiki_dir()?;
+    if file_back {
+        let answer = wiki::query_file_back(question, &wiki_dir, &log_path, idea_card::now_secs())?;
+        print!("{}", answer.text);
+        if let Some(slug) = answer.filed {
+            println!("filed as [[{slug}]]");
+        }
+    } else {
+        let answer = wiki::query(question, &wiki_dir)?;
+        print!("{}", answer.text);
+    }
+    Ok(())
+}
+
+fn cmd_wiki_lint(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    let wiki_dir = wiki::wiki_dir()?;
+    let report = wiki::lint_and_propose(&wiki_dir, &log_path, idea_card::now_secs())?;
+    print!("{}", wiki::render_lint_report(&report));
+    Ok(())
+}
+
+fn cmd_wiki_show(args: &[String]) -> Result<(), String> {
+    if args.len() != 1 || args[0].is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let wiki_dir = wiki::wiki_dir()?;
+    print!("{}", wiki::read_page(&wiki_dir, &args[0])?);
+    Ok(())
+}
+
+fn cmd_wiki(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("ingest") => cmd_wiki_ingest(&args[1..]),
+        Some("query") => cmd_wiki_query(&args[1..]),
+        Some("lint") => cmd_wiki_lint(&args[1..]),
+        Some("show") => cmd_wiki_show(&args[1..]),
+        _ => Err(USAGE.to_string()),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -961,6 +1072,7 @@ fn main() {
         Some("approve") => cmd_approve(&args[1..]),
         Some("deny") => cmd_deny(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
+        Some("wiki") => cmd_wiki(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {

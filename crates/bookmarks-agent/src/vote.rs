@@ -106,6 +106,14 @@ pub fn run_vote(
             serde_json::json!({"post_id": post_id, "category": category}),
         )
         .map_err(|e| e.to_string())?;
+        // A delegate verdict also queues a wiki ingest (logged, same handle).
+        crate::wiki::append_queued(
+            &mut log,
+            crate::wiki::QUEUE_REASON_DELEGATE,
+            post_id,
+            post_id,
+            crate::idea_card::now_secs(),
+        )?;
     }
     Ok(VoteResult {
         post_id: post_id.to_string(),
@@ -211,12 +219,19 @@ mod tests {
         assert!(res.queued_delegate);
         let log = DecisionLog::open(&log_path).unwrap();
         let entries = log.verify().unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].kind, "feedback");
         assert_eq!(entries[0].payload["verdict"], "delegate");
         assert_eq!(entries[1].kind, DELEGATE_QUEUED_KIND);
         assert_eq!(entries[1].payload["post_id"], "p1");
         assert_eq!(entries[1].payload["category"], "Rust");
+        // A delegate verdict also queues a wiki ingest (logged).
+        assert_eq!(entries[2].kind, crate::wiki::WIKI_QUEUED_KIND);
+        assert_eq!(entries[2].payload["post_id"], "p1");
+        assert_eq!(
+            entries[2].payload["reason"],
+            crate::wiki::QUEUE_REASON_DELEGATE
+        );
     }
 
     #[test]

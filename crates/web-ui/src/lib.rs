@@ -183,6 +183,12 @@ impl State {
             .join(bookmarks_agent::liveness::CACHE_FILE_NAME)
     }
 
+    /// Wiki root: `wiki/` in this data dir (read-only for the web UI;
+    /// ingest and lint run in the CLI or daemon).
+    pub fn wiki_dir(&self) -> PathBuf {
+        self.data_dir.join(bookmarks_agent::wiki::WIKI_DIR_NAME)
+    }
+
     /// Translation cache path: `$TRANSLATIONS_CACHE_PATH` when set, else
     /// `translations.json` in this data dir. Pages read it only; the brief
     /// writes it. Request handling never live-translates (no network).
@@ -337,7 +343,8 @@ fn layout(title: &str, body: &str, state: &State) -> String {
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{}</title><style>{CSS}</style></head><body>\
          <nav><a href=\"/\">Brief</a><a href=\"/ideas\">Ideas</a>\
-         <a href=\"/try\">Try it</a><a href=\"/hidden-authors\">Hidden</a>\
+         <a href=\"/try\">Try it</a><a href=\"/wiki\">Wiki</a>\
+         <a href=\"/hidden-authors\">Hidden</a>\
          <a href=\"/approvals\">Approvals ({})</a>\
          <a href=\"/log\">Log</a></nav><hr>{body}</body></html>",
         escape(title),
@@ -746,7 +753,31 @@ fn do_triage(state: &State, body: &[u8]) -> Response {
         decision,
         now,
     ) {
-        Ok(_) => Response::redirect("/ideas".to_string()),
+        Ok(card) => {
+            // An adopt queues a wiki ingest (logged); the adoption itself
+            // already landed, so a queue failure is reported honestly.
+            if decision == Triage::Adopt {
+                let post_id = bookmarks_agent::wiki::post_id_from_url(&card.source_url)
+                    .unwrap_or_else(|| card.id.clone());
+                if let Err(e) = bookmarks_agent::wiki::queue_ingest(
+                    &state.log_path(),
+                    bookmarks_agent::wiki::QUEUE_REASON_ADOPT,
+                    &card.id,
+                    &post_id,
+                    now,
+                ) {
+                    return Response::status(
+                        500,
+                        error_page(
+                            "Triage queued poorly",
+                            &format!("Adopted but failed to queue wiki ingest: {e}"),
+                            state,
+                        ),
+                    );
+                }
+            }
+            Response::redirect("/ideas".to_string())
+        }
         Err(e) if e.starts_with("no idea card") => {
             Response::status(400, error_page("Bad triage", &e, state))
         }
@@ -1029,6 +1060,127 @@ fn page_deeper(state: &State, post_id: &str) -> Response {
     Response::ok(layout(&format!("Go deeper — {post_id}"), &body, state))
 }
 
+/// Minimal wiki markdown renderer: `#`/`##`/`###` headings, `- ` bullets,
+/// paragraphs. Every line is HTML-escaped, then `[[slug]]` targets become
+/// links to `/wiki/<slug>` (invalid slugs stay plain text), so output is
+/// safe by construction.
+fn wiki_markdown_html(md: &str) -> String {
+    fn linkify(escaped: &str) -> String {
+        let mut out = String::new();
+        let mut rest = escaped;
+        while let Some(start) = rest.find("[[") {
+            out.push_str(&rest[..start]);
+            rest = &rest[start + 2..];
+            match rest.find("]]") {
+                Some(end) => {
+                    let target = rest[..end].trim();
+                    if bookmarks_agent::wiki::valid_slug(target) {
+                        out.push_str(&format!(
+                            "<a href=\"/wiki/{}\">[[{}]]</a>",
+                            escape(target),
+                            escape(target)
+                        ));
+                    } else {
+                        out.push_str("[[");
+                        out.push_str(&rest[..end]);
+                        out.push_str("]]");
+                    }
+                    rest = &rest[end + 2..];
+                }
+                None => {
+                    out.push_str("[[");
+                    out.push_str(rest);
+                    rest = "";
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+    let mut out = String::new();
+    let mut in_list = false;
+    let close_list = |out: &mut String, in_list: &mut bool| {
+        if *in_list {
+            out.push_str("</ul>");
+            *in_list = false;
+        }
+    };
+    for raw in md.lines() {
+        let line = raw.trim_end();
+        if line.trim().is_empty() {
+            close_list(&mut out, &mut in_list);
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("### ") {
+            close_list(&mut out, &mut in_list);
+            out.push_str(&format!("<h3>{}</h3>", linkify(&escape(body))));
+        } else if let Some(body) = line.strip_prefix("## ") {
+            close_list(&mut out, &mut in_list);
+            out.push_str(&format!("<h2>{}</h2>", linkify(&escape(body))));
+        } else if let Some(body) = line.strip_prefix("# ") {
+            close_list(&mut out, &mut in_list);
+            out.push_str(&format!("<h1>{}</h1>", linkify(&escape(body))));
+        } else if let Some(body) = line.strip_prefix("- ") {
+            if !in_list {
+                out.push_str("<ul>");
+                in_list = true;
+            }
+            out.push_str(&format!("<li>{}</li>", linkify(&escape(body))));
+        } else {
+            close_list(&mut out, &mut in_list);
+            out.push_str(&format!("<p>{}</p>", linkify(&escape(line))));
+        }
+    }
+    close_list(&mut out, &mut in_list);
+    out
+}
+
+/// `/wiki`: the page catalog (one link per page plus its summary), or an
+/// empty-state message when nothing has been ingested yet.
+fn page_wiki_index(state: &State) -> Response {
+    let pages = bookmarks_agent::wiki::list_pages(&state.wiki_dir());
+    let mut body = String::from("<h1>Wiki</h1>");
+    if pages.is_empty() {
+        body.push_str("<p>No wiki pages yet — ingest a post first.</p>");
+        return Response::ok(layout("Wiki", &body, state));
+    }
+    body.push_str("<ul>");
+    for p in &pages {
+        body.push_str(&format!(
+            "<li><a href=\"/wiki/{}\">[[{}]]</a> — {} (sources: {})</li>",
+            escape(&p.slug),
+            escape(&p.slug),
+            escape(&p.summary),
+            p.sources.len()
+        ));
+    }
+    body.push_str("</ul>");
+    Response::ok(layout("Wiki", &body, state))
+}
+
+/// `/wiki/<slug>`: one page, escaped with `[[links]]` linkified. Unknown
+/// slugs and unsafe names fail closed.
+fn page_wiki_show(state: &State, slug: &str) -> Response {
+    if !bookmarks_agent::wiki::valid_slug(slug) {
+        return Response::status(400, error_page("Bad slug", "Invalid wiki slug.", state));
+    }
+    let md = match bookmarks_agent::wiki::read_page(&state.wiki_dir(), slug) {
+        Ok(md) => md,
+        Err(_) => {
+            return Response::status(
+                404,
+                error_page("Not found", "No wiki page for that slug.", state),
+            )
+        }
+    };
+    let mut body = format!(
+        "<p><a href=\"/wiki\">Back to wiki</a></p><h1>{}</h1>",
+        escape(slug)
+    );
+    body.push_str(&wiki_markdown_html(&md));
+    Response::ok(layout(&format!("Wiki — {slug}"), &body, state))
+}
+
 /// Parse the Later form's `at` value: an HTML `datetime-local`
 /// (`YYYY-MM-DDTHH:MM`, optional `:SS`, no zone, assumed UTC) or a full
 /// RFC 3339 timestamp. Past or unparseable values are refused.
@@ -1300,6 +1452,10 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("GET", "/approvals") => page_approvals(state),
         ("POST", "/approvals/approve") => decide_approval(state, &req.body, true),
         ("POST", "/approvals/deny") => decide_approval(state, &req.body, false),
+        ("GET", "/wiki") => page_wiki_index(state),
+        ("GET", path) if path.starts_with("/wiki/") => {
+            page_wiki_show(state, &path["/wiki/".len()..])
+        }
         ("GET", path) if path.starts_with("/deeper/") => {
             page_deeper(state, &path["/deeper/".len()..])
         }
@@ -1667,10 +1823,13 @@ mod tests {
         assert_eq!(resp.status, 303);
         assert_eq!(resp.location.as_deref(), Some("/?i=1"));
         let entries = log_entries(&state);
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].payload["verdict"], "delegate");
         assert_eq!(entries[1].kind, "delegate.queued");
         assert_eq!(entries[1].payload["post_id"], "p1");
+        // A delegate verdict also queues a wiki ingest (logged).
+        assert_eq!(entries[2].kind, bookmarks_agent::wiki::WIKI_QUEUED_KIND);
+        assert_eq!(entries[2].payload["post_id"], "p1");
     }
 
     #[test]
@@ -1931,6 +2090,123 @@ mod tests {
         assert!(handle(&Request::get("/ideas"), &state)
             .body
             .contains("No ideas due"));
+    }
+
+    #[test]
+    fn triage_adopt_queues_wiki_ingest() {
+        let (_dir, state) = test_state();
+        let out = "## Worth borrowing for AncientOS\n- Drag a card to approve\n";
+        let made = bookmarks_agent::idea_card::capture_from_delegate(
+            &state.cards_path(),
+            "https://example.invalid/a/status/p1",
+            out,
+            100,
+        )
+        .unwrap();
+        let resp = handle(
+            &Request::post(
+                "/ideas/triage",
+                &format!("id={}&decision=adopt", made[0].id),
+            ),
+            &state,
+        );
+        assert_eq!(resp.status, 303);
+        let entries = log_entries(&state);
+        let queued = entries
+            .iter()
+            .find(|e| e.kind == bookmarks_agent::wiki::WIKI_QUEUED_KIND)
+            .expect("wiki.queued entry");
+        assert_eq!(
+            queued.payload["reason"],
+            bookmarks_agent::wiki::QUEUE_REASON_ADOPT
+        );
+        assert_eq!(queued.payload["post_id"], "p1");
+    }
+
+    /// Seed one raw source plus one page (with HTML in the summary to prove
+    /// escaping) in the state's wiki dir.
+    fn seed_wiki_page(state: &State) {
+        use bookmarks_agent::wiki;
+        // Public class without naming the router crate (not a dependency).
+        let public = bookmarks_agent::translate::class_of("synthetic public text");
+        let dir = state.wiki_dir();
+        wiki::write_raw(
+            &dir,
+            "p1",
+            "https://example.invalid/a/status/p1",
+            public,
+            "2026-10-27",
+            "synthetic source about the approval gate",
+            &[],
+            None,
+        )
+        .unwrap();
+        let edits = vec![wiki::PageEdit {
+            slug: "gate".to_string(),
+            title: "Concept: gate".to_string(),
+            summary: "Notes on the gate <script>alert('x')</script>".to_string(),
+            claims: vec![wiki::ClaimEdit {
+                text: "The gate reviews cards.".to_string(),
+                sources: vec!["p1".to_string()],
+            }],
+            links: vec!["other".to_string()],
+        }];
+        let known = wiki::known_raw_ids(&dir);
+        let (valid, rejected) = wiki::validate_edits(&edits, &known);
+        assert!(rejected.is_empty());
+        wiki::apply_edits(&dir, &valid, public).unwrap();
+        wiki::sync_index(&dir).unwrap();
+    }
+
+    #[test]
+    fn wiki_index_lists_pages_and_escapes() {
+        let (_dir, state) = test_state();
+        // Empty wiki: honest empty state.
+        let resp = handle(&Request::get("/wiki"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("No wiki pages yet"), "{}", resp.body);
+        seed_wiki_page(&state);
+        let resp = handle(&Request::get("/wiki"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(
+            resp.body.contains("<a href=\"/wiki/gate\">[[gate]]</a>"),
+            "{}",
+            resp.body
+        );
+        assert!(resp.body.contains("(sources: 1)"), "{}", resp.body);
+        // The HTML in the summary is escaped, never raw.
+        assert!(!resp.body.contains("<script>"), "{}", resp.body);
+        assert!(resp.body.contains("&lt;script&gt;"), "{}", resp.body);
+        // The nav links to the wiki from every page.
+        assert!(
+            resp.body.contains("<a href=\"/wiki\">Wiki</a>"),
+            "{}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn wiki_show_renders_page_with_links_and_escapes() {
+        let (_dir, state) = test_state();
+        seed_wiki_page(&state);
+        let resp = handle(&Request::get("/wiki/gate"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(
+            resp.body.contains("The gate reviews cards."),
+            "{}",
+            resp.body
+        );
+        assert!(
+            resp.body.contains("<a href=\"/wiki/other\">[[other]]</a>"),
+            "{}",
+            resp.body
+        );
+        assert!(!resp.body.contains("<script>"), "{}", resp.body);
+        assert!(resp.body.contains("Back to wiki"), "{}", resp.body);
+        // Unknown slugs 404, unsafe names 400 (fail closed, no traversal).
+        assert_eq!(handle(&Request::get("/wiki/ghost"), &state).status, 404);
+        assert_eq!(handle(&Request::get("/wiki/..%2F.."), &state).status, 400);
+        assert_eq!(handle(&Request::get("/wiki/"), &state).status, 400);
     }
 
     #[test]

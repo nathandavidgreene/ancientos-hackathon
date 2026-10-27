@@ -52,6 +52,9 @@ pub const BRIEF_PAID_ACTION: &str = "brief.paid";
 /// Paid go-deeper walkthrough: proposed by the daemon, executed only after
 /// a human approval is claimed and released.
 pub const DEEPER_PAID_ACTION: &str = "deeper.paid";
+/// Wiki lint fix: proposed by `wiki lint` (or the weekly daemon lint), never
+/// auto-applied — a human approves each fix.
+pub const WIKI_EDIT_ACTION: &str = "wiki.edit";
 
 /// Canonical policy used by the approval queue: read-only agent work is
 /// low risk, X writes (which no agent performs without a human) and paid
@@ -69,6 +72,7 @@ pub fn default_gate() -> Gate {
         "x.dm.send",
         BRIEF_PAID_ACTION,
         DEEPER_PAID_ACTION,
+        WIKI_EDIT_ACTION,
     ] {
         g.register(action, Risk::High);
     }
@@ -121,6 +125,19 @@ mod tests {
         assert_eq!(g.evaluate(&p(DEEPER_PAID_ACTION)), Verdict::NeedsHuman);
         // Neighbouring names still fail closed.
         for action in ["brief.paid.extra", "deeper.paid2", "brief", "deeper"] {
+            assert!(
+                matches!(g.evaluate(&p(action)), Verdict::Deny { .. }),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_policy_needs_human_for_wiki_edits() {
+        let g = default_gate();
+        assert_eq!(g.evaluate(&p(WIKI_EDIT_ACTION)), Verdict::NeedsHuman);
+        // Neighbouring names still fail closed.
+        for action in ["wiki", "wiki.read", "wiki.edit.extra"] {
             assert!(
                 matches!(g.evaluate(&p(action)), Verdict::Deny { .. }),
                 "{action}"
