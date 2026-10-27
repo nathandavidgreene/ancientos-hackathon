@@ -17,6 +17,8 @@
 //! `/hidden-authors`) are filtered per request the same silent in-memory
 //! way, so a vote takes effect immediately without a restart.
 
+pub mod phone;
+
 use bookmarks_agent::fixture::Bookmark;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -111,6 +113,9 @@ pub struct State {
     /// Muse Code run-log path for the `/stats` "Built with Meta" section
     /// (defaults from env, overridable per state for tests).
     pub muse_log_path: PathBuf,
+    /// Shared secret for the phone approvals page (`/m`); `None` turns it
+    /// off (403, fail closed). See [`phone::token_from`].
+    pub phone_token: Option<String>,
 }
 
 /// `store.jsonl` (demo/tests) if present, else the real synced
@@ -156,6 +161,7 @@ impl State {
             bookmarks: bookmarks.clone(),
             all_bookmarks: bookmarks,
             muse_log_path: bookmarks_agent::stats::muse_log_path_from_env(),
+            phone_token: None,
         };
         let live = bookmarks_agent::liveness::filter_live(
             &state.bookmarks,
@@ -168,6 +174,7 @@ impl State {
             bookmarks: live,
             all_bookmarks: state.all_bookmarks,
             muse_log_path: state.muse_log_path,
+            phone_token: None,
         })
     }
 
@@ -1867,6 +1874,8 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("GET", "/approvals") => page_approvals(state),
         ("POST", "/approvals/approve") => decide_approval(state, &req.body, true),
         ("POST", "/approvals/deny") => decide_approval(state, &req.body, false),
+        ("GET", "/m") => phone::page_list(req, state),
+        ("POST", "/m/decide") => phone::do_decide(&req.body, state),
         ("GET", "/wiki") => page_wiki_index(state),
         ("GET", path) if path.starts_with("/wiki/") => {
             page_wiki_show(state, &path["/wiki/".len()..])

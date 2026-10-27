@@ -176,7 +176,16 @@ fn run(args: &[String]) -> Result<(), String> {
     } else {
         None
     };
-    let state = State::open_with_liveness(&dir, parsed.demo)?;
+    let mut state = State::open_with_liveness(&dir, parsed.demo)?;
+    state.phone_token = web_ui::phone::token_from(std::env::var(web_ui::phone::TOKEN_ENV).ok());
+    eprintln!(
+        "phone approvals (/m): {}",
+        if state.phone_token.is_some() {
+            "on"
+        } else {
+            "off (set ANCIENTOS_PHONE_TOKEN, 16+ chars)"
+        }
+    );
     let addr = loopback_addr(&parsed.host, parsed.port)?;
     let listener = TcpListener::bind(addr).map_err(|e| format!("bind {addr} failed: {e}"))?;
     println!(
