@@ -20,7 +20,14 @@
 //!
 //! Keys are read from env at call time and never stored on the client,
 //! logged, or printed. The HTTP request/response shape is shared by both
-//! backends in the single function [`post_chat_completions`].
+//! backends in the single function [`post_systemone`].
+//!
+//! VERIFIED 2026-10-26 against api.typesafe.ai (OpenAPI + one live call):
+//! Jev is NOT a chat API. `POST /v1/systemone` takes
+//! `{model, state, questions: {name: {type: noul|choice|score, instructions, criteria?}}}`
+//! and returns `{model, answers: {name: {type, noul|choice,...}}, usage: {input_tokens, output_tokens}}`.
+//! `/v1/chat/completions` returns 404. Use [`JevClient::ask`]; freeform
+//! [`JevClient::chat`] fails closed after the usual gates.
 use crate::{Destination, ModelClient, RouterError, Sensitivity};
 
 /// Backend selector: `auto` (default) | `typesafe` | `localjev`.
@@ -177,8 +184,8 @@ impl JevClient {
         self.allow_paid
     }
 
-    /// Full chat-completions endpoint for the configured base URL.
-    /// A base already ending in `/v1` appends only `/chat/completions`.
+    /// Full System One endpoint for the configured base URL.
+    /// A base already ending in `/v1` appends only `/systemone`.
     pub fn endpoint(&self) -> String {
         endpoint_for(&self.base_url)
     }
@@ -204,23 +211,75 @@ impl JevClient {
     /// Send one prompt. TypeSafe calls fail closed without the paid switch or
     /// the API key; the local backend needs neither. Prefer
     /// [`Self::complete_with_sensitivity`] when sensitivity is known.
-    pub fn chat(&self, prompt: &str) -> Result<String, RouterError> {
+    pub fn chat(&self, _prompt: &str) -> Result<String, RouterError> {
+        self.preflight()?;
+        Err(RouterError::Refused(
+            "Jev has no freeform chat endpoint; use JevClient::ask (POST /v1/systemone)".into(),
+        ))
+    }
+
+    /// Gates shared by every call: paid switch + key for TypeSafe; optional
+    /// key for local. Returns the Bearer key to send, if any.
+    fn preflight(&self) -> Result<Option<String>, RouterError> {
         match self.backend {
             JevBackend::TypeSafe => {
                 if !self.allow_paid {
                     return Err(RouterError::PaidCallsDisabled);
                 }
                 // Key lives in env only; an empty value counts as missing.
-                let api_key = get_env(TYPESAFE_API_KEY_ENV)
-                    .ok_or(RouterError::MissingEnv(TYPESAFE_API_KEY_ENV))?;
-                post_chat_completions(&self.endpoint(), &self.model, Some(&api_key), prompt)
+                get_env(TYPESAFE_API_KEY_ENV)
+                    .map(Some)
+                    .ok_or(RouterError::MissingEnv(TYPESAFE_API_KEY_ENV))
             }
-            JevBackend::LocalJev => {
-                // Local inference is free: no paid gate. Key is optional.
-                let api_key = get_env(LOCALJEV_API_KEY_ENV);
-                post_chat_completions(&self.endpoint(), &self.model, api_key.as_deref(), prompt)
-            }
+            // Local inference is free: no paid gate. Key is optional.
+            JevBackend::LocalJev => Ok(get_env(LOCALJEV_API_KEY_ENV)),
         }
+    }
+
+    /// Ask structured questions about `state` (System One). TypeSafe refuses
+    /// anything but sanitized content before touching the network.
+    pub fn ask(
+        &self,
+        s: Sensitivity,
+        state: &str,
+        questions: &serde_json::Value,
+    ) -> Result<SystemOneReply, RouterError> {
+        if self.backend == JevBackend::TypeSafe && s != Sensitivity::Sanitized {
+            return Err(RouterError::Refused(
+                "sensitive content must stay local; TypeSafe accepts sanitized/public content only"
+                    .into(),
+            ));
+        }
+        let key = self.preflight()?;
+        post_systemone(
+            &self.endpoint(),
+            &self.model,
+            key.as_deref(),
+            state,
+            questions,
+        )
+    }
+}
+
+/// Parsed System One response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemOneReply {
+    /// Model that answered (may differ from the alias requested).
+    pub model: String,
+    /// Answers keyed by question name.
+    pub answers: serde_json::Map<String, serde_json::Value>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl SystemOneReply {
+    /// Probability of yes for a `noul` question.
+    pub fn noul(&self, name: &str) -> Option<f64> {
+        self.answers.get(name)?.get("noul")?.as_f64()
+    }
+    /// Selected choice for a `choice` question.
+    pub fn choice(&self, name: &str) -> Option<&str> {
+        self.answers.get(name)?.get("choice")?.as_str()
     }
 }
 
@@ -245,35 +304,28 @@ impl ModelClient for JevClient {
     }
 }
 
-/// Join a base URL to the chat-completions path.
+/// Join a base URL to the System One path.
 fn endpoint_for(base: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     if trimmed.ends_with("/v1") {
-        format!("{trimmed}/chat/completions")
+        format!("{trimmed}/systemone")
     } else {
-        format!("{trimmed}/v1/chat/completions")
+        format!("{trimmed}/v1/systemone")
     }
 }
 
-/// Shared Jev chat call used by BOTH backends (TypeSafe and localjev).
-///
-/// NOTE: the chat shape is UNVERIFIED — it assumes an OpenAI-compatible
-/// `POST /v1/chat/completions` with `{model, messages: [{role, content}],
-/// stream: false}` and Bearer auth, returning `choices[0].message.content`.
-/// Neither the TypeSafe endpoint nor a real localjev server has been checked
-/// against this shape yet; update this ONE function when the real shape is
-/// known. No pricing or rate-limit info is known for either backend.
-fn post_chat_completions(
+/// Shared Jev System One call used by BOTH backends (TypeSafe and localjev):
+/// `POST /v1/systemone` with `{model, state, questions}` and Bearer auth.
+/// Shape verified live against TypeSafe on 2026-10-26; the localjev server is
+/// assumed to share it (discord-luna uses one SystemOneClient for both).
+fn post_systemone(
     endpoint: &str,
     model: &str,
     api_key: Option<&str>,
-    prompt: &str,
-) -> Result<String, RouterError> {
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": false,
-    });
+    state: &str,
+    questions: &serde_json::Value,
+) -> Result<SystemOneReply, RouterError> {
+    let body = serde_json::json!({"model": model, "state": state, "questions": questions});
     let request = ureq::post(endpoint).timeout(std::time::Duration::from_secs(TIMEOUT_SECS));
     let request = match api_key {
         Some(key) => request.set("Authorization", &format!("Bearer {key}")),
@@ -284,13 +336,28 @@ fn post_chat_completions(
         .map_err(map_ureq_error)?
         .into_json()
         .map_err(|e| RouterError::Http(e.to_string()))?;
-    raw.get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|m| m.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| RouterError::BadResponse("missing choices[0].message.content string".into()))
+    let answers = raw
+        .get("answers")
+        .and_then(|a| a.as_object())
+        .filter(|a| !a.is_empty())
+        .cloned()
+        .ok_or_else(|| RouterError::BadResponse("missing answers object".into()))?;
+    let usage = |k: &str| {
+        raw.get("usage")
+            .and_then(|u| u.get(k))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    Ok(SystemOneReply {
+        model: raw
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or(model)
+            .to_string(),
+        answers,
+        input_tokens: usage("input_tokens"),
+        output_tokens: usage("output_tokens"),
+    })
 }
 
 fn get_env(key: &str) -> Option<String> {
@@ -450,8 +517,11 @@ mod tests {
         url
     }
 
-    const OK_BODY: &str =
-        r#"{"choices":[{"message":{"role":"assistant","content":"jev says hi"}}]}"#;
+    const OK_BODY: &str = r#"{"model":"jev-1.14.0","answers":{"q":{"type":"noul","noul":0.9}},"usage":{"input_tokens":304,"output_tokens":21}}"#;
+
+    fn qs() -> serde_json::Value {
+        serde_json::json!({"q": {"type": "noul", "instructions": "yes?"}})
+    }
 
     fn typesafe_client(base_url: String, allow_paid: bool) -> JevClient {
         JevClient::new(JevBackend::TypeSafe, base_url, "test-jevo", allow_paid)
@@ -570,10 +640,7 @@ mod tests {
         let c = JevClient::from_env().expect("typesafe from env");
         assert_eq!(c.base_url(), "https://typesafe.example.test");
         assert_eq!(c.model(), "jev-test-1");
-        assert_eq!(
-            c.endpoint(),
-            "https://typesafe.example.test/v1/chat/completions"
-        );
+        assert_eq!(c.endpoint(), "https://typesafe.example.test/v1/systemone");
 
         let _env = EnvGuard::set(&[
             (JEV_BACKEND_ENV, Some("localjev")),
@@ -586,15 +653,17 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_success_posts_openai_body_with_bearer() {
+    fn typesafe_success_posts_systemone_body_with_bearer() {
         let _guard = env_lock();
         let _env = EnvGuard::set(&[(TYPESAFE_API_KEY_ENV, Some("test-key"))]);
         let (url, seen, handle) = mock_server(200, OK_BODY);
         let client = typesafe_client(url, true);
         let out = client
-            .complete_with_sensitivity(Sensitivity::Sanitized, "public prompt")
+            .ask(Sensitivity::Sanitized, "public prompt", &qs())
             .expect("mock success");
-        assert_eq!(out, "jev says hi");
+        assert_eq!(out.noul("q"), Some(0.9));
+        assert_eq!(out.model, "jev-1.14.0");
+        assert_eq!((out.input_tokens, out.output_tokens), (304, 21));
         handle.join().expect("server thread");
         let seen = seen.lock().expect("seen lock");
         assert_eq!(seen.len(), 1);
@@ -602,9 +671,8 @@ mod tests {
         assert_eq!(auth.as_deref(), Some("Bearer test-key"));
         let sent: serde_json::Value = serde_json::from_str(body).expect("request is json");
         assert_eq!(sent["model"], "test-jevo");
-        assert_eq!(sent["messages"][0]["role"], "user");
-        assert_eq!(sent["messages"][0]["content"], "public prompt");
-        assert_eq!(sent["stream"], false);
+        assert_eq!(sent["state"], "public prompt");
+        assert_eq!(sent["questions"], qs());
     }
 
     #[test]
@@ -684,13 +752,15 @@ mod tests {
         assert_eq!(client.destination(), Destination::LocalJev);
         // Sensitive content is allowed: data stays on the local server.
         let out = client
-            .complete_with_sensitivity(Sensitivity::Sensitive, "PRIVATE health note")
+            .ask(Sensitivity::Sensitive, "PRIVATE health note", &qs())
             .expect("local sensitive ok");
-        assert_eq!(out, "jev says hi");
-        // Bare complete() works too (local backends accept any sensitivity).
-        let (url2, _, handle2) = mock_server(200, OK_BODY);
-        let out = localjev_client(url2).complete("PRIVATE").expect("local ok");
-        assert_eq!(out, "jev says hi");
+        assert_eq!(out.noul("q"), Some(0.9));
+        // Freeform complete() passes local gates but fails closed (no chat API).
+        let (url2, _, handle2) = (closed_url(), (), std::thread::spawn(|| {}));
+        assert!(matches!(
+            localjev_client(url2).complete("PRIVATE"),
+            Err(RouterError::Refused(_))
+        ));
         handle.join().expect("server thread");
         handle2.join().expect("server thread");
         let seen = seen.lock().expect("seen lock");
@@ -700,9 +770,7 @@ mod tests {
         // Same shared request shape as the TypeSafe backend.
         let sent: serde_json::Value = serde_json::from_str(body).expect("request is json");
         assert_eq!(sent["model"], "test-localjev");
-        assert_eq!(sent["messages"][0]["role"], "user");
-        assert_eq!(sent["messages"][0]["content"], "PRIVATE health note");
-        assert_eq!(sent["stream"], false);
+        assert_eq!(sent["state"], "PRIVATE health note");
     }
 
     #[test]
@@ -711,9 +779,9 @@ mod tests {
         let _env = EnvGuard::set(&[(LOCALJEV_API_KEY_ENV, Some("local-secret"))]);
         let (url, seen, handle) = mock_server(200, OK_BODY);
         let out = localjev_client(url)
-            .complete_with_sensitivity(Sensitivity::Sanitized, "hi")
+            .ask(Sensitivity::Sanitized, "hi", &qs())
             .expect("mock success");
-        assert_eq!(out, "jev says hi");
+        assert_eq!(out.noul("q"), Some(0.9));
         handle.join().expect("server thread");
         let seen = seen.lock().expect("seen lock");
         assert_eq!(seen[0].0.as_deref(), Some("Bearer local-secret"));
@@ -725,7 +793,7 @@ mod tests {
         let _env = EnvGuard::set(&[(LOCALJEV_API_KEY_ENV, None)]);
         let (url, _, handle) = mock_server(500, r#"{"error":"boom"}"#);
         let err = localjev_client(url)
-            .complete_with_sensitivity(Sensitivity::Sensitive, "x")
+            .ask(Sensitivity::Sensitive, "x", &qs())
             .unwrap_err();
         assert!(matches!(err, RouterError::Http(_)), "unexpected: {err:?}");
         assert!(err.to_string().contains("500"));
@@ -733,14 +801,14 @@ mod tests {
 
         for body in [
             "{}",
-            r#"{"choices":[]}"#,
-            r#"{"choices":[{"message":{}}]}"#,
-            r#"{"choices":[{"message":{"content":42}}]}"#,
-            r#"{"choices":[{"message":{"content":null}}]}"#,
+            r#"{"answers":{}}"#,
+            r#"{"answers":null}"#,
+            r#"{"answers":42}"#,
+            r#"{"choices":[{"message":{"content":"hi"}}]}"#,
         ] {
             let (url, _, handle) = mock_server(200, body);
             let err = localjev_client(url)
-                .complete_with_sensitivity(Sensitivity::Sensitive, "x")
+                .ask(Sensitivity::Sensitive, "x", &qs())
                 .unwrap_err();
             assert!(
                 matches!(err, RouterError::BadResponse(_)),
@@ -751,19 +819,13 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_appends_chat_completions() {
+    fn endpoint_appends_systemone() {
         let c = typesafe_client("https://api.typesafe.ai".into(), true);
-        assert_eq!(c.endpoint(), "https://api.typesafe.ai/v1/chat/completions");
+        assert_eq!(c.endpoint(), "https://api.typesafe.ai/v1/systemone");
         let trailing = typesafe_client("https://api.typesafe.ai/".into(), true);
-        assert_eq!(
-            trailing.endpoint(),
-            "https://api.typesafe.ai/v1/chat/completions"
-        );
+        assert_eq!(trailing.endpoint(), "https://api.typesafe.ai/v1/systemone");
         let with_v1 = localjev_client("http://127.0.0.1:8080/v1".into());
-        assert_eq!(
-            with_v1.endpoint(),
-            "http://127.0.0.1:8080/v1/chat/completions"
-        );
+        assert_eq!(with_v1.endpoint(), "http://127.0.0.1:8080/v1/systemone");
     }
 
     #[test]

@@ -10,6 +10,7 @@ bookmarks-agent = { path = "../bookmarks-agent" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

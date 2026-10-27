@@ -287,12 +287,81 @@ impl JevClassifier {
 }
 
 impl ClassifierBackend for JevClassifier {
+    /// Asks one System One `choice` question over the constrained labels
+    /// (falls back to the free-text label prompt as a choice-less question,
+    /// which Jev rejects, so labels are effectively required).
     fn classify(&self, text: &str) -> Result<String, EvalError> {
-        let reply = self
-            .client
-            .complete_with_sensitivity(self.sensitivity, &self.prompt_for(text))?;
-        Ok(reply.trim().to_string())
+        let criteria: serde_json::Map<String, serde_json::Value> = self
+            .labels
+            .iter()
+            .map(|l| (l.clone(), serde_json::Value::String(String::new())))
+            .collect();
+        let questions = serde_json::json!({
+            "label": {"type": "choice", "instructions": "Which label best fits this text?", "criteria": criteria}
+        });
+        let reply = self.client.ask(self.sensitivity, text, &questions)?;
+        reply
+            .choice("label")
+            .map(|c| c.trim().to_string())
+            .ok_or_else(|| EvalError::from(RouterError::BadResponse("missing choice".into())))
     }
+}
+
+/// Bookmark triage labels (same fields as the Muse labeling prompt).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BookmarkLabels {
+    pub try_it: f64,
+    pub worth_resurfacing: f64,
+    pub category: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Category criteria mirroring eval-private label_muse.py.
+pub const BOOKMARK_CATEGORIES: &[&str] = &[
+    "ai_agents_homelab",
+    "health_fitness_food",
+    "mental_health_adhd",
+    "mind_consciousness",
+    "markets_investing",
+    "space_tech_news",
+    "cool_fun",
+    "other_unsure",
+];
+
+/// System One questions for bookmark labeling (one request per post).
+pub fn bookmark_questions() -> serde_json::Value {
+    let cats: serde_json::Map<String, serde_json::Value> = BOOKMARK_CATEGORIES
+        .iter()
+        .map(|c| (c.to_string(), serde_json::Value::String(String::new())))
+        .collect();
+    serde_json::json!({
+        "try_it": {"type": "noul", "instructions": "This X bookmark is hands-on practice the reader could physically try now with actionable steps (exercise, stretch, breathing, meditation, recipe, concrete routine, a tool walkthrough with steps). Not general advice lists, news, or hype."},
+        "worth_resurfacing": {"type": "noul", "instructions": "This X bookmark has durable substantive value (insight, how-to, reference). False for jokes, hype, news blips, low-content."},
+        "category": {"type": "choice", "instructions": "Topic category of this X bookmark for a personal-knowledge app.", "criteria": cats}
+    })
+}
+
+/// Label one public bookmark with Jev. Sensitivity is the caller's call.
+pub fn jev_label_bookmark(
+    client: &JevClient,
+    s: Sensitivity,
+    text: &str,
+) -> Result<BookmarkLabels, RouterError> {
+    let r = client.ask(s, text, &bookmark_questions())?;
+    let miss = |f: &str| RouterError::BadResponse(format!("missing {f}"));
+    Ok(BookmarkLabels {
+        try_it: r.noul("try_it").ok_or_else(|| miss("try_it"))?,
+        worth_resurfacing: r
+            .noul("worth_resurfacing")
+            .ok_or_else(|| miss("worth_resurfacing"))?,
+        category: r
+            .choice("category")
+            .ok_or_else(|| miss("category"))?
+            .to_string(),
+        input_tokens: r.input_tokens,
+        output_tokens: r.output_tokens,
+    })
 }
 
 #[cfg(test)]
@@ -526,7 +595,7 @@ mod tests {
             .iter()
             .map(|content| {
                 format!(
-                    "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":{}}}}}]}}",
+                    "{{\"model\":\"m\",\"answers\":{{\"label\":{{\"type\":\"choice\",\"choice\":{}}}}},\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}",
                     serde_json::Value::String(content.to_string())
                 )
             })
@@ -589,9 +658,9 @@ mod tests {
         assert_eq!(seen.len(), 4);
         for (body, ex) in seen.iter().zip(ex.iter()) {
             let sent: serde_json::Value = serde_json::from_str(body).expect("request is json");
-            let content = sent["messages"][0]["content"].as_str().unwrap();
-            assert!(content.contains("tech, sports"), "prompt: {content:?}");
-            assert!(content.contains(&ex.text), "prompt: {content:?}");
+            assert_eq!(sent["state"], ex.text.as_str());
+            let crit = sent["questions"]["label"]["criteria"].as_object().unwrap();
+            assert!(crit.contains_key("tech") && crit.contains_key("sports"));
         }
     }
 
