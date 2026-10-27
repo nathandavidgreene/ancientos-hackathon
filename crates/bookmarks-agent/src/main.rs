@@ -7,7 +7,8 @@
 //! | `ideas` | `triage <id> <adopt|park|drop>`
 //! | `tried <post_id> <yes|no|later> [note]` | `try-pending`
 //! | `digest [--now SECS] [--dry-run]`
-//! | `approvals` | `approve <id>` | `deny <id> [reason]`
+//! | `approvals` | `approve <id> [--now <rfc3339>]`
+//! | `deny <id> [reason] [--now <rfc3339>]`
 //! | `run [--once] [--now <rfc3339>] [--offline <fixture>]`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
@@ -29,7 +30,9 @@
 //! triage digest plus "did you try it?" nudges, recording the showing
 //! unless `--dry-run` or `--now` is given. `approvals` lists pending human
 //! approvals; `approve`/`deny` record the decision (the CLI user is the
-//! human) and print the outcome — nothing executes from the CLI. `run`
+//! human) and print the outcome — nothing executes from the CLI. Both take
+//! an optional `--now <rfc3339>` fixed clock for deterministic demos.
+//! `run`
 //! ticks the scheduled agents (`--once` runs every due agent once, exit
 //! non-zero on any agent error; otherwise loops until Ctrl-C).
 //! Tokens, codes, and verifiers are never printed.
@@ -39,7 +42,7 @@ use bookmarks_agent::{
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> | deny <id> [reason] | run [--once] [--now <rfc3339>] [--offline <fixture>]";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> [--now <rfc3339>] | deny <id> [reason] [--now <rfc3339>] | run [--once] [--now <rfc3339>] [--offline <fixture>]";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -727,35 +730,90 @@ fn stored_hash(log: &ancientos_core::log::DecisionLog, id: &str) -> Result<Strin
         .map_err(|e| e.to_string())
 }
 
-fn cmd_approve(args: &[String]) -> Result<(), String> {
-    if args.len() != 1 || args[0].is_empty() {
+/// Parsed `approve`/`deny` args: the approval id, an optional fixed RFC 3339
+/// clock, and (deny only) the trailing reason words.
+#[derive(Debug)]
+struct DecideArgs {
+    id: String,
+    reason: String,
+    now: Option<u64>,
+}
+
+/// `approve <id> [--now <rfc3339>]` and `deny <id> [reason] [--now
+/// <rfc3339>]` (`--now=` form too). `--now` must come last when present;
+/// duplicates, a missing value, an unparseable value, an empty id, or a
+/// reason word that looks like `--now` are errors (fail closed).
+fn parse_decide_args(args: &[String], is_deny: bool) -> Result<DecideArgs, String> {
+    if args.is_empty() || args[0].is_empty() {
         return Err(USAGE.to_string());
     }
+    let id = args[0].clone();
+    let mut rest: &[String] = &args[1..];
+    let mut now: Option<u64> = None;
+    // Peel one trailing --now flag when present.
+    if let Some(last) = rest.last() {
+        if let Some(v) = last.strip_prefix("--now=") {
+            now = Some(
+                idea_card::parse_rfc3339(v)
+                    .ok_or_else(|| "invalid --now value (want RFC 3339)".to_string())?,
+            );
+            rest = &rest[..rest.len() - 1];
+        } else if last == "--now" {
+            return Err(USAGE.to_string());
+        } else if rest.len() >= 2 && rest[rest.len() - 2] == "--now" {
+            let v = last.clone();
+            now = Some(
+                idea_card::parse_rfc3339(&v)
+                    .ok_or_else(|| "invalid --now value (want RFC 3339)".to_string())?,
+            );
+            rest = &rest[..rest.len() - 2];
+        }
+    }
+    // Any remaining --now is a duplicate or a misplaced flag.
+    if rest.iter().any(|a| a == "--now" || a.starts_with("--now=")) {
+        return Err(USAGE.to_string());
+    }
+    if !is_deny && !rest.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    Ok(DecideArgs {
+        id,
+        reason: rest.join(" "),
+        now,
+    })
+}
+
+fn cmd_approve(args: &[String]) -> Result<(), String> {
+    let parsed = parse_decide_args(args, false)?;
     let log_path = brief::decision_log_path()?;
     let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
-    let hash = stored_hash(&log, &args[0])?;
-    let now = idea_card::now_secs();
-    let token = ancientos_core::approvals::approve(&mut log, &args[0], &hash, CLI_DECIDER, now)
+    let hash = stored_hash(&log, &parsed.id)?;
+    let now = parsed.now.unwrap_or_else(idea_card::now_secs);
+    let token = ancientos_core::approvals::approve(&mut log, &parsed.id, &hash, CLI_DECIDER, now)
         .map_err(|e| e.to_string())?;
     // The release token is single-process by design (not Clone, not
     // Serialize): approving records the decision only. Nothing executes.
     drop(token);
-    println!("approved {} (release-ready)", args[0]);
+    println!("approved {} (release-ready)", parsed.id);
     Ok(())
 }
 
 fn cmd_deny(args: &[String]) -> Result<(), String> {
-    if args.is_empty() || args[0].is_empty() {
-        return Err(USAGE.to_string());
-    }
-    let reason = args[1..].join(" ");
+    let parsed = parse_decide_args(args, true)?;
     let log_path = brief::decision_log_path()?;
     let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
-    let hash = stored_hash(&log, &args[0])?;
-    let now = idea_card::now_secs();
-    ancientos_core::approvals::deny(&mut log, &args[0], &hash, CLI_DECIDER, &reason, now)
-        .map_err(|e| e.to_string())?;
-    println!("denied {}", args[0]);
+    let hash = stored_hash(&log, &parsed.id)?;
+    let now = parsed.now.unwrap_or_else(idea_card::now_secs);
+    ancientos_core::approvals::deny(
+        &mut log,
+        &parsed.id,
+        &hash,
+        CLI_DECIDER,
+        &parsed.reason,
+        now,
+    )
+    .map_err(|e| e.to_string())?;
+    println!("denied {}", parsed.id);
     Ok(())
 }
 
@@ -1063,6 +1121,97 @@ mod tests {
         );
         assert_eq!(cmd_deny(&[]).unwrap_err(), USAGE);
         assert_eq!(cmd_deny(&["".to_string()]).unwrap_err(), USAGE);
+    }
+
+    #[test]
+    fn decide_now_parses_space_and_equals_forms() {
+        let at = idea_card::parse_rfc3339("2030-01-01T00:00:00Z").unwrap();
+        // Approve: id alone, or id plus trailing --now.
+        let parsed = parse_decide_args(&["abc".to_string()], false).unwrap();
+        assert_eq!(parsed.id, "abc");
+        assert_eq!(parsed.now, None);
+        assert_eq!(parsed.reason, "");
+        for args in [
+            vec!["abc", "--now", "2030-01-01T00:00:00Z"],
+            vec!["abc", "--now=2030-01-01T00:00:00Z"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let parsed = parse_decide_args(&owned, false).unwrap();
+            assert_eq!(parsed.id, "abc");
+            assert_eq!(parsed.now, Some(at), "{args:?}");
+        }
+        // Deny: reason words preserved, trailing --now peeled.
+        let owned: Vec<String> = ["abc", "not", "convincing"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_decide_args(&owned, true).unwrap();
+        assert_eq!(parsed.reason, "not convincing");
+        assert_eq!(parsed.now, None);
+        for args in [
+            vec!["abc", "not", "convincing", "--now", "2030-01-01T00:00:00Z"],
+            vec!["abc", "--now=2030-01-01T00:00:00Z"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let parsed = parse_decide_args(&owned, true).unwrap();
+            assert_eq!(parsed.now, Some(at), "{args:?}");
+        }
+        let owned: Vec<String> = ["abc", "not", "convincing", "--now", "2030-01-01T00:00:00Z"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_decide_args(&owned, true).unwrap().reason,
+            "not convincing"
+        );
+        // Bad: duplicates, misplaced, missing, unparseable, empty id.
+        for (args, is_deny) in [
+            (vec!["abc", "--now"], false),
+            (vec!["abc", "--now", "someday"], false),
+            (vec!["abc", "--now="], false),
+            (
+                vec![
+                    "abc",
+                    "--now",
+                    "2030-01-01T00:00:00Z",
+                    "--now",
+                    "2030-01-02T00:00:00Z",
+                ],
+                false,
+            ),
+            (
+                vec![
+                    "abc",
+                    "--now",
+                    "2030-01-01T00:00:00Z",
+                    "--now=2030-01-02T00:00:00Z",
+                ],
+                true,
+            ),
+            (vec!["abc", "--now", "2030-01-01T00:00:00Z", "extra"], false),
+            (vec!["abc", "extra", "--now"], true),
+            (vec![""], false),
+            (vec!["", "--now", "2030-01-01T00:00:00Z"], true),
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let err = parse_decide_args(&owned, is_deny).unwrap_err();
+            assert!(
+                err == USAGE || err == "invalid --now value (want RFC 3339)",
+                "{args:?}: {err}"
+            );
+        }
+        assert_eq!(
+            parse_decide_args(
+                &[
+                    "abc".to_string(),
+                    "--now".to_string(),
+                    "someday".to_string()
+                ],
+                false
+            )
+            .unwrap_err(),
+            "invalid --now value (want RFC 3339)"
+        );
     }
 
     #[test]

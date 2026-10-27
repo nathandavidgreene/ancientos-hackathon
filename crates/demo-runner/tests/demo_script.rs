@@ -1,4 +1,4 @@
-//! Integration test for `scripts/demo.sh`: all 12 shots, determinism, no leaks.
+//! Integration test for `scripts/demo.sh`: all 14 shots, determinism, no leaks.
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
@@ -58,7 +58,7 @@ fn storyboard_quotes() -> Vec<String> {
     quotes
 }
 
-/// Same rule as `scripts/demo.sh` shot 11: log rows matching
+/// Same rule as `scripts/demo.sh` shot 13: log rows matching
 /// `^\| [0-9]+[a-z]? `, excluding rows marked `Not used`.
 fn muse_code_runs_from_log() -> usize {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/muse-code-log.md");
@@ -157,10 +157,10 @@ fn private_strings() -> Vec<String> {
 fn demo_runs_all_shots_deterministically_without_private_data() {
     let (code1, out1, err1) = run_demo(&[]);
     assert_eq!(code1, Some(0), "demo.sh failed: {err1}");
-    for n in 1..=12 {
+    for n in 1..=14 {
         assert!(
-            out1.contains(&format!("Shot {n}/12")),
-            "missing Shot {n}/12"
+            out1.contains(&format!("Shot {n}/14")),
+            "missing Shot {n}/14"
         );
     }
     assert!(
@@ -189,6 +189,12 @@ fn demo_runs_all_shots_deterministically_without_private_data() {
         "threshold shift:",
         "tampered copy:",
         "idea=Drag a card to approve",
+        "deeper.paid",
+        "topic_filter",
+        "Translated from",
+        "never_author",
+        "already decided",
+        "exactly once",
     ] {
         assert!(
             quotes.iter().any(|q| q.contains(key)),
@@ -206,7 +212,7 @@ fn demo_runs_all_shots_deterministically_without_private_data() {
             "storyboard quote missing from demo output: {q:?}"
         );
     }
-    // Shot 11 derives N from the log with the same rule as scripts/demo.sh.
+    // Shot 13 derives N from the log with the same rule as scripts/demo.sh.
     let expected_runs = muse_code_runs_from_log();
     assert!(
         out1.contains(&format!(
@@ -229,8 +235,8 @@ fn demo_runs_all_shots_deterministically_without_private_data() {
 fn demo_shot_8_alone() {
     let (code, out, err) = run_demo(&["--shot", "8"]);
     assert_eq!(code, Some(0), "--shot 8 failed: {err}");
-    assert!(out.contains("Shot 8/12"), "missing Shot 8/12");
-    assert!(!out.contains("Shot 1/12"), "shot 8 leaked shot 1");
+    assert!(out.contains("Shot 8/14"), "missing Shot 8/14");
+    assert!(!out.contains("Shot 1/14"), "shot 8 leaked shot 1");
     for want in [
         "demo-2001",
         "demo-2002",
@@ -247,18 +253,18 @@ fn demo_shot_8_alone() {
 
 #[test]
 fn demo_each_shot_runs_alone() {
-    for n in 1..=12 {
+    for n in 1..=14 {
         let arg = n.to_string();
         let (code, out, err) = run_demo(&["--shot", &arg]);
         assert_eq!(code, Some(0), "--shot {n} failed: {err}");
         assert!(
-            out.contains(&format!("==== Shot {n}/12:")),
+            out.contains(&format!("==== Shot {n}/14:")),
             "--shot {n} missing its header"
         );
-        for m in 1..=12 {
+        for m in 1..=14 {
             if m != n {
                 assert!(
-                    !out.contains(&format!("==== Shot {m}/12:")),
+                    !out.contains(&format!("==== Shot {m}/14:")),
                     "--shot {n} leaked shot {m}"
                 );
             }
@@ -268,8 +274,52 @@ fn demo_each_shot_runs_alone() {
 }
 
 #[test]
+fn demo_shot_11_approvals_flow() {
+    let (code, out, err) = run_demo(&["--shot", "11"]);
+    assert_eq!(code, Some(0), "--shot 11 failed: {err}");
+    for want in [
+        "Shot 11/14",
+        "ANCIENTOS_ALLOW_PAID=unset",
+        "queued demo-3001",
+        "deeper.paid pending",
+        "expires_at=",
+        "bookmarks-agent approvals:",
+        "release-ready",
+        "exactly once",
+        "walkthrough demo-3001.md",
+        "approval.requested",
+        "approval.approved",
+        "approval.released",
+        "hash chain verified",
+        "already decided",
+    ] {
+        assert!(out.contains(want), "--shot 11 missing {want}");
+    }
+    assert!(!has_15plus_digits(&out));
+}
+
+#[test]
+fn demo_shot_12_cascade_stages() {
+    let (code, out, err) = run_demo(&["--shot", "12"]);
+    assert_eq!(code, Some(0), "--shot 12 failed: {err}");
+    for want in [
+        "Shot 12/14",
+        "mock Jev + mock Muse",
+        "stage=topic_filter",
+        "stage=rules",
+        "stage=jev",
+        "topic_filtered=1",
+        "jev_calls=1",
+        "muse_calls=0",
+    ] {
+        assert!(out.contains(want), "--shot 12 missing {want}");
+    }
+    assert!(!has_15plus_digits(&out));
+}
+
+#[test]
 fn demo_rejects_invalid_shot() {
-    for bad in ["13", "99"] {
+    for bad in ["15", "99"] {
         let (code, _, err) = run_demo(&["--shot", bad]);
         assert_eq!(code, Some(2), "--shot {bad} must exit 2");
         assert!(err.contains("usage"), "--shot {bad} must print usage");

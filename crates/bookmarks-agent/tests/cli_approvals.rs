@@ -27,6 +27,15 @@ fn run(args: &[&str], log_path: &Path) -> Output {
 }
 
 fn seed(summary: &str, draft: &str, log_path: &Path) -> ancientos_core::approvals::ApprovalRequest {
+    seed_at(summary, draft, log_path, now_secs())
+}
+
+fn seed_at(
+    summary: &str,
+    draft: &str,
+    log_path: &Path,
+    now: u64,
+) -> ancientos_core::approvals::ApprovalRequest {
     let mut log = ancientos_core::log::DecisionLog::open(log_path).unwrap();
     ancientos_core::approvals::request(
         &mut log,
@@ -34,7 +43,7 @@ fn seed(summary: &str, draft: &str, log_path: &Path) -> ancientos_core::approval
         "x.post",
         summary,
         serde_json::json!({"draft": draft}),
-        now_secs(),
+        now,
         None,
     )
     .unwrap()
@@ -175,4 +184,50 @@ fn approve_rejects_bad_args() {
             stderr(&out)
         );
     }
+}
+
+#[test]
+fn approve_now_records_fixed_clock_and_rejects_bad_clock() {
+    let (_dir, log) = setup();
+    let requested = bookmarks_agent::idea_card::parse_rfc3339("2030-01-01T00:00:00Z").unwrap();
+    let r = seed_at(
+        "synthetic cli fixed clock",
+        "synthetic draft fixed",
+        &log,
+        requested,
+    );
+    let fixed = "2030-01-01T00:00:01Z";
+    let expected = bookmarks_agent::idea_card::parse_rfc3339(fixed).unwrap();
+    let out = run(&["approve", &r.id, "--now", fixed], &log);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let entries = ancientos_core::log::DecisionLog::open(&log)
+        .unwrap()
+        .verify()
+        .unwrap();
+    assert_eq!(entries[1].kind, "approval.approved");
+    assert_eq!(entries[1].payload["decided_at"], expected);
+    // Bad clocks fail closed without appending.
+    let s = seed_at(
+        "synthetic cli bad clock",
+        "synthetic draft bad",
+        &log,
+        requested + 10,
+    );
+    for args in [
+        vec!["approve", &s.id, "--now", "someday"],
+        vec!["approve", &s.id, "--now"],
+        vec!["deny", &s.id, "--now", "someday"],
+    ] {
+        let out = run(&args, &log);
+        assert!(!out.status.success(), "{args:?} must fail");
+    }
+    assert_eq!(
+        ancientos_core::log::DecisionLog::open(&log)
+            .unwrap()
+            .verify()
+            .unwrap()
+            .len(),
+        3,
+        "refusals append nothing"
+    );
 }

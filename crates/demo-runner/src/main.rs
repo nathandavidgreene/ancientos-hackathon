@@ -8,7 +8,7 @@ use ancientos_router::Sensitivity;
 use demo_runner::{demo_date, demo_now_secs, routing_demo, Workspace};
 use std::path::Path;
 
-const USAGE: &str = "usage: demo-runner --data DIR <sync FIXTURE | brief DAY | brief-rich DAY | feedback PICK VERDICT | thresholds | log | count FIXTURE... | routing | route [--sensitive|--sanitized] TEXT | vote-demo | delegate-demo POST_ID | try-demo | tamper-demo>";
+const USAGE: &str = "usage: demo-runner --data DIR <sync FIXTURE | brief DAY | brief-rich DAY | feedback PICK VERDICT | thresholds | log | count FIXTURE... | routing | route [--sensitive|--sanitized] TEXT | vote-demo | delegate-demo POST_ID | try-demo | tamper-demo | approvals-propose | approvals-release | approvals-chain | cascade-demo | translate-demo | author-demo>";
 
 /// Parse `route` args: `--sensitive TEXT` (default) or `--sanitized TEXT`.
 /// A bare `route TEXT` is treated as sensitive (fail closed).
@@ -260,6 +260,70 @@ fn run(args: &[String]) -> Result<(), String> {
                 "tampered copy: verification failed as expected (fails closed: {})",
                 demo.failure
             );
+        }
+        [c] if c == "approvals-propose" => {
+            let demo = ws.approvals_propose()?;
+            println!("ANCIENTOS_ALLOW_PAID=unset (paid simulated via mock, no network)");
+            println!("queued {} at {}", demo.post_id, demo.at);
+            println!(
+                "deeper_queue: local=0 proposed={} paid=0 waiting={} denied=0 (mock paid, no network)",
+                demo.proposed, demo.waiting
+            );
+            println!(
+                "proposed {} deeper.paid pending expires_at={}",
+                demo.approval_id, demo.expires_at
+            );
+        }
+        [c] if c == "approvals-release" => {
+            let demo = ws.approvals_release()?;
+            println!(
+                "deeper_queue: local=0 proposed=0 paid={} waiting=0 denied=0 (mock paid, no network)",
+                demo.executed.len()
+            );
+            println!("released {} exactly once", demo.approval_id);
+            println!("walkthrough {} (mock, no network):", demo.walkthrough_file);
+            for line in &demo.walkthrough_head {
+                println!("  {line}");
+            }
+        }
+        [c] if c == "approvals-chain" => {
+            let demo = ws.approvals_chain()?;
+            for (kind, id) in &demo.kinds {
+                println!("{kind} {id}");
+            }
+            println!("hash chain verified: {} entries", demo.total);
+        }
+        [c] if c == "cascade-demo" => {
+            let demo = ws.cascade_demo()?;
+            println!("cascade demo (mock Jev + mock Muse, no network, paid off):");
+            for item in &demo.items {
+                println!(
+                    "{}: try_it={} stage={} ({})",
+                    item.post_id, item.try_it, item.stage, item.note
+                );
+            }
+            println!(
+                "cascade stats: topic_filtered={} rules_yes={} jev_calls={} jev_yes={} muse_calls={} (mock, no network)",
+                demo.topic_filtered, demo.rules_yes, demo.jev_calls, demo.jev_yes, demo.muse_calls
+            );
+        }
+        [c] if c == "translate-demo" => {
+            let demo = ws.translate_demo()?;
+            println!("{} original: {}", demo.post_id, demo.original);
+            println!("{} {}: {}", demo.post_id, demo.marker, demo.english);
+            println!("original kept below (never hidden for language)");
+        }
+        [c] if c == "author-demo" => {
+            let demo = ws.author_demo()?;
+            println!("never_author {} (hidden):", demo.author);
+            println!("hidden authors: {{\"{}\"}}", demo.author);
+            println!(
+                "visible after hide: {} ({} by {} filtered, store kept at {})",
+                demo.visible_after_hide, demo.hidden_count, demo.author, demo.total
+            );
+            println!("unhide-author {} (undone):", demo.author);
+            println!("hidden authors: {{}}");
+            println!("visible after unhide: {}", demo.visible_after_unhide);
         }
         _ => return Err(USAGE.into()),
     }
