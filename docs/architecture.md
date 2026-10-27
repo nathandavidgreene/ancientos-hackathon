@@ -1,0 +1,100 @@
+# AncientOS hackathon build: architecture
+
+AncientOS turns your X bookmarks into a short daily brief. You approve or reject each pick, and those votes feed a tamper-evident decision log. A post can go further: to an idea card, a "Try it" follow-up, or a "go deeper" walkthrough. Private text never leaves the machine. Hosted Meta (Muse) models only ever see sanitized text, and only when the paid switch is on.
+
+## Data flow
+
+```mermaid
+flowchart LR
+  X[X API v2<br/>OAuth2 PKCE, read-only] --> ingest[ingest + merge<br/>never deletes bookmarks]
+  F[JSONL fixture] --> ingest
+  ingest --> sanitize[sanitize<br/>strip urls, handles, emails, phones]
+  sanitize --> router{privacy router}
+  router -- Sensitive / Unknown --> local[local_llm<br/>Llama via Ollama]
+  router -- Sanitized + ANCIENTOS_ALLOW_PAID=1 --> muse[muse<br/>Muse Spark, Meta Model API]
+  local --> brief[brief<br/>3-5 picks, local fallback]
+  muse --> brief
+  brief --> gate[gate<br/>deny unless registered]
+  gate --> vote[vote / feedback<br/>approve, skip, never_post, never_category, delegate]
+  vote --> log[(decision_log<br/>SHA-256 hash chain)]
+  vote -- delegate --> idea[idea_card]
+  vote --> deeper[deeper<br/>unroll + quoted + steps]
+  brief --> tryit[try_it tag + followups]
+  idea --> log
+  deeper --> log
+  tryit --> log
+```
+
+## Privacy router decision
+
+```mermaid
+flowchart TD
+  A[request + Sensitivity] --> B{Sensitivity}
+  B -- Sensitive --> L[LocalLlama]
+  B -- Unknown --> L
+  B -- Sanitized --> P{ANCIENTOS_ALLOW_PAID == 1<br/>and META_API_KEY set?}
+  P -- yes --> M[Muse Spark]
+  P -- no --> E[error: fail closed / local fallback]
+  L --> U{local backend reachable?}
+  U -- no --> E2[error: never retried on Muse]
+  U -- yes --> OK[reply]
+```
+
+## Decision log hash chain
+
+```mermaid
+flowchart LR
+  e0["seq 0<br/>prev = genesis"] --> e1["seq 1<br/>prev = hash(e0)"] --> e2["seq 2<br/>prev = hash(e1)"] --> en["..."]
+```
+
+Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the chain, and any edited, dropped or reordered line fails verification.
+
+## Modules
+
+| Module | Crate | Role |
+|---|---|---|
+| `gate` | core | Fail-closed approval gate. Unregistered actions are denied. |
+| `log` | core | Append-only, hash-chained JSONL decision log |
+| `feedback` | core | Verdicts and category auto-approval (at least 3 votes, at least 80% approve) |
+| `scheduler` | core | Daily run timing |
+| `router` (lib) | router | Sensitivity → destination routing |
+| `dispatch` | router | Sends a routed request to the matching client |
+| `local_llm` | router | Local Llama backend (OpenAI/Ollama compatible) |
+| `muse` | router | Muse Spark client for the Meta Model API, behind the paid switch |
+| `modal` | router | Hosted Llama stub (Modal), paid switch, fail closed |
+| `oauth`, `callback`, `token_store` | bookmarks-agent | X sign-in (PKCE), loopback callback, tokens stored with mode 0600 |
+| `x_api` | bookmarks-agent | Read-only X client: bookmarks, hydrate, threads, quotes |
+| `ingest`, `merge`, `fixture` | bookmarks-agent | Incremental sync. Bookmarks are never removed. |
+| `sanitize` | bookmarks-agent | Strips PII before anything is sent to a hosted model |
+| `brief` | bookmarks-agent | Candidate selection, one model call, local fallback |
+| `media` | bookmarks-agent | Photos and video under the full text, capped at 1080p |
+| `vote` | bookmarks-agent | Records verdicts |
+| `unroll` | bookmarks-agent | Rebuilds an author's self-reply thread |
+| `delegate`, `idea_card` | bookmarks-agent | Hand-off to the agent, and idea cards (adopt / park / drop) |
+| `try_it` | bookmarks-agent | Hands-on classifier, tried yes/no/later follow-ups |
+| `deeper` | bookmarks-agent | "Go deeper" walkthroughs |
+| `demo-runner` | demo-runner | Deterministic 12-shot demo on synthetic data |
+| `eval` | eval | Offline precision/recall harness ([eval.md](eval.md)) |
+
+## Guarantees and the tests that prove them
+
+| Guarantee | Test |
+|---|---|
+| Unknown actions are denied | [`gate::denies_unknown_action`](../crates/core/src/gate.rs) |
+| A tampered decision log is detected | [`log::detects_tampering`](../crates/core/src/log.rs) |
+| Sensitive data never reaches Muse | [`dispatch::sensitive_data_never_reaches_muse`](../crates/router/src/dispatch.rs) |
+| Unknown sensitivity stays local | [`unknown_stays_local`](../crates/router/src/lib.rs) |
+| Local Llama down means no fallback to Muse | [`local_llm::dispatch_sensitive_with_local_down_never_calls_muse`](../crates/router/src/local_llm.rs) |
+| Local backend unreachable or malformed fails closed | [`unreachable_host_fails_closed`, `malformed_response_fails_closed`](../crates/router/src/local_llm.rs) |
+| Paid calls are off by default | [`muse::paid_calls_disabled_by_default`](../crates/router/src/muse.rs), [`modal::paid_switch_defaults_off`](../crates/router/src/modal.rs) |
+| A missing key fails before any network call | [`muse::missing_key_fails_closed_without_network`](../crates/router/src/muse.rs) |
+| X paid endpoints need the switch | [`x_api::paid_switch_is_required`](../crates/bookmarks-agent/src/x_api.rs) |
+| Only sanitized text goes into the brief prompt | [`brief::run_sends_only_sanitized_text`](../crates/bookmarks-agent/src/brief.rs) |
+| Model failure falls back to local picks | [`brief::run_falls_back_when_model_fails`](../crates/bookmarks-agent/src/brief.rs) |
+| PII is stripped | [`sanitize::combined_pii_is_removed`](../crates/bookmarks-agent/src/sanitize.rs) |
+| Bookmarks are never deleted on a partial sync | [`ingest::partial_sync_never_removes`](../crates/bookmarks-agent/src/ingest.rs), [`merge::null_still_bookmarked_never_removes`](../crates/bookmarks-agent/src/merge.rs) |
+| OAuth callback state mismatch fails closed | [`callback::state_mismatch_fails_closed`](../crates/bookmarks-agent/src/callback.rs) |
+| Tokens are redacted in debug output | [`token_store::debug_redacts_token_values`](../crates/bookmarks-agent/src/token_store.rs) |
+| never_post hides one post, not its category | [`feedback::never_post_is_excluded_from_stats_and_blocking`](../crates/core/src/feedback.rs) |
+| Demo contains no private data | [`demo_runs_all_shots_deterministically_without_private_data`](../crates/demo-runner/tests/demo_script.rs) |
+| Eval output contains no ids, urls or text | [`eval` tests](../crates/eval) |
