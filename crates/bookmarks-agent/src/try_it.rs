@@ -12,6 +12,11 @@ use crate::fixture::Bookmark;
 use ancientos_core::log::{DecisionLog, Entry};
 use std::collections::BTreeSet;
 
+pub use ancientos_router::try_it_cascade::{
+    record_decision as record_decided, CascadeStage, TryItExplanation, DECIDED_KIND,
+    RULES_NO_CUES_REASON,
+};
+
 /// Log kind appended when the brief renders a tagged pick.
 pub const SHOWN_KIND: &str = "try_it.shown";
 /// Log kind appended by [`record_followup`].
@@ -26,10 +31,12 @@ pub const MAX_NOTE_CHARS: usize = 280;
 /// Maximum characters kept per extracted step.
 pub const MAX_STEP_CHARS: usize = 140;
 
-/// Tag attached to a hands-on post, with the human-readable reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Tag attached to a hands-on post, with the human-readable reason and
+/// the [`TryItExplanation`] behind it (rules stage, matched-cue text).
+#[derive(Debug, Clone, PartialEq)]
 pub struct TryItTag {
     pub reason: String,
+    pub explanation: TryItExplanation,
 }
 
 /// Answer to "did you try it?".
@@ -98,6 +105,36 @@ pub fn rules_confident(topic: &str, text: &str) -> bool {
 /// hydrated/expanded text rather than the stored excerpt).
 pub fn classify_text(topic: &str, text: &str) -> Option<TryItTag> {
     classify_with_media(topic, text, false)
+}
+
+/// Explain one bookmark's try-it decision: [`CascadeStage::TopicFilter`]
+/// when an excluded topic matches, [`CascadeStage::Rules`] with the
+/// matched-cue text when tagged, else [`CascadeStage::Rules`] with
+/// [`RULES_NO_CUES_REASON`]. Never fails.
+pub fn explain(b: &Bookmark) -> TryItExplanation {
+    let has_video = b
+        .media
+        .iter()
+        .any(|m| m.kind == "video" || m.kind == "animated_gif");
+    explain_with_media(&crate::brief::topic_of(b), &b.text, has_video)
+}
+
+/// Explain one classification from a topic and full text (see [`explain`]).
+/// Never fails.
+pub fn explain_text(topic: &str, text: &str) -> TryItExplanation {
+    explain_with_media(topic, text, false)
+}
+
+/// Explain one classification with the media cue (see [`explain`]).
+/// Never fails.
+pub fn explain_with_media(topic: &str, text: &str, has_video: bool) -> TryItExplanation {
+    if let Some(topic_id) = ancientos_router::topic_filter::excluded_topic(text) {
+        return TryItExplanation::topic_filter(topic_id);
+    }
+    if let Some(tag) = classify_with_media(topic, text, has_video) {
+        return tag.explanation;
+    }
+    TryItExplanation::rules(RULES_NO_CUES_REASON)
 }
 
 /// Deterministic rule set (broad cues; no single-post phrases):
@@ -182,8 +219,10 @@ pub fn classify_with_media(topic: &str, text: &str, has_video: bool) -> Option<T
     if video_demo {
         labels.push(if has_video { CUE_VIDEO } else { CUE_SHORT_DEMO });
     }
+    let reason = format!("{}; topic '{topic}'", labels.join(", "));
     Some(TryItTag {
-        reason: format!("{}; topic '{topic}'", labels.join(", ")),
+        explanation: TryItExplanation::rules(&reason),
+        reason,
     })
 }
 
@@ -2343,5 +2382,67 @@ mod tests {
             tagged_not_confident >= 2,
             "confidence must be strictly narrower than tagging"
         );
+    }
+
+    #[test]
+    fn tag_carries_rules_explanation_with_cue_text() {
+        let tag = classify_text(
+            "Health & Wellness",
+            "Try it: roll shoulders 10x, hold 20s each side.",
+        )
+        .unwrap();
+        assert_eq!(tag.explanation.stage, CascadeStage::Rules);
+        assert_eq!(tag.explanation.reason, tag.reason);
+        assert_eq!(tag.explanation.confidence, None);
+        assert!(
+            tag.reason.contains("topic 'Health & Wellness'"),
+            "{}",
+            tag.reason
+        );
+    }
+
+    #[test]
+    fn explain_covers_topic_filter_tagged_and_untagged() {
+        let filtered = explain_text(
+            "Health & Wellness",
+            "OpenClaw shoulder routine 1) roll 10x 2) hold 20s. Try it now.",
+        );
+        assert_eq!(filtered.stage, CascadeStage::TopicFilter);
+        assert_eq!(filtered.reason, "excluded topic 'openclaw'");
+        assert_eq!(filtered.confidence, None);
+        let tagged = explain_text(
+            "Health & Wellness",
+            "Try it: roll shoulders 10x, hold 20s each side.",
+        );
+        assert_eq!(tagged.stage, CascadeStage::Rules);
+        assert!(
+            tagged.reason.contains("explicit try-it"),
+            "{}",
+            tagged.reason
+        );
+        let plain = explain_text("News", "A quiet morning note about paper maps.");
+        assert_eq!(plain.stage, CascadeStage::Rules);
+        assert_eq!(plain.reason, RULES_NO_CUES_REASON);
+        assert_eq!(plain.confidence, None);
+    }
+
+    #[test]
+    fn record_decided_shape_has_no_post_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        let expl = explain_text(
+            "Health & Wellness",
+            "Try it: roll shoulders 10x, hold 20s each side.",
+        );
+        let entry = record_decided(&mut log, "syn-9", &expl).unwrap();
+        assert_eq!(entry.kind, DECIDED_KIND);
+        assert_eq!(DECIDED_KIND, "try_it.decided");
+        assert_eq!(entry.payload["post_id"], "syn-9");
+        assert_eq!(entry.payload["stage"], "rules");
+        assert_eq!(entry.payload["reason"], expl.reason);
+        let raw = entry.payload.to_string();
+        assert!(!raw.contains("shoulders 10x"), "{raw}");
+        assert!(record_decided(&mut log, "", &expl).is_err());
     }
 }

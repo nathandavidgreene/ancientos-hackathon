@@ -501,10 +501,11 @@ fn post_text_html(
     )
 }
 
-/// `[TRY IT]` section via the existing classifier and step extractor,
-/// scoring `text` (the English translation when available) with the media
-/// cue from `b`.
-fn try_it_html(b: &Bookmark, text: &str) -> String {
+/// Small badge for a tagged post: the deciding stage plus the reason as
+/// visible text and on hover (`title`). Empty when untagged. Every
+/// dynamic string is escaped. Args: the bookmark and its English text
+/// (the translation when available); returns the badge HTML; never fails.
+fn try_it_badge(b: &Bookmark, text: &str) -> String {
     let has_video = b
         .media
         .iter()
@@ -513,7 +514,23 @@ fn try_it_html(b: &Bookmark, text: &str) -> String {
     let Some(tag) = bookmarks_agent::try_it::classify_with_media(&topic, text, has_video) else {
         return String::new();
     };
-    let mut out = format!("<h2>[TRY IT] {}</h2>", escape(&tag.reason));
+    format!(
+        "<span class=\"badge-ok\" title=\"{}\">{}</span> {}",
+        escape(&tag.reason),
+        escape(tag.explanation.stage.as_str()),
+        escape(&tag.reason),
+    )
+}
+
+/// `[TRY IT]` section via the existing classifier and step extractor,
+/// scoring `text` (the English translation when available) with the media
+/// cue from `b`. Tagged posts show the stage badge plus steps.
+fn try_it_html(b: &Bookmark, text: &str) -> String {
+    let badge = try_it_badge(b, text);
+    if badge.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("<h2>[TRY IT] {badge}</h2>");
     let steps = bookmarks_agent::try_it::extract_steps(text);
     if steps.is_empty() {
         out.push_str("<p>No explicit steps found.</p>");
@@ -853,14 +870,26 @@ fn page_try(state: &State) -> Response {
         body.push_str("<p>No pending try-it follow-ups.</p>");
     }
     for id in pending {
-        let text = state
-            .bookmarks
-            .iter()
-            .find(|b| &b.post_id == id)
+        let bm = state.bookmarks.iter().find(|b| &b.post_id == id);
+        let text = bm
             .map(|b| post_text_html(b, &tcache))
             .unwrap_or_else(|| "<blockquote>(not in store)</blockquote>".to_string());
+        // The stage badge re-scores the stored post (English translation
+        // when available); posts missing from the store show no badge.
+        let badge = bm
+            .map(|b| {
+                let t = bookmarks_agent::translate::cached_only(b, &tcache);
+                let english = bookmarks_agent::translate::english_for(b, &t).to_string();
+                try_it_badge(b, &english)
+            })
+            .unwrap_or_default();
+        let badge = if badge.is_empty() {
+            String::new()
+        } else {
+            format!(" {badge}")
+        };
         body.push_str(&format!(
-            "<div class=\"card\"><p><strong>{}</strong></p>{}\
+            "<div class=\"card\"><p><strong>{}</strong>{}</p>{}\
              <form method=\"post\" action=\"/try\">\
              <input type=\"hidden\" name=\"post_id\" value=\"{}\">\
              <label><input type=\"radio\" name=\"tried\" value=\"yes\" checked> yes</label> \
@@ -868,6 +897,7 @@ fn page_try(state: &State) -> Response {
              <label><input type=\"radio\" name=\"tried\" value=\"later\"> later</label> \
              <button type=\"submit\">Record</button></form></div>",
             escape(id),
+            badge,
             text,
             escape(id),
         ));
@@ -2139,6 +2169,57 @@ mod tests {
     }
 
     #[test]
+    fn brief_try_it_badge_names_stage_with_reason_title_and_text() {
+        let (_dir, state) = test_state();
+        let resp = handle(&Request::get("/"), &state);
+        assert!(resp.body.contains("[TRY IT]"), "{}", resp.body);
+        // Badge: the stage is visible, the reason is visible and on `title`.
+        assert!(
+            resp.body.contains("<span class=\"badge-ok\" title=\""),
+            "{}",
+            resp.body
+        );
+        assert!(resp.body.contains(">rules</span>"), "{}", resp.body);
+        assert!(
+            resp.body.contains("topic &#39;Health &amp; Wellness&#39;"),
+            "escaped reason missing: {}",
+            resp.body
+        );
+        assert!(
+            !resp.body.contains("Health & Wellness"),
+            "unescaped reason leaked: {}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn try_it_badge_escapes_reason_html() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = bookmark(
+            "evil1",
+            "Try it: roll shoulders 10x, hold 20s each side.",
+            Some("<script>alert('x')</script>"),
+            Vec::new(),
+        );
+        std::fs::write(dir.path().join("store.jsonl"), row + "\n").unwrap();
+        let state = State::open(dir.path()).unwrap();
+        let resp = handle(&Request::get("/"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("[TRY IT]"), "{}", resp.body);
+        assert!(
+            !resp.body.contains("<script>alert"),
+            "raw reason HTML leaked: {}",
+            resp.body
+        );
+        assert!(
+            resp.body
+                .contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"),
+            "escaped reason missing: {}",
+            resp.body
+        );
+    }
+
+    #[test]
     fn vote_post_appends_to_log_and_redirects() {
         let (_dir, state) = test_state();
         let resp = handle(
@@ -2597,6 +2678,27 @@ mod tests {
         assert!(handle(&Request::get("/try"), &state)
             .body
             .contains("No pending"));
+    }
+
+    #[test]
+    fn try_page_shows_stage_badge_per_pending_post() {
+        let (_dir, state) = test_state();
+        // Rendering the brief marks the tagged pick shown (pending).
+        assert_eq!(handle(&Request::get("/"), &state).status, 200);
+        let resp = handle(&Request::get("/try"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("p1"), "{}", resp.body);
+        assert!(
+            resp.body.contains("<span class=\"badge-ok\" title=\""),
+            "badge missing: {}",
+            resp.body
+        );
+        assert!(resp.body.contains(">rules</span>"), "{}", resp.body);
+        assert!(
+            resp.body.contains("topic &#39;Health &amp; Wellness&#39;"),
+            "escaped reason missing: {}",
+            resp.body
+        );
     }
 
     #[test]

@@ -130,17 +130,198 @@ impl std::fmt::Display for CascadeStage {
     }
 }
 
-/// One item's decision: the answer, the stage that gave it, the backend
-/// error when the stage is [`CascadeStage::FailClosed`], and whether the
-/// Muse reply was length-truncated (empty/null content with `finish_reason`
-/// "length"). A truncation still fails closed exactly like any other error;
-/// the flag only records it distinctly instead of an ordinary Muse "no".
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why one post was (or was not) tagged try-it: the deciding stage, a
+/// human-readable reason, and the model score when the stage has one.
+/// Reasons never carry post text, secrets, or raw HTTP bodies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TryItExplanation {
+    pub stage: CascadeStage,
+    pub reason: String,
+    pub confidence: Option<f32>,
+}
+
+impl TryItExplanation {
+    /// Build an explanation directly (args: stage, reason, score; never fails).
+    pub fn new(stage: CascadeStage, reason: impl Into<String>, confidence: Option<f32>) -> Self {
+        Self {
+            stage,
+            reason: reason.into(),
+            confidence,
+        }
+    }
+
+    /// Stage 0 explanation: the excluded topic id (args: topic id; never fails).
+    pub fn topic_filter(topic_id: &str) -> Self {
+        Self {
+            stage: CascadeStage::TopicFilter,
+            reason: format!("excluded topic '{topic_id}'"),
+            confidence: None,
+        }
+    }
+
+    /// Rules-stage explanation: the matched-cue text from the local
+    /// classifier (args: cue text; never fails).
+    pub fn rules(matched_cues: &str) -> Self {
+        Self {
+            stage: CascadeStage::Rules,
+            reason: matched_cues.to_string(),
+            confidence: None,
+        }
+    }
+
+    /// Jev-stage explanation: the `noul` score and the threshold it cleared
+    /// (args: score, threshold; never fails).
+    pub fn jev(noul: f64, threshold: f64) -> Self {
+        Self {
+            stage: CascadeStage::Jev,
+            reason: format!("jev noul={noul:.2} >= {threshold:.2}"),
+            confidence: Some(noul as f32),
+        }
+    }
+
+    /// Muse-stage explanation: the model's own short reason when it gave
+    /// one (sanitized, capped), else what Muse answered (args: the answer
+    /// and the raw reason; never fails).
+    pub fn muse(answer: bool, raw_reason: Option<&str>) -> Self {
+        let reason = raw_reason
+            .map(sanitize_muse_reason)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if answer {
+                    "muse answered try_it=true".to_string()
+                } else {
+                    "muse answered try_it=false".to_string()
+                }
+            });
+        Self {
+            stage: CascadeStage::Muse,
+            reason,
+            confidence: None,
+        }
+    }
+
+    /// Fail-closed explanation: the error class only, never the message
+    /// body (args: the backend error; never fails).
+    pub fn fail_closed(error: &RouterError) -> Self {
+        Self {
+            stage: CascadeStage::FailClosed,
+            reason: fail_closed_reason(error),
+            confidence: None,
+        }
+    }
+}
+
+/// Decision-log kind for try-it decisions: `{post_id, stage, reason}`
+/// (never post text). Counted by `/stats` per stage.
+pub const DECIDED_KIND: &str = "try_it.decided";
+
+/// Maximum reason chars kept from a Muse reply (sanitized, one line).
+pub const MUSE_REASON_MAX_CHARS: usize = 160;
+
+/// Rules-stage fallback when the caller has no matched-cue text: a
+/// confident yes with no API call.
+pub const RULES_CONFIDENT_REASON: &str = "rules-confident yes";
+/// Rules-stage fallback when the local classifier found no cues.
+pub const RULES_NO_CUES_REASON: &str = "no try-it cues";
+
+/// Sanitize a free-form Muse reason for display and logging: redact
+/// secret-shaped values, drop URL/email/handle tokens, collapse to one
+/// line, and cap at [`MUSE_REASON_MAX_CHARS`] chars. Never fails.
+pub fn sanitize_muse_reason(raw: &str) -> String {
+    let redacted = ancientos_core::redact::redact_text(raw).text;
+    let kept: Vec<&str> = redacted
+        .split_whitespace()
+        .filter(|t| !is_url_or_email_token(t) && !is_handle_token(t))
+        .collect();
+    kept.join(" ")
+        .chars()
+        .take(MUSE_REASON_MAX_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+/// True for whitespace-separated tokens that are URLs or emails (dropped
+/// from Muse reasons so no hostname or address is logged).
+fn is_url_or_email_token(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    if lower.contains("://") || lower.starts_with("www.") {
+        return true;
+    }
+    let t = token.trim_matches(|c: char| {
+        c.is_ascii_punctuation() && c != '@' && c != '.' && c != '_' && c != '-' && c != '+'
+    });
+    let Some(at) = t.find('@') else {
+        return false;
+    };
+    t[at + 1..].contains('.')
+}
+
+/// True for `@handle` tokens (dropped from Muse reasons).
+fn is_handle_token(token: &str) -> bool {
+    let t = token.trim_start_matches(|c: char| {
+        c == '(' || c == '[' || c == '{' || c == '"' || c == '\'' || c == '<'
+    });
+    t.starts_with('@')
+        && t.chars()
+            .nth(1)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The error class of a backend failure for [`TryItExplanation`] reasons:
+/// `http status <code>` when the message carries one, else the variant
+/// name (`http error`, `bad response`, ...). Never the message body, so no
+/// secret or raw HTTP payload can leak into a reason or log entry.
+pub fn fail_closed_reason(error: &RouterError) -> String {
+    match error {
+        RouterError::MissingEnv(_) => "missing env".to_string(),
+        RouterError::NotImplemented(_) => "backend not implemented".to_string(),
+        RouterError::PaidCallsDisabled => "paid calls disabled".to_string(),
+        RouterError::Http(msg) => match http_status_of(msg) {
+            Some(code) => format!("http status {code}"),
+            None => "http error".to_string(),
+        },
+        RouterError::BadResponse(_) => "bad response".to_string(),
+        RouterError::Refused(_) => "refused".to_string(),
+        RouterError::EgressDenied { .. } => "egress denied".to_string(),
+    }
+}
+
+/// Append a [`DECIDED_KIND`] entry (`{post_id, stage, reason}`, never post
+/// text) for one try-it explanation. An empty post id is an error (fail
+/// closed); anything else appends and returns the entry.
+pub fn record_decision(
+    log: &mut DecisionLog,
+    post_id: &str,
+    explanation: &TryItExplanation,
+) -> Result<ancientos_core::log::Entry, String> {
+    if post_id.trim().is_empty() {
+        return Err("post id must be non-empty".to_string());
+    }
+    log.append(
+        DECIDED_KIND,
+        serde_json::json!({
+            "post_id": post_id,
+            "stage": explanation.stage.as_str(),
+            "reason": explanation.reason,
+        }),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// One item's decision: the answer, the stage that gave it, the
+/// [`TryItExplanation`] behind it, the backend error when the stage is
+/// [`CascadeStage::FailClosed`], and whether the Muse reply was
+/// length-truncated (empty/null content with `finish_reason` "length"). A
+/// truncation still fails closed exactly like any other error; the flag
+/// only records it distinctly instead of an ordinary Muse "no".
+#[derive(Debug, Clone, PartialEq)]
 pub struct CascadeDecision {
     pub try_it: bool,
     pub stage: CascadeStage,
     pub error: Option<String>,
     pub truncated: bool,
+    pub explanation: TryItExplanation,
 }
 
 impl CascadeDecision {
@@ -248,36 +429,57 @@ impl<'a> Cascade<'a> {
     /// Content above [`DataClass::Public`] never reaches the hosted stages:
     /// the refusal is logged as `router.egress_denied` (route `jev`, caller
     /// `cascade`) when `log` is given, and the rules verdict is returned.
-    // The log is lent to two sequential hosted calls; each `as_deref_mut`
-    // reborrow is required (a move would not compile) despite the lint name.
-    #[allow(clippy::needless_option_as_deref)]
+    /// Rules-stage reasons use [`RULES_CONFIDENT_REASON`]; callers with the
+    /// local classifier's matched-cue text use
+    /// [`decide_with_rules_reason`](Self::decide_with_rules_reason) instead.
     pub fn decide(
         &self,
         text: &str,
         class: DataClass,
         rules: RulesVerdict,
         stats: &mut CascadeStats,
+        log: Option<&mut DecisionLog>,
+    ) -> CascadeDecision {
+        self.decide_with_rules_reason(text, class, rules, None, stats, log)
+    }
+
+    /// Decide one item with the rules classifier's matched-cue text for the
+    /// rules-stage reason (`None` falls back to [`RULES_CONFIDENT_REASON`]).
+    /// Otherwise identical to [`decide`](Self::decide): never fails.
+    // The log is lent to two sequential hosted calls; each `as_deref_mut`
+    // reborrow is required (a move would not compile) despite the lint name.
+    #[allow(clippy::needless_option_as_deref)]
+    pub fn decide_with_rules_reason(
+        &self,
+        text: &str,
+        class: DataClass,
+        rules: RulesVerdict,
+        rules_reason: Option<&str>,
+        stats: &mut CascadeStats,
         mut log: Option<&mut DecisionLog>,
     ) -> CascadeDecision {
         // Stage 0: excluded topics are never try-it, with no API call —
         // before rules, so even a confident rules yes cannot tag them.
-        if excluded_topic(text).is_some() {
+        if let Some(topic) = excluded_topic(text) {
             stats.topic_filtered += 1;
             return CascadeDecision {
                 try_it: false,
                 stage: CascadeStage::TopicFilter,
                 error: None,
                 truncated: false,
+                explanation: TryItExplanation::topic_filter(topic),
             };
         }
         // Stage 1: confident rules answer yes with no API call.
         if rules == RulesVerdict::ConfidentYes {
             stats.rules_yes += 1;
+            let reason = rules_reason.unwrap_or(RULES_CONFIDENT_REASON);
             return CascadeDecision {
                 try_it: true,
                 stage: CascadeStage::Rules,
                 error: None,
                 truncated: false,
+                explanation: TryItExplanation::rules(reason),
             };
         }
         // Gates: both clients present, both paid-allowed, Public only.
@@ -285,14 +487,14 @@ impl<'a> Cascade<'a> {
         // A class refusal is logged (route jev: the first hosted stage that
         // would have run) but still returns the rules verdict, never an error.
         let (Some(jev), Some(muse)) = (self.jev, self.muse) else {
-            return rules_only(rules);
+            return rules_only(rules, "rules unsure (backend unavailable)");
         };
         if !jev.allow_paid() || !muse.allow_paid() {
-            return rules_only(rules);
+            return rules_only(rules, "rules unsure (paid off)");
         }
         if class > DataClass::Public {
             let _ = check_egress(class, Route::Jev, "cascade", log);
-            return rules_only(rules);
+            return rules_only(rules, "rules unsure (non-public)");
         }
         // Stage 2: Jev. Yes stops here; no falls through to Muse.
         stats.jev_calls += 1;
@@ -314,6 +516,7 @@ impl<'a> Cascade<'a> {
                             stage: CascadeStage::Jev,
                             error: None,
                             truncated: false,
+                            explanation: TryItExplanation::jev(p, self.jev_threshold),
                         };
                     }
                     Some(_) => {}
@@ -353,8 +556,8 @@ impl<'a> Cascade<'a> {
             first
         };
         match result {
-            Ok(reply) => match parse_muse_try_it(&reply.content) {
-                Some(answer) => {
+            Ok(reply) => match parse_muse_try_it_with_reason(&reply.content) {
+                Some((answer, reason)) => {
                     if answer {
                         stats.muse_yes += 1;
                     }
@@ -363,6 +566,7 @@ impl<'a> Cascade<'a> {
                         stage: CascadeStage::Muse,
                         error: None,
                         truncated: false,
+                        explanation: TryItExplanation::muse(answer, reason.as_deref()),
                     }
                 }
                 None => {
@@ -387,19 +591,22 @@ impl<'a> Cascade<'a> {
 }
 
 /// Rules-alone decision: no call was made, so no error is recorded.
-fn rules_only(rules: RulesVerdict) -> CascadeDecision {
+/// `reason` names why the paid stages did not run (gates off).
+fn rules_only(rules: RulesVerdict, reason: &str) -> CascadeDecision {
     CascadeDecision {
         try_it: rules.answer(),
         stage: CascadeStage::Rules,
         error: None,
         truncated: false,
+        explanation: TryItExplanation::rules(reason),
     }
 }
 
 /// Error fallback: rules verdict with the backend error recorded. A Muse
 /// truncation fails closed exactly like any other error; it is only
 /// additionally flagged on the decision and counted in
-/// [`CascadeStats::muse_truncated`].
+/// [`CascadeStats::muse_truncated`]. The explanation carries the error
+/// class only, never the message body.
 fn fail_closed(
     rules: RulesVerdict,
     stats: &mut CascadeStats,
@@ -411,11 +618,13 @@ fn fail_closed(
     if truncated {
         stats.muse_truncated += 1;
     }
+    let explanation = TryItExplanation::fail_closed(&error);
     CascadeDecision {
         try_it: rules.answer(),
         stage: CascadeStage::FailClosed,
         error: Some(error.to_string()),
         truncated,
+        explanation,
     }
 }
 
@@ -442,6 +651,8 @@ pub fn try_it_questions() -> serde_json::Value {
 
 /// Stage 3 prompt: strict JSON with the same try-it definition. The lead
 /// sentence states the yes signals explicitly; the full definition follows.
+/// An optional short `reason` string is accepted and surfaced (sanitized)
+/// in the decision explanation.
 pub fn muse_prompt(text: &str) -> String {
     format!(
         "Decide whether this X bookmark is try-it for the reader: hands-on practice to try now, \
@@ -449,13 +660,21 @@ pub fn muse_prompt(text: &str) -> String {
          something to hand off to an agent or bot to review or explore, \
          or learning content whose actionable thing is in the linked page or video. \
          Definition: {TRY_IT_INSTRUCTIONS} \
-         Reply with strict JSON {{\"try_it\":true}} or {{\"try_it\":false}} and nothing else.\n\nBookmark text: {text}"
+         Reply with strict JSON only: {{\"try_it\":true}} or {{\"try_it\":false}}, optionally with a short \"reason\" string (max 160 chars).\n\nBookmark text: {text}"
     )
 }
 
 /// Lenient strict-JSON parse: the first `{...}` substring (from any `{` to a
 /// later `}`) that parses with a boolean `try_it` field wins.
 pub fn parse_muse_try_it(content: &str) -> Option<bool> {
+    parse_muse_try_it_with_reason(content).map(|(answer, _)| answer)
+}
+
+/// Lenient strict-JSON parse with the optional `reason` string: the first
+/// `{...}` substring (from any `{` to a later `}`) that parses with a
+/// boolean `try_it` field wins, carrying its `reason` when it is a string.
+/// Callers sanitize the raw reason via [`TryItExplanation::muse`].
+pub fn parse_muse_try_it_with_reason(content: &str) -> Option<(bool, Option<String>)> {
     for (start, _) in content.match_indices('{') {
         for (end, _) in content.match_indices('}') {
             if end <= start {
@@ -463,7 +682,11 @@ pub fn parse_muse_try_it(content: &str) -> Option<bool> {
             }
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content[start..=end]) {
                 if let Some(answer) = value.get("try_it").and_then(|v| v.as_bool()) {
-                    return Some(answer);
+                    let reason = value
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    return Some((answer, reason));
                 }
             }
         }
@@ -717,6 +940,7 @@ mod tests {
                 stage: CascadeStage::Rules,
                 error: None,
                 truncated: false,
+                explanation: TryItExplanation::rules(RULES_CONFIDENT_REASON),
             }
         );
         assert_eq!(stats.rules_yes, 1);
@@ -1531,9 +1755,12 @@ mod tests {
         let muse = muse_client(muse_url, true);
         let cascade = Cascade::new(Some(&jev), Some(&muse));
         let mut stats = zero_stats();
-        for text in [
-            "OpenClaw setup you can try now: 1) install 2) run it",
-            "Try this Hermes Agent quickstart today",
+        for (text, topic) in [
+            (
+                "OpenClaw setup you can try now: 1) install 2) run it",
+                "openclaw",
+            ),
+            ("Try this Hermes Agent quickstart today", "hermes"),
         ] {
             for rules in [RulesVerdict::Unsure, RulesVerdict::ConfidentYes] {
                 let d = cascade.decide(text, DataClass::Public, rules, &mut stats, None);
@@ -1544,6 +1771,7 @@ mod tests {
                         stage: CascadeStage::TopicFilter,
                         error: None,
                         truncated: false,
+                        explanation: TryItExplanation::topic_filter(topic),
                     },
                     "text {text:?} rules {rules:?}"
                 );
@@ -1720,5 +1948,257 @@ mod tests {
         assert_eq!(entries[0].kind, crate::data_class::EGRESS_ALLOWED_KIND);
         assert_eq!(entries[0].payload["class"], "public");
         assert_eq!(entries[0].payload["route"], "jev");
+    }
+
+    #[test]
+    fn explanations_name_stage_reason_and_score() {
+        let cascade = Cascade::new(None, None);
+        let mut stats = zero_stats();
+        // Topic filter: the excluded topic id, no score.
+        let d = cascade.decide(
+            "OpenClaw quickstart",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        assert_eq!(d.explanation.stage, CascadeStage::TopicFilter);
+        assert_eq!(d.explanation.reason, "excluded topic 'openclaw'");
+        assert_eq!(d.explanation.confidence, None);
+        // Confident rules without cue text: the fallback reason, no score.
+        let d = cascade.decide(
+            "plain post",
+            DataClass::Public,
+            RulesVerdict::ConfidentYes,
+            &mut stats,
+            None,
+        );
+        assert_eq!(d.explanation.stage, CascadeStage::Rules);
+        assert_eq!(d.explanation.reason, RULES_CONFIDENT_REASON);
+        assert_eq!(d.explanation.confidence, None);
+        // Confident rules with cue text: the cue text wins.
+        let d = cascade.decide_with_rules_reason(
+            "plain post",
+            DataClass::Public,
+            RulesVerdict::ConfidentYes,
+            Some("practice cue; topic 'Health & Wellness'"),
+            &mut stats,
+            None,
+        );
+        assert_eq!(d.explanation.stage, CascadeStage::Rules);
+        assert_eq!(
+            d.explanation.reason,
+            "practice cue; topic 'Health & Wellness'"
+        );
+        assert_eq!(d.explanation.confidence, None);
+        // Gates-off rules: the gate that stopped the paid stages.
+        let d = cascade.decide(
+            "plain post",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        assert_eq!(d.explanation.stage, CascadeStage::Rules);
+        assert_eq!(d.explanation.reason, "rules unsure (backend unavailable)");
+        let jev = jev_client(closed_url(), false);
+        let muse = muse_client(closed_url(), true);
+        let gated = Cascade::new(Some(&jev), Some(&muse));
+        let d = gated.decide(
+            "plain post",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        assert_eq!(d.explanation.reason, "rules unsure (paid off)");
+        let jev = jev_client(closed_url(), true);
+        let muse = muse_client(closed_url(), true);
+        let gated = Cascade::new(Some(&jev), Some(&muse));
+        let d = gated.decide(
+            "private",
+            DataClass::Confidential,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        assert_eq!(d.explanation.reason, "rules unsure (non-public)");
+    }
+
+    #[test]
+    fn jev_explanation_shows_score_and_threshold() {
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.9));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(closed_url(), true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse)).with_jev_threshold(0.3);
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "stretch now",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        jev_handle.join().expect("server thread");
+        assert_eq!(d.explanation.stage, CascadeStage::Jev);
+        assert_eq!(d.explanation.reason, "jev noul=0.90 >= 0.30");
+        assert_eq!(d.explanation.confidence, Some(0.9f32));
+    }
+
+    #[test]
+    fn muse_explanation_uses_sanitized_capped_reason() {
+        // With a model reason: surfaced, one line.
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+        let (muse_url, _, muse_handle) = mock_server(
+            200,
+            &muse_body("{\"try_it\":true,\"reason\":\"hands-on  routine\\nwith steps\"}"),
+        );
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "desk routine",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        jev_handle.join().expect("server thread");
+        muse_handle.join().expect("server thread");
+        assert_eq!(d.explanation.stage, CascadeStage::Muse);
+        assert_eq!(d.explanation.reason, "hands-on routine with steps");
+        assert_eq!(d.explanation.confidence, None);
+        // Without a model reason: what Muse answered.
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+        let (muse_url, _, muse_handle) = mock_server(200, &muse_body("{\"try_it\":false}"));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "desk routine",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        jev_handle.join().expect("server thread");
+        muse_handle.join().expect("server thread");
+        assert_eq!(d.explanation.reason, "muse answered try_it=false");
+        // Long reasons cap at 160 chars.
+        let long = "w ".repeat(200);
+        let capped = sanitize_muse_reason(&long);
+        assert!(capped.chars().count() <= MUSE_REASON_MAX_CHARS);
+        assert_eq!(MUSE_REASON_MAX_CHARS, 160);
+    }
+
+    #[test]
+    fn muse_reason_never_carries_secrets_or_links() {
+        let token = format!("ghp_{}", "C".repeat(36));
+        let raw = format!(
+            "rotate {token} now see https://example.invalid/x mail a@b.example @syn_user ok"
+        );
+        let clean = sanitize_muse_reason(&raw);
+        assert!(!clean.contains(&token), "{clean}");
+        assert!(!clean.contains("https://"), "{clean}");
+        assert!(!clean.contains("a@b.example"), "{clean}");
+        assert!(!clean.contains("@syn_user"), "{clean}");
+        assert!(clean.contains("[redacted:github_token]"), "{clean}");
+        assert!(clean.contains("ok"), "{clean}");
+        // A reason that is only a link degrades to the default, never empty.
+        let expl = TryItExplanation::muse(true, Some("https://example.invalid/x"));
+        assert_eq!(expl.reason, "muse answered try_it=true");
+    }
+
+    #[test]
+    fn muse_reason_parse_matrix() {
+        assert_eq!(
+            parse_muse_try_it_with_reason("{\"try_it\":true,\"reason\":\"steps\"}"),
+            Some((true, Some("steps".to_string())))
+        );
+        assert_eq!(
+            parse_muse_try_it_with_reason("{\"try_it\":false}"),
+            Some((false, None))
+        );
+        assert_eq!(
+            parse_muse_try_it_with_reason("{\"try_it\":true,\"reason\":42}"),
+            Some((true, None))
+        );
+        assert_eq!(parse_muse_try_it_with_reason("no json here"), None);
+        // The legacy parser ignores the reason field.
+        assert_eq!(
+            parse_muse_try_it("{\"try_it\":true,\"reason\":\"steps\"}"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn fail_closed_explanation_is_error_class_only() {
+        for (error, want) in [
+            (
+                RouterError::Http("http status 429: {\"detail\":\"slow\"}".into()),
+                "http status 429",
+            ),
+            (
+                RouterError::Http("http status 500: tokenizer exploded".into()),
+                "http status 500",
+            ),
+            (RouterError::Http("connection refused".into()), "http error"),
+            (
+                RouterError::BadResponse("muse reply is not strict try_it JSON: nope".into()),
+                "bad response",
+            ),
+            (RouterError::PaidCallsDisabled, "paid calls disabled"),
+            (RouterError::MissingEnv("TYPESAFE_API_KEY"), "missing env"),
+            (
+                RouterError::Refused("JEV_BACKEND=auto needs more".into()),
+                "refused",
+            ),
+        ] {
+            let expl = TryItExplanation::fail_closed(&error);
+            assert_eq!(expl.stage, CascadeStage::FailClosed);
+            assert_eq!(expl.reason, want, "error {error:?}");
+            assert_eq!(expl.confidence, None);
+        }
+        // End to end: a 500 with a body fails closed without the body.
+        let (jev_url, _, jev_handle) =
+            mock_server_seq(vec![(500, "{\"detail\":\"synthetic boom\"}".to_string())]);
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(closed_url(), true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "stretch now",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        jev_handle.join().expect("server thread");
+        assert_eq!(d.stage, CascadeStage::FailClosed);
+        assert_eq!(d.explanation.reason, "http status 500");
+        assert!(
+            !d.explanation.reason.contains("boom"),
+            "{}",
+            d.explanation.reason
+        );
+    }
+
+    #[test]
+    fn record_decision_shape_has_no_post_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        let expl = TryItExplanation::jev(0.9, 0.3);
+        let entry = record_decision(&mut log, "syn-1", &expl).unwrap();
+        assert_eq!(entry.kind, DECIDED_KIND);
+        assert_eq!(DECIDED_KIND, "try_it.decided");
+        assert_eq!(entry.payload["post_id"], "syn-1");
+        assert_eq!(entry.payload["stage"], "jev");
+        assert_eq!(entry.payload["reason"], "jev noul=0.90 >= 0.30");
+        let raw = entry.payload.to_string();
+        assert!(!raw.contains("stretch"), "{raw}");
+        assert!(record_decision(&mut log, "  ", &expl).is_err());
     }
 }

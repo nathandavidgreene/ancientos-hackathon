@@ -19,9 +19,9 @@ pub const MUSE_LOG_FALLBACK_ENV_VAR: &str = "MUSE_LOG";
 pub const MUSE_LOG_DEFAULT_PATH: &str = "docs/muse-code-log.md";
 
 /// Decision-log kinds counted as try-it cascade decisions. Any entry whose
-/// kind contains `cascade` with a `stage` payload field is counted; these
-/// are the kinds a producer would use, but the match is the substring so
-/// future kinds keep working.
+/// kind contains `cascade` with a `stage` payload field is counted, plus
+/// [`crate::try_it::DECIDED_KIND`] (`try_it.decided`, which carries no
+/// `cascade` substring); unknown stages are ignored.
 pub const CASCADE_KIND_SUBSTR: &str = "cascade";
 
 /// Cascade stages in display order (matching
@@ -468,13 +468,14 @@ fn try_it_counts(log: &DecisionLog, entries: &[Entry]) -> TryItCounts {
 }
 
 /// Count cascade decisions by stage over entries whose kind contains
-/// [`CASCADE_KIND_SUBSTR`] with a `stage` payload that [`normalize_stage`]
-/// accepts. Args: verified log entries; returns `Some` counts, or `None`
-/// when no cascade decisions are logged; never fails.
+/// [`CASCADE_KIND_SUBSTR`] (or equals [`crate::try_it::DECIDED_KIND`])
+/// with a `stage` payload that [`normalize_stage`] accepts. Args:
+/// verified log entries; returns `Some` counts, or `None` when no cascade
+/// decisions are logged; never fails.
 fn cascade_counts(entries: &[Entry]) -> Option<CascadeCounts> {
     let mut out = CascadeCounts::default();
     for e in entries {
-        if !e.kind.contains(CASCADE_KIND_SUBSTR) {
+        if !e.kind.contains(CASCADE_KIND_SUBSTR) && e.kind != crate::try_it::DECIDED_KIND {
             continue;
         }
         let Some(stage) = e.payload.get("stage").and_then(|v| v.as_str()) else {
@@ -799,5 +800,55 @@ mod tests {
         assert!(text.contains("broken at line 0"), "{text}");
         assert!(text.contains("approvals: withheld"), "{text}");
         assert!(!text.contains("verified"), "{text}");
+    }
+
+    #[test]
+    fn decided_entries_count_by_stage_alongside_cascade_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("decision_log.jsonl");
+        let mut open = DecisionLog::open(&log).unwrap();
+        for (post_id, stage) in [
+            ("syn-1", "rules"),
+            ("syn-2", "jev"),
+            ("syn-3", "muse"),
+            ("syn-4", "topic_filter"),
+            ("syn-5", "fail_closed"),
+        ] {
+            open.append(
+                crate::try_it::DECIDED_KIND,
+                serde_json::json!({
+                    "post_id": post_id,
+                    "stage": stage,
+                    "reason": "synthetic reason",
+                }),
+            )
+            .unwrap();
+        }
+        open.append(
+            "try_it.cascade",
+            serde_json::json!({"post_id": "syn-6", "stage": "rules"}),
+        )
+        .unwrap();
+        // Unknown stages and unrelated kinds never count.
+        open.append(
+            crate::try_it::DECIDED_KIND,
+            serde_json::json!({"post_id": "syn-7", "stage": "nope"}),
+        )
+        .unwrap();
+        open.append("brief.pick", serde_json::json!({"stage": "rules"}))
+            .unwrap();
+        drop(open);
+        let muse = dir.path().join("missing.md");
+        let s = collect(&log, &muse, 1_700_000_000);
+        let c = s.cascade.expect("decisions logged");
+        assert_eq!(
+            (c.topic_filter, c.rules, c.jev, c.muse, c.fail_closed),
+            (1, 2, 1, 1, 1)
+        );
+        let text = render_text(&s);
+        assert!(
+            text.contains("cascade: topic_filter=1 rules=2 jev=1 muse=1 fail_closed=1"),
+            "{text}"
+        );
     }
 }

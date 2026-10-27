@@ -372,6 +372,14 @@ fn run(args: &Args) -> Result<(), String> {
         } else {
             RulesVerdict::Unsure
         };
+        // Matched-cue text for the rules-stage reason (confident posts
+        // always carry a tag, since confidence implies tagging).
+        let rules_reason = if confident {
+            bookmarks_agent::try_it::classify_text(&topic_of(bookmark), &scoring_text)
+                .map(|tag| tag.reason)
+        } else {
+            None
+        };
         // With --enrich, the cascade (topic filter, Jev, Muse) decides on
         // the sanitized post text plus linked/media context. Non-public
         // bookmarks keep their enrichment local-only: `cascade_input`
@@ -399,7 +407,14 @@ fn run(args: &Args) -> Result<(), String> {
             let class = bookmarks_agent::translate::class_of(&scoring_text);
             (scoring_text.into_owned(), class)
         };
-        let decision = cascade.decide(&cascade_text, class, verdict, &mut stats, None);
+        let decision = cascade.decide_with_rules_reason(
+            &cascade_text,
+            class,
+            verdict,
+            rules_reason.as_deref(),
+            &mut stats,
+            None,
+        );
         cascade_pairs.push((label.try_it, decision.try_it));
         rules_pairs.push((label.try_it, confident));
         rows.push(serde_json::json!({
@@ -407,6 +422,7 @@ fn run(args: &Args) -> Result<(), String> {
             "actual": label.try_it,
             "predicted": decision.try_it,
             "stage": decision.stage.as_str(),
+            "reason": decision.explanation.reason,
             "rules_confident": confident,
             "truncated": decision.truncated,
             "error": decision.error,

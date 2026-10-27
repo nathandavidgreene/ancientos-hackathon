@@ -506,8 +506,14 @@ pub fn render_markdown(
                 .as_deref()
                 .map(|a| format!("@{a}"))
                 .unwrap_or_else(|| "unknown".to_string());
-            let tagged = crate::try_it::classify_text(&p.topic, english_for_try_it(p)).is_some();
-            let marker = if tagged { " [TRY IT]" } else { "" };
+            let tag = crate::try_it::classify_text(&p.topic, english_for_try_it(p));
+            let marker = match &tag {
+                Some(t) => format!(
+                    " [TRY IT] (decided by {}: {})",
+                    t.explanation.stage, t.explanation.reason
+                ),
+                None => String::new(),
+            };
             md.push_str(&format!(
                 "## {}. **{}**{marker}\n- Author: {}\n- Topic: {}\n- Link: {}\n\n{}\n\n",
                 i + 1,
@@ -517,7 +523,7 @@ pub fn render_markdown(
                 p.url,
                 render_pick_text(p)
             ));
-            if tagged {
+            if tag.is_some() {
                 let steps = crate::try_it::extract_steps(english_for_try_it(p));
                 if !steps.is_empty() {
                     md.push_str("**Steps**\n");
@@ -1019,12 +1025,21 @@ fn run_impl(
         serde_json::json!({"requested": requested, "hydrated": hydrated}),
     )
     .map_err(|e| e.to_string())?;
-    // Tag hands-on picks for follow-up: one `try_it.shown` entry per
-    // rendered tagged pick (post id plus timestamp, never text).
-    // Classification scores the English translation when available.
+    // Decide try-it for every pick: one `try_it.decided` entry per pick
+    // (post id, stage, reason; never text) so `/stats` can count stages,
+    // plus one `try_it.shown` entry per rendered tagged pick (post id plus
+    // timestamp, never text). Classification scores the English
+    // translation when available.
     let shown_at = now_secs;
     for p in &picks {
-        if crate::try_it::classify_text(&p.topic, english_for_try_it(p)).is_some() {
+        let english = english_for_try_it(p);
+        let tag = crate::try_it::classify_text(&p.topic, english);
+        let explanation = match &tag {
+            Some(t) => t.explanation.clone(),
+            None => crate::try_it::explain_text(&p.topic, english),
+        };
+        crate::try_it::record_decided(&mut log, &p.post_id, &explanation)?;
+        if tag.is_some() {
             crate::try_it::record_shown(&mut log, &p.post_id, shown_at)?;
         }
     }
@@ -1373,7 +1388,9 @@ mod tests {
 
         let log = DecisionLog::open(&log_path).unwrap();
         let entries = log.verify().unwrap();
-        assert_eq!(entries.len(), 1 + 1 + 1 + 3 + 1);
+        // candidates + ranker + model_call + 3 picks + hydrate + 3 decided
+        // (one `try_it.decided` per pick; no `try_it.shown`: untagged texts).
+        assert_eq!(entries.len(), 1 + 1 + 1 + 3 + 1 + 3);
         assert_eq!(entries[0].kind, "brief.candidates");
         assert_eq!(entries[0].payload["count"], 4);
         assert_eq!(entries[1].kind, crate::ranker::INACTIVE_KIND);
@@ -1668,6 +1685,117 @@ mod tests {
     }
 
     #[test]
+    fn render_markdown_names_try_it_stage_and_reason() {
+        let counts = MergeCounts {
+            live: 1,
+            fixture: 0,
+            overlap: 0,
+            total: 1,
+            high_confidence: 0,
+        };
+        let pick = BriefPick {
+            index: 1,
+            post_id: "syn-try".into(),
+            author: Some("syn_user".into()),
+            url: "https://x.com/i/status/syn-try".into(),
+            topic: "Health & Wellness".into(),
+            why: "synthetic why".into(),
+            full_text: "Try it: roll shoulders 10x, hold 20s each side.".into(),
+            media: Vec::new(),
+            translation: None,
+        };
+        let md = render_markdown(
+            "2026-10-26",
+            std::slice::from_ref(&pick),
+            &counts,
+            "local",
+            None,
+        );
+        assert!(
+            md.contains("[TRY IT] (decided by rules: explicit try-it"),
+            "{md}"
+        );
+        assert!(md.contains("topic 'Health & Wellness'"), "{md}");
+        let plain = BriefPick {
+            full_text: "A quiet morning note about paper maps.".into(),
+            topic: "News".into(),
+            ..pick
+        };
+        let md = render_markdown(
+            "2026-10-26",
+            std::slice::from_ref(&plain),
+            &counts,
+            "local",
+            None,
+        );
+        assert!(!md.contains("[TRY IT]"), "{md}");
+        assert!(!md.contains("decided by"), "{md}");
+    }
+
+    #[test]
+    fn run_logs_one_decided_entry_per_pick_without_text() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
+        let mut tagged = bm("tag1", None, Some("Health & Wellness"), None);
+        tagged.text = "Try it: roll shoulders 10x, hold 20s each side.".into();
+        let plain = bm("plain1", None, Some("News"), None);
+        let merged = merged_of(vec![tagged, plain], &["tag1", "plain1"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("decision_log.jsonl");
+        let res = run_local_full(
+            &merged,
+            &log_path,
+            "2026-10-26",
+            None,
+            None,
+            true,
+            None,
+            1_700_000_000,
+        )
+        .unwrap();
+        assert!(
+            res.markdown.contains("[TRY IT] (decided by rules:"),
+            "{}",
+            res.markdown
+        );
+        let log = DecisionLog::open(&log_path).unwrap();
+        let entries = log.verify().unwrap();
+        let decided: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == crate::try_it::DECIDED_KIND)
+            .collect();
+        assert_eq!(decided.len(), res.picks.len());
+        for e in &decided {
+            assert!(e.payload.get("post_id").and_then(|v| v.as_str()).is_some());
+            assert!(e.payload.get("stage").and_then(|v| v.as_str()).is_some());
+            assert!(e.payload.get("reason").and_then(|v| v.as_str()).is_some());
+            let raw = e.payload.to_string();
+            assert!(!raw.contains("shoulders 10x"), "{raw}");
+            assert!(!raw.contains("synthetic text"), "{raw}");
+        }
+        let tagged_entry = decided
+            .iter()
+            .find(|e| e.payload["post_id"] == "tag1")
+            .expect("tagged pick decided");
+        assert_eq!(tagged_entry.payload["stage"], "rules");
+        assert!(
+            tagged_entry.payload["reason"]
+                .as_str()
+                .unwrap()
+                .contains("explicit try-it"),
+            "{}",
+            tagged_entry.payload
+        );
+        // The tagged pick is also shown for follow-up.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.kind == crate::try_it::SHOWN_KIND && e.payload["post_id"] == "tag1"),
+            "shown entry missing"
+        );
+    }
+
+    #[test]
     fn hydrate_called_at_most_once_for_truncated_picks() {
         // Hermetic: paid off so liveness skips with no network.
         let _env = crate::test_support::EnvHold::paid_off();
@@ -1896,12 +2024,14 @@ mod tests {
         assert!(!res.markdown.contains("status/id0"), "{}", res.markdown);
         assert!(!res.markdown.contains("status/id2"), "{}", res.markdown);
         // No log entry for the filtering itself (candidates/model/picks
-        // plus the one ranker outcome entry only).
+        // plus the one ranker outcome entry, plus one `try_it.decided`
+        // per pick).
         let log = DecisionLog::open(&log_path).unwrap();
         let entries = log.verify().unwrap();
         assert!(entries.iter().all(|e| e.kind.starts_with("brief.")
             || e.kind == "feedback"
-            || e.kind.starts_with("ranker.")));
+            || e.kind.starts_with("ranker.")
+            || e.kind == crate::try_it::DECIDED_KIND));
     }
 
     #[test]
