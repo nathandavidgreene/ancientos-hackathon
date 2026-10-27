@@ -25,6 +25,11 @@ pub struct Media {
     pub video_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alt_text: Option<String>,
+    /// Caption/subtitle track URL for videos, when the stored data carries
+    /// one. `None` for old stores and fixtures. Read by
+    /// [`crate::link_context`]; fetching it never calls the X API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_url: Option<String>,
 }
 
 /// Accept only https URLs on X's media hosts, with no userinfo or port.
@@ -76,6 +81,24 @@ fn clean_alt(s: &str) -> Option<String> {
         .collect();
     let flat = flat.trim().to_string();
     (!flat.is_empty()).then_some(flat)
+}
+
+/// Keep a caption/subtitle track URL for storage: trimmed http(s) only,
+/// length-capped, with no whitespace or control characters. Full validation
+/// happens at fetch time in [`crate::link_context`]; this only drops
+/// obviously unusable values. Anything else is `None` (fail closed).
+fn clean_caption_url(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 2048 {
+        return None;
+    }
+    if !(s.starts_with("http://") || s.starts_with("https://")) {
+        return None;
+    }
+    if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 /// Sanitize a media kind for storage and display: lowercase ASCII
@@ -171,6 +194,10 @@ fn parse_one(m: &serde_json::Value) -> Option<Media> {
             .get("alt_text")
             .and_then(|v| v.as_str())
             .and_then(clean_alt),
+        caption_url: m
+            .get("caption_url")
+            .and_then(|v| v.as_str())
+            .and_then(clean_caption_url),
     };
     (media.url.is_some() || media.preview_url.is_some() || media.video_url.is_some())
         .then_some(media)
@@ -330,6 +357,7 @@ mod tests {
             preview_url: None,
             video_url: None,
             alt_text: None,
+            caption_url: None,
         }];
         assert_eq!(render_markdown(&tampered), "");
         assert_eq!(render_markdown(&[]), "");
@@ -341,8 +369,55 @@ mod tests {
             serde_json::from_str(r#"{"kind":"photo","url":"https://pbs.twimg.com/a.jpg"}"#)
                 .unwrap();
         assert!(m.video_url.is_none());
+        assert!(m.caption_url.is_none());
         let s = serde_json::to_string(&m).unwrap();
         assert!(!s.contains("video_url"));
+        assert!(!s.contains("caption_url"));
+    }
+
+    #[test]
+    fn caption_url_kept_when_usable_else_dropped() {
+        let v = json!({
+            "media_key": "k",
+            "type": "video",
+            "preview_image_url": "https://pbs.twimg.com/thumb/synthetic.jpg",
+            "variants": [
+                {"content_type": "video/mp4", "bit_rate": 500000, "url": "https://video.twimg.com/synthetic.mp4"},
+            ],
+            "caption_url": "https://video.twimg.com/synthetic.vtt",
+        });
+        let m = parse_one(&v).unwrap();
+        assert_eq!(
+            m.caption_url.as_deref(),
+            Some("https://video.twimg.com/synthetic.vtt")
+        );
+        for bad in [
+            "",
+            "  ",
+            "ftp://example.invalid/a.vtt",
+            "javascript:alert(1)",
+        ] {
+            let v = json!({
+                "media_key": "k",
+                "type": "video",
+                "preview_image_url": "https://pbs.twimg.com/thumb/synthetic.jpg",
+                "variants": [
+                    {"content_type": "video/mp4", "bit_rate": 500000, "url": "https://video.twimg.com/synthetic.mp4"},
+                ],
+                "caption_url": bad,
+            });
+            assert_eq!(parse_one(&v).unwrap().caption_url, None, "{bad:?}");
+        }
+        // Missing key stays missing.
+        let v = json!({
+            "media_key": "k",
+            "type": "video",
+            "preview_image_url": "https://pbs.twimg.com/thumb/synthetic.jpg",
+            "variants": [
+                {"content_type": "video/mp4", "bit_rate": 500000, "url": "https://video.twimg.com/synthetic.mp4"},
+            ],
+        });
+        assert_eq!(parse_one(&v).unwrap().caption_url, None);
     }
 
     #[test]
@@ -379,6 +454,7 @@ mod tests {
             preview_url: None,
             video_url: None,
             alt_text: None,
+            caption_url: None,
         }];
         let md = render_markdown(&video_like);
         assert!(md.contains("- Media (video):"), "{md}");

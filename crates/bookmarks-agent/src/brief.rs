@@ -894,6 +894,7 @@ mod tests {
             // Synthetic English posts: a determined code keeps brief tests
             // hermetic (translation behavior is covered by its own tests).
             lang: Some("en".to_string()),
+            urls: Vec::new(),
         }
     }
 
@@ -1316,6 +1317,7 @@ mod tests {
                 preview_url: None,
                 video_url: None,
                 alt_text: Some("synthetic alt".into()),
+                caption_url: None,
             }],
             translation: None,
         };

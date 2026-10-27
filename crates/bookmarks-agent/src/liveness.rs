@@ -354,6 +354,7 @@ mod tests {
             had_note_tweet: false,
             media: Vec::new(),
             lang: None,
+            urls: Vec::new(),
         }
     }
 

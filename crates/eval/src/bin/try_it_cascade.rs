@@ -19,6 +19,15 @@
 //! `ANCIENTOS_JEV_TRY_IT_THRESHOLD` when set (see
 //! [`jev_threshold_from_env`]), and `--jev-threshold <f>` overrides both.
 //! The summary prints the threshold actually used.
+//!
+//! `--enrich` (default off) enriches each bookmark with linked-page text
+//! and media context (see `bookmarks_agent::link_context`) before the
+//! cascade decides: cascade input becomes post text plus
+//! `"\n\nLinked/Media context:\n"` plus the enrichment, so topic filtering
+//! and the paid stages all see it. Fetches need `ANCIENTOS_FETCH_LINKS=1`
+//! and reuse the on-disk link cache (saved after the run); without the
+//! opt-in nothing is fetched and nothing is appended. The summary reports
+//! an `enriched` count.
 use ancientos_router::jev_client::JevClient;
 use ancientos_router::muse::MuseClient;
 use ancientos_router::try_it_cascade::{
@@ -31,8 +40,7 @@ use bookmarks_agent::try_it::rules_confident;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const USAGE: &str =
-    "usage: try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>] [--jev-threshold <f>]";
+const USAGE: &str = "usage: try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>] [--jev-threshold <f>] [--enrich]";
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -57,6 +65,7 @@ struct Args {
     bookmarks: PathBuf,
     out: Option<PathBuf>,
     jev_threshold: Option<f64>,
+    enrich: bool,
 }
 
 /// Parse argv. Unknown or repeated flags, missing values, missing required
@@ -67,14 +76,23 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut bookmarks = None;
     let mut out = None;
     let mut jev_threshold = None;
+    let mut enrich = false;
     let mut i = 1;
     while i < argv.len() {
         let flag = argv[i].as_str();
         if !matches!(
             flag,
-            "--labels" | "--bookmarks" | "--out" | "--jev-threshold"
+            "--labels" | "--bookmarks" | "--out" | "--jev-threshold" | "--enrich"
         ) {
             return Err(format!("unknown argument: {flag}"));
+        }
+        if flag == "--enrich" {
+            if enrich {
+                return Err(format!("repeated argument: {flag}"));
+            }
+            enrich = true;
+            i += 1;
+            continue;
         }
         let value = argv
             .get(i + 1)
@@ -102,6 +120,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         bookmarks: bookmarks.ok_or_else(|| "missing --bookmarks <jsonl>".to_string())?,
         out,
         jev_threshold,
+        enrich,
     })
 }
 
@@ -285,6 +304,30 @@ fn run(args: &Args) -> Result<(), String> {
     };
     let tcache = bookmarks_agent::translate::load_cache(&tcache_path);
 
+    // Link-context cache for --enrich: $LINK_CONTEXT_CACHE_PATH when set,
+    // else link_context_cache.json next to the bookmarks file. Loaded here,
+    // saved after the run; fetches reuse it so reruns make no new calls.
+    let lcache_path = if args.enrich {
+        let path = match std::env::var(bookmarks_agent::link_context::CACHE_ENV_VAR)
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            Some(p) => PathBuf::from(p),
+            None => args
+                .bookmarks
+                .parent()
+                .map(|d| d.join(bookmarks_agent::link_context::CACHE_FILE_NAME))
+                .unwrap_or_else(|| PathBuf::from(bookmarks_agent::link_context::CACHE_FILE_NAME)),
+        };
+        Some(path)
+    } else {
+        None
+    };
+    let mut lcache = lcache_path
+        .as_ref()
+        .map(|p| bookmarks_agent::link_context::load_cache(p))
+        .unwrap_or_default();
+
     let mut stats = CascadeStats::default();
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut cascade_pairs: Vec<(bool, bool)> = Vec::new();
@@ -292,6 +335,7 @@ fn run(args: &Args) -> Result<(), String> {
     let mut missing = 0usize;
     let mut translated = 0usize;
     let mut untranslated = 0usize;
+    let mut enriched = 0usize;
     let mut stopped_early = false;
     for label in &labels {
         let Some(bookmark) = bookmarks.get(&label.id) else {
@@ -323,7 +367,20 @@ fn run(args: &Args) -> Result<(), String> {
         } else {
             RulesVerdict::Unsure
         };
-        let decision = cascade.decide(&scoring_text, Sensitivity::Sanitized, verdict, &mut stats);
+        // With --enrich, the cascade (topic filter, Jev, Muse) decides on
+        // the post text plus linked/media context. Private bookmarks keep
+        // their enrichment local-only: `cascade_input` withholds it, so it
+        // is never counted here and never reaches a paid model.
+        let cascade_text = if args.enrich {
+            let e = bookmarks_agent::link_context::enrich(bookmark, &mut lcache);
+            if bookmarks_agent::link_context::will_append(&e) {
+                enriched += 1;
+            }
+            bookmarks_agent::link_context::cascade_input(&scoring_text, &e)
+        } else {
+            scoring_text.into_owned()
+        };
+        let decision = cascade.decide(&cascade_text, Sensitivity::Sanitized, verdict, &mut stats);
         cascade_pairs.push((label.try_it, decision.try_it));
         rules_pairs.push((label.try_it, confident));
         rows.push(serde_json::json!({
@@ -350,9 +407,14 @@ fn run(args: &Args) -> Result<(), String> {
         std::fs::write(path, out).map_err(|e| format!("cannot write output file: {e}"))?;
     }
 
+    if let Some(path) = &lcache_path {
+        bookmarks_agent::link_context::save_cache(path, &lcache)
+            .map_err(|e| format!("cannot write link context cache: {e}"))?;
+    }
+
     let decided = rows.len();
     println!(
-        "try_it_cascade: {decided} decided, {missing} missing, {} malformed, {translated} translated, {untranslated} untranslated",
+        "try_it_cascade: {decided} decided, {missing} missing, {} malformed, {translated} translated, {untranslated} untranslated, {enriched} enriched",
         labels_bad + bookmarks_bad
     );
     if stopped_early {
@@ -420,6 +482,31 @@ mod tests {
         assert_eq!(a.bookmarks, PathBuf::from("b"));
         assert_eq!(a.out, None);
         assert_eq!(a.jev_threshold, None);
+        assert!(!a.enrich);
+        // --enrich is a bare flag, default off, free order.
+        let a = parse_args(&argv(&[
+            "bin",
+            "--enrich",
+            "--labels",
+            "l",
+            "--bookmarks",
+            "b",
+        ]))
+        .unwrap();
+        assert!(a.enrich);
+        let a = parse_args(&argv(&[
+            "bin",
+            "--labels",
+            "l",
+            "--bookmarks",
+            "b",
+            "--out",
+            "o",
+            "--enrich",
+        ]))
+        .unwrap();
+        assert!(a.enrich);
+        assert_eq!(a.out, Some(PathBuf::from("o")));
         let a = parse_args(&argv(&[
             "bin",
             "--labels",
@@ -463,6 +550,16 @@ mod tests {
             argv(&["bin", "--labels", "l", "--bookmarks", "b", "--bogus", "x"]),
             argv(&["bin", "--labels", "l", "--labels", "m", "--bookmarks", "b"]),
             argv(&["bin", "l", "b"]),
+            // Repeated --enrich fails like any repeated flag.
+            argv(&[
+                "bin",
+                "--labels",
+                "l",
+                "--bookmarks",
+                "b",
+                "--enrich",
+                "--enrich",
+            ]),
             // Threshold flag: missing, repeated, or unparseable values fail.
             argv(&[
                 "bin",

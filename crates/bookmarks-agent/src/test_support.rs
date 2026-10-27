@@ -24,17 +24,21 @@ impl EnvHold {
             "ANCIENTOS_ALLOW_PAID",
             crate::liveness::OFFLINE_ENV_VAR,
             crate::liveness::CACHE_ENV_VAR,
+            crate::link_context::FETCH_ENV_VAR,
+            crate::link_context::CACHE_ENV_VAR,
         ];
         let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
         (lock, saved)
     }
 
-    /// Paid switch on, offline/cache overrides cleared.
+    /// Paid switch on, offline/cache/link-fetch overrides cleared.
     pub(crate) fn paid_on() -> Self {
         let (lock, saved) = Self::capture();
         std::env::set_var("ANCIENTOS_ALLOW_PAID", "1");
         std::env::remove_var(crate::liveness::OFFLINE_ENV_VAR);
         std::env::remove_var(crate::liveness::CACHE_ENV_VAR);
+        std::env::remove_var(crate::link_context::FETCH_ENV_VAR);
+        std::env::remove_var(crate::link_context::CACHE_ENV_VAR);
         Self { _lock: lock, saved }
     }
 
@@ -45,7 +49,18 @@ impl EnvHold {
         std::env::remove_var("ANCIENTOS_ALLOW_PAID");
         std::env::remove_var(crate::liveness::OFFLINE_ENV_VAR);
         std::env::remove_var(crate::liveness::CACHE_ENV_VAR);
+        std::env::remove_var(crate::link_context::FETCH_ENV_VAR);
+        std::env::remove_var(crate::link_context::CACHE_ENV_VAR);
         Self { _lock: lock, saved }
+    }
+
+    /// Link fetching on (plus paid on): [`crate::link_context::enrich`] may
+    /// fetch. Callers that need paid off with fetching on set
+    /// `ANCIENTOS_FETCH_LINKS=1` themselves on top of [`Self::paid_off`].
+    pub(crate) fn fetch_on() -> Self {
+        let hold = Self::paid_on();
+        std::env::set_var(crate::link_context::FETCH_ENV_VAR, "1");
+        hold
     }
 }
 

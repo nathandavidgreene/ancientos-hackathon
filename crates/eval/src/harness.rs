@@ -438,6 +438,7 @@ mod tests {
                 had_note_tweet: false,
                 media: Vec::new(),
                 lang: lang.map(str::to_string),
+                urls: Vec::new(),
             }
         }
         let en_text =

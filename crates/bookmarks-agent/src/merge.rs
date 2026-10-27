@@ -96,6 +96,9 @@ fn merge_pair(live: &Bookmark, fixture: &Bookmark) -> Bookmark {
     if merged.lang.is_none() {
         merged.lang.clone_from(&fixture.lang);
     }
+    if merged.urls.is_empty() {
+        merged.urls.clone_from(&fixture.urls);
+    }
     merged
 }
 
@@ -204,6 +207,7 @@ mod tests {
             had_note_tweet: false,
             media: Vec::new(),
             lang: None,
+            urls: Vec::new(),
         }
     }
 
@@ -367,6 +371,7 @@ mod tests {
             preview_url: None,
             video_url: None,
             alt_text: Some("synthetic".into()),
+            caption_url: None,
         }];
         let out = merge(std::slice::from_ref(&live), std::slice::from_ref(&fixture));
         assert_eq!(out.rows.len(), 1);
@@ -379,12 +384,30 @@ mod tests {
             preview_url: None,
             video_url: None,
             alt_text: None,
+            caption_url: None,
         }];
         let out = merge(
             std::slice::from_ref(&live_with),
             std::slice::from_ref(&fixture),
         );
         assert_eq!(out.rows[0].media, live_with.media);
+    }
+
+    #[test]
+    fn keeps_fixture_urls_when_live_has_none() {
+        let live = bm("s", "live text");
+        let mut fixture = bm("s", "fixture text");
+        fixture.urls = vec!["https://example.invalid/guide".into()];
+        let out = merge(std::slice::from_ref(&live), std::slice::from_ref(&fixture));
+        assert_eq!(out.rows[0].urls, fixture.urls);
+        // Live urls win when present.
+        let mut live_with = bm("s", "live text");
+        live_with.urls = vec!["https://example.invalid/live".into()];
+        let out = merge(
+            std::slice::from_ref(&live_with),
+            std::slice::from_ref(&fixture),
+        );
+        assert_eq!(out.rows[0].urls, live_with.urls);
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod fixture;
 pub mod idea_card;
 pub mod ingest;
 pub mod language;
+pub mod link_context;
 pub mod liveness;
 pub mod media;
 pub mod merge;

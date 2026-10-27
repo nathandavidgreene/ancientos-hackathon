@@ -92,6 +92,7 @@ mod tests {
             had_note_tweet: false,
             media: Vec::new(),
             lang: Some("en".to_string()),
+            urls: Vec::new(),
         }
     }
 

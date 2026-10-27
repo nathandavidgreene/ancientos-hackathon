@@ -39,6 +39,11 @@ pub struct Bookmark {
     /// fixtures that predate ingest storing it; see [`crate::language`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// Expanded link URLs from X `entities.urls` (`expanded_url`), stored at
+    /// ingest. Empty for old stores and fixtures. Read by
+    /// [`crate::link_context`] to fetch linked-page text; never written back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -110,6 +115,27 @@ mod tests {
         assert!(rows[0].media.is_empty());
         let back = serde_json::to_string(&rows[0]).unwrap();
         assert!(!back.contains("media"), "{back}");
+    }
+
+    #[test]
+    fn urls_default_to_empty_and_round_trip() {
+        let old =
+            r#"{"post_id":"old1","url":"https://x.com/i/status/old1","text":"synthetic old"}"#;
+        let rows = parse_jsonl(old).unwrap();
+        assert!(rows[0].urls.is_empty());
+        let back = serde_json::to_string(&rows[0]).unwrap();
+        assert!(!back.contains("urls"), "{back}");
+        let tagged = r#"{"post_id":"t1","url":"https://x.com/i/status/t1","text":"synthetic","urls":["https://example.invalid/a","https://example.invalid/b"]}"#;
+        let rows = parse_jsonl(tagged).unwrap();
+        assert_eq!(
+            rows[0].urls,
+            vec![
+                "https://example.invalid/a".to_string(),
+                "https://example.invalid/b".to_string()
+            ]
+        );
+        let back = serde_json::to_string(&rows[0]).unwrap();
+        assert!(back.contains("\"urls\":"), "{back}");
     }
 
     #[test]

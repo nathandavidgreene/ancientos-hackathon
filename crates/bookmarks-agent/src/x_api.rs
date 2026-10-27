@@ -297,6 +297,39 @@ pub fn parse_user_id(value: &serde_json::Value) -> Result<String, String> {
         .ok_or_else(|| "users/me response has no data.id".to_string())
 }
 
+/// Expanded link URLs from a tweet's `entities.urls` (`expanded_url`).
+/// Pure, for tests. Keeps trimmed http(s) URLs up to 2048 chars, deduped in
+/// order; non-http(s) values and overlong values are dropped (fail
+/// closed). Link fetching in [`crate::link_context`] applies the rest of the
+/// skip list (unexpanded `t.co`, X status links) and re-validates every URL
+/// before use.
+pub fn expanded_urls(tweet: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let urls = tweet
+        .get("entities")
+        .and_then(|e| e.get("urls"))
+        .and_then(|u| u.as_array());
+    for u in urls.into_iter().flatten() {
+        let Some(raw) = u.get("expanded_url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let s = raw.trim();
+        if s.is_empty() || s.len() > 2048 {
+            continue;
+        }
+        if !(s.starts_with("http://") || s.starts_with("https://")) {
+            continue;
+        }
+        if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            continue;
+        }
+        if !out.contains(&s.to_string()) {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
 /// Map one bookmarks page to fixtures. Pure, for tests.
 pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
     let mut usernames: HashMap<&str, &str> = HashMap::new();
@@ -349,6 +382,7 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.trim().is_empty())
                     .map(str::to_string),
+                urls: expanded_urls(t),
             });
         }
     }
@@ -863,6 +897,32 @@ mod tests {
         assert_eq!(page.items[1].lang.as_deref(), Some("es"));
         assert_eq!(page.items[2].lang, None);
         assert_eq!(page.items[3].lang, None);
+    }
+
+    #[test]
+    fn parses_bookmarks_page_stores_expanded_urls() {
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "1", "text": "synthetic with links", "author_id": "u1",
+                 "entities": {"urls": [
+                    {"url": "https://t.co/a", "expanded_url": "https://example.invalid/guide"},
+                    {"url": "https://t.co/b", "expanded_url": "https://example.invalid/guide"},
+                    {"url": "https://t.co/c", "expanded_url": "ftp://example.invalid/nope"},
+                    {"url": "https://t.co/d"},
+                    {"url": "https://t.co/e", "expanded_url": "  "},
+                 ]}},
+                {"id": "2", "text": "synthetic no entities", "author_id": "u1"},
+            ],
+            "includes": {"users": [{"id": "u1", "username": "alice"}]},
+            "meta": {}
+        });
+        let page = parse_bookmarks_page(&raw).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(
+            page.items[0].urls,
+            vec!["https://example.invalid/guide".to_string()]
+        );
+        assert!(page.items[1].urls.is_empty());
     }
 
     #[test]

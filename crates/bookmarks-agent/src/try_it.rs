@@ -1691,6 +1691,7 @@ mod tests {
             // Synthetic English posts (the classifier ignores lang; brief
             // translations leave English posts unchanged).
             lang: Some("en".to_string()),
+            urls: Vec::new(),
         }
     }
 
@@ -2088,6 +2089,7 @@ mod tests {
             preview_url: None,
             video_url: None,
             alt_text: Some("synthetic alt".into()),
+            caption_url: None,
         }];
         let breath = bm(
             "h2",
