@@ -772,13 +772,17 @@ fn run_impl(
     // with scores so preferred posts surface earlier (same round-robin
     // spread, ties keep today's order). Inactive keeps `candidates`
     // untouched. Hidden/never filtering above applied first.
-    let ranker = crate::ranker::Ranker::train_from_log(
-        &DecisionLog::open(log_path).map_err(|e| e.to_string())?,
-        &merged.rows,
-    )
-    .map_err(|e| e.to_string())?;
+    // Semantic ranking (local embeddings, opt-in) blends in when its model
+    // is configured and reachable; otherwise the vote-learned order stands.
+    let vote_log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let events = crate::ranker::events_from_log(&vote_log, &merged.rows)?;
+    let ranker = crate::ranker::Ranker::train(&events, crate::ranker::min_records_from_env());
+    let mut semantic = false;
     let candidates = if ranker.is_active() {
-        let scores = ranker.score_all(merged.rows.iter());
+        let cache = log_path.with_file_name(crate::semantic::CACHE_FILE_NAME);
+        let (scores, applied) =
+            crate::semantic::personal_scores(&ranker, &events, &merged.rows, &cache);
+        semantic = applied;
         select_candidates_ranked(&rows, &merged.live_ids, &scores)
     } else {
         candidates
@@ -976,6 +980,7 @@ fn run_impl(
                 "labeled": ranker.n_labeled(),
                 "candidates": candidates.len(),
                 "reordered": reordered,
+                "semantic": semantic,
             }),
         )
         .map_err(|e| e.to_string())?;
@@ -2697,10 +2702,12 @@ mod tests {
         assert_eq!(payload["labeled"], min as u64);
         assert_eq!(payload["candidates"], res.candidates.len() as u64);
         assert!(payload.get("reordered").and_then(|v| v.as_u64()).is_some());
+        // Semantic ranking is opt-in: off unless its local model is configured.
+        assert_eq!(payload["semantic"], false);
         assert_eq!(
             payload.as_object().unwrap().len(),
-            3,
-            "counts only: {payload}"
+            4,
+            "counts and flags only: {payload}"
         );
         let raw = payload.to_string();
         for leak in [

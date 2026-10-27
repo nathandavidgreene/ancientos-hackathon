@@ -84,6 +84,7 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `link_context` | bookmarks-agent | Linked-page and media enrichment for the try-it classifiers |
 | `liveness` | bookmarks-agent | Confirms a bookmark still exists before it is surfaced; dead posts are filtered in memory only |
 | `ranker` | bookmarks-agent | Personal ranking learned locally from verdicts (naive Bayes), with plain-language reasons |
+| `semantic` | bookmarks-agent | Ranking by meaning: local embeddings (opt-in, cached, fail closed) blended with the ranker |
 | `stats` | bookmarks-agent | Local stats for the `/stats` page and the `stats` command |
 | `wiki` | bookmarks-agent | Idea cards and research bookmarks distilled into concept pages with cited claims |
 | `digest` | bookmarks-agent | Weekly triage digest: due idea cards plus "did you try it?" nudges |

@@ -273,9 +273,15 @@ fn cmd_rank(args: &[String]) -> Result<(), String> {
     if rows.is_empty() {
         return Err("no bookmarks to rank".to_string());
     }
-    let trained = ranker::Ranker::train_from_log(&log, &merged.rows)?;
+    let events = ranker::events_from_log(&log, &merged.rows)?;
+    let trained = ranker::Ranker::train(&events, ranker::min_records_from_env());
+    let (scores, semantic_on) = if trained.is_active() {
+        let cache = log_path.with_file_name(bookmarks_agent::semantic::CACHE_FILE_NAME);
+        bookmarks_agent::semantic::personal_scores(&trained, &events, &merged.rows, &cache)
+    } else {
+        (HashMap::new(), false)
+    };
     let candidates = if trained.is_active() {
-        let scores = trained.score_all(merged.rows.iter());
         brief::select_candidates_ranked(&rows, &merged.live_ids, &scores)
     } else {
         brief::select_candidates(&rows, &merged.live_ids)
@@ -295,9 +301,10 @@ fn cmd_rank(args: &[String]) -> Result<(), String> {
                     score: 0.0,
                     top_reasons: Vec::new(),
                 });
+            let shown = scores.get(&c.post_id).copied().unwrap_or(score.score);
             println!(
                 "{}. {} [{}] score {:.3}",
-                c.index, c.post_id, c.topic, score.score
+                c.index, c.post_id, c.topic, shown
             );
             for reason in &score.top_reasons {
                 println!("   - {reason}");
@@ -305,6 +312,9 @@ fn cmd_rank(args: &[String]) -> Result<(), String> {
         } else {
             println!("{}. {} [{}]", c.index, c.post_id, c.topic);
         }
+    }
+    if semantic_on {
+        println!("semantic ranking: on (local embeddings blended with votes)");
     }
     if !trained.is_active() {
         println!(

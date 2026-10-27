@@ -22,6 +22,7 @@ pub mod merge;
 pub mod oauth;
 pub mod ranker;
 pub mod sanitize;
+pub mod semantic;
 pub mod stats;
 #[cfg(test)]
 pub(crate) mod test_support;
