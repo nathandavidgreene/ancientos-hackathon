@@ -327,7 +327,7 @@ pub struct BookmarkLabels {
     pub output_tokens: u64,
 }
 
-/// Category criteria mirroring eval-private label_muse.py.
+/// Category criteria mirroring the private labeling script.
 pub const BOOKMARK_CATEGORIES: &[&str] = &[
     "ai_agents_homelab",
     "health_fitness_food",
