@@ -8,7 +8,10 @@
 //! - Stage 2 (Jev): one `noul` question with the same try-it wording the eval
 //!   uses ([`TRY_IT_INSTRUCTIONS`]); `noul >= 0.5` answers yes.
 //! - Stage 3 (Muse Spark): strict-JSON `{"try_it":true|false}` prompt with the
-//!   same definition; the reply is parsed leniently (first `{...}`).
+//!   same definition; the reply is parsed leniently (first `{...}`). An
+//!   empty/null content with `finish_reason` "length" still fails closed but
+//!   is flagged as truncated instead of an ordinary Muse "no" (see
+//!   [`CascadeDecision::truncated`] and [`CascadeStats::muse_truncated`]).
 //!
 //! Fail-closed everywhere: gates-off items fall back to the rules verdict
 //! with no call and no error, while backend errors and unparseable replies
@@ -18,7 +21,7 @@
 //! [`CascadeDecision::is_rate_limited`].
 use crate::jev_client::JevClient;
 use crate::muse::MuseClient;
-use crate::{ModelClient, RouterError, Sensitivity};
+use crate::{RouterError, Sensitivity};
 
 /// Try-it definition shared by the Jev question and the Muse prompt. The eval
 /// crate's `bookmark_questions()` carries the same wording; the router cannot
@@ -28,6 +31,14 @@ pub const TRY_IT_INSTRUCTIONS: &str = "This X bookmark is hands-on practice the 
 
 /// Jev `noul` threshold: `>= 0.5` answers yes.
 pub const TRY_IT_THRESHOLD: f64 = 0.5;
+
+/// Muse Spark completion-token cap for stage 3 (a classify-style yes/no
+/// call). Single source of truth for the cascade and the eval bin. Muse
+/// Spark's reasoning shares this budget: 200 starved every answer (empty
+/// content, `finish_reason` "length"), while real answers used up to 672
+/// completion tokens. The brief (700), deeper, and delegate caps are
+/// separate and unchanged.
+pub const TRY_IT_MUSE_MAX_COMPLETION_TOKENS: u32 = 1024;
 
 /// Rules verdict for one item, computed by the caller (bookmarks-agent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,13 +88,17 @@ impl std::fmt::Display for CascadeStage {
     }
 }
 
-/// One item's decision: the answer, the stage that gave it, and the backend
-/// error when the stage is [`CascadeStage::FailClosed`].
+/// One item's decision: the answer, the stage that gave it, the backend
+/// error when the stage is [`CascadeStage::FailClosed`], and whether the
+/// Muse reply was length-truncated (empty/null content with `finish_reason`
+/// "length"). A truncation still fails closed exactly like any other error;
+/// the flag only records it distinctly instead of an ordinary Muse "no".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CascadeDecision {
     pub try_it: bool,
     pub stage: CascadeStage,
     pub error: Option<String>,
+    pub truncated: bool,
 }
 
 impl CascadeDecision {
@@ -133,7 +148,9 @@ mod status_tests {
 }
 
 /// Run counters. Call counts record attempts (including ones that errored);
-/// token counts record successful Jev replies only.
+/// token counts record successful Jev replies only. `muse_truncated` counts
+/// the Muse calls that failed closed on a length truncation; those calls
+/// are also counted in `muse_calls`, `fail_closed`, and `errors`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadeStats {
     pub rules_yes: u64,
@@ -141,6 +158,7 @@ pub struct CascadeStats {
     pub jev_yes: u64,
     pub muse_calls: u64,
     pub muse_yes: u64,
+    pub muse_truncated: u64,
     pub fail_closed: u64,
     pub errors: u64,
     pub jev_input_tokens: u64,
@@ -175,6 +193,7 @@ impl<'a> Cascade<'a> {
                 try_it: true,
                 stage: CascadeStage::Rules,
                 error: None,
+                truncated: false,
             };
         }
         // Gates: both clients present, both paid-allowed, sanitized only.
@@ -201,6 +220,7 @@ impl<'a> Cascade<'a> {
                             try_it: true,
                             stage: CascadeStage::Jev,
                             error: None,
+                            truncated: false,
                         };
                     }
                     Some(_) => {}
@@ -209,16 +229,19 @@ impl<'a> Cascade<'a> {
                             rules,
                             stats,
                             RouterError::BadResponse("jev reply has no try_it noul".into()),
+                            false,
                         );
                     }
                 }
             }
-            Err(e) => return fail_closed(rules, stats, e),
+            Err(e) => return fail_closed(rules, stats, e, false),
         }
-        // Stage 3: Muse Spark. Final answer.
+        // Stage 3: Muse Spark. Final answer. `chat` (not `complete`) so a
+        // length-truncated reply keeps its finish reason and is flagged as
+        // truncated instead of an ordinary Muse "no".
         stats.muse_calls += 1;
-        match muse.complete(&muse_prompt(text)) {
-            Ok(content) => match parse_muse_try_it(&content) {
+        match muse.chat(&muse_prompt(text)) {
+            Ok(reply) => match parse_muse_try_it(&reply.content) {
                 Some(answer) => {
                     if answer {
                         stats.muse_yes += 1;
@@ -227,18 +250,27 @@ impl<'a> Cascade<'a> {
                         try_it: answer,
                         stage: CascadeStage::Muse,
                         error: None,
+                        truncated: false,
                     }
                 }
-                None => fail_closed(
-                    rules,
-                    stats,
-                    RouterError::BadResponse(format!(
-                        "muse reply is not strict try_it JSON: {}",
-                        snippet(&content)
-                    )),
-                ),
+                None => {
+                    let truncated = reply.finish_reason.as_deref() == Some("length")
+                        && reply.content.trim().is_empty();
+                    fail_closed(
+                        rules,
+                        stats,
+                        RouterError::BadResponse(format!(
+                            "muse reply is not strict try_it JSON: {}",
+                            snippet(&reply.content)
+                        )),
+                        truncated,
+                    )
+                }
             },
-            Err(e) => fail_closed(rules, stats, e),
+            Err(e) => {
+                let truncated = is_truncation_error(&e);
+                fail_closed(rules, stats, e, truncated)
+            }
         }
     }
 }
@@ -249,22 +281,39 @@ fn rules_only(rules: RulesVerdict) -> CascadeDecision {
         try_it: rules.answer(),
         stage: CascadeStage::Rules,
         error: None,
+        truncated: false,
     }
 }
 
-/// Error fallback: rules verdict with the backend error recorded.
+/// Error fallback: rules verdict with the backend error recorded. A Muse
+/// truncation fails closed exactly like any other error; it is only
+/// additionally flagged on the decision and counted in
+/// [`CascadeStats::muse_truncated`].
 fn fail_closed(
     rules: RulesVerdict,
     stats: &mut CascadeStats,
     error: RouterError,
+    truncated: bool,
 ) -> CascadeDecision {
     stats.fail_closed += 1;
     stats.errors += 1;
+    if truncated {
+        stats.muse_truncated += 1;
+    }
     CascadeDecision {
         try_it: rules.answer(),
         stage: CascadeStage::FailClosed,
         error: Some(error.to_string()),
+        truncated,
     }
+}
+
+/// True when a Muse error is a length truncation. [`MuseClient`] reports a
+/// null, non-string, or missing content as `BadResponse` naming the
+/// `finish_reason`; only `"length"` means the completion budget ran out. A
+/// null content with any other reason keeps its existing handling.
+fn is_truncation_error(error: &RouterError) -> bool {
+    matches!(error, RouterError::BadResponse(msg) if msg.contains("finish_reason: \"length\""))
 }
 
 /// The single Jev System One question for stage 2.
@@ -441,7 +490,13 @@ mod tests {
 
     /// Muse client with the cascade's stage-3 settings.
     fn muse_client(base_url: String, allow_paid: bool) -> MuseClient {
-        MuseClient::new("muse-spark-1.3", base_url, 200, allow_paid).with_reasoning_effort("low")
+        MuseClient::new(
+            "muse-spark-1.3",
+            base_url,
+            TRY_IT_MUSE_MAX_COMPLETION_TOKENS,
+            allow_paid,
+        )
+        .with_reasoning_effort("low")
     }
 
     fn jev_noul_body(noul: f64) -> String {
@@ -456,6 +511,18 @@ mod tests {
             "model": "muse-spark-1.3",
             "choices": [{"message": {"role": "assistant", "content": content},
                          "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+        })
+        .to_string()
+    }
+
+    /// Muse reply with an explicit content value (string or null) and finish
+    /// reason, for the truncation tests.
+    fn muse_body_full(content: serde_json::Value, finish_reason: &str) -> String {
+        serde_json::json!({
+            "model": "muse-spark-1.3",
+            "choices": [{"message": {"role": "assistant", "content": content},
+                         "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
         })
         .to_string()
@@ -484,6 +551,7 @@ mod tests {
                 try_it: true,
                 stage: CascadeStage::Rules,
                 error: None,
+                truncated: false,
             }
         );
         assert_eq!(stats.rules_yes, 1);
@@ -619,6 +687,7 @@ mod tests {
     fn jev_no_falls_through_to_muse_yes_and_no() {
         let _guard = env_lock();
         let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
+        assert_eq!(TRY_IT_MUSE_MAX_COMPLETION_TOKENS, 1024);
         for (muse_content, expected) in [("{\"try_it\":true}", true), ("{\"try_it\":false}", false)]
         {
             let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
@@ -639,16 +708,22 @@ mod tests {
             assert_eq!(d.stage, CascadeStage::Muse);
             assert_eq!(d.error, None);
             assert!(!d.is_rate_limited());
+            // A normal Muse answer is never reported as truncated.
+            assert!(!d.truncated, "muse said {muse_content}");
             assert_eq!(stats.jev_calls, 1);
             assert_eq!(stats.jev_yes, 0);
             assert_eq!(stats.muse_calls, 1);
             assert_eq!(stats.muse_yes, u64::from(expected));
+            assert_eq!(stats.muse_truncated, 0);
             // Stage-3 settings from the spec reach the wire.
             let seen = muse_seen.lock().expect("seen lock");
             assert_eq!(seen.len(), 1);
             let sent: serde_json::Value = serde_json::from_str(&seen[0]).expect("request is json");
             assert_eq!(sent["model"], "muse-spark-1.3");
-            assert_eq!(sent["max_completion_tokens"], 200);
+            assert_eq!(
+                sent["max_completion_tokens"],
+                TRY_IT_MUSE_MAX_COMPLETION_TOKENS
+            );
             assert_eq!(sent["reasoning_effort"], "low");
             assert!(sent["messages"][0]["content"]
                 .as_str()
@@ -729,8 +804,10 @@ mod tests {
         assert_eq!(d.stage, CascadeStage::FailClosed);
         let error = d.error.expect("error recorded");
         assert!(error.contains("strict try_it JSON"), "{error}");
+        assert!(!d.truncated);
         assert_eq!(stats.muse_calls, 1);
         assert_eq!(stats.muse_yes, 0);
+        assert_eq!(stats.muse_truncated, 0);
         assert_eq!(stats.fail_closed, 1);
         assert_eq!(stats.errors, 1);
     }
@@ -757,8 +834,74 @@ mod tests {
         assert_eq!(d.stage, CascadeStage::FailClosed);
         assert!(d.error.as_deref().unwrap().contains("500"));
         assert!(!d.is_rate_limited());
+        assert!(!d.truncated);
         assert_eq!(stats.muse_calls, 1);
+        assert_eq!(stats.muse_truncated, 0);
         assert_eq!(stats.fail_closed, 1);
+    }
+
+    #[test]
+    fn muse_empty_length_reply_is_truncated_fail_closed() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+        let empty_length = muse_body_full(serde_json::json!(""), "length");
+        let (muse_url, _, muse_handle) = mock_server(200, &empty_length);
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "x",
+            Sensitivity::Sanitized,
+            RulesVerdict::Unsure,
+            &mut stats,
+        );
+        jev_handle.join().expect("server thread");
+        muse_handle.join().expect("server thread");
+        // Fail closed exactly as before: not try-it, rules verdict, error kept.
+        assert!(!d.try_it);
+        assert_eq!(d.stage, CascadeStage::FailClosed);
+        assert!(d.error.is_some());
+        assert!(!d.is_rate_limited());
+        // ...but reported as truncated, distinct from an ordinary Muse "no".
+        assert!(d.truncated);
+        assert_eq!(stats.muse_calls, 1);
+        assert_eq!(stats.muse_yes, 0);
+        assert_eq!(stats.muse_truncated, 1);
+        assert_eq!(stats.fail_closed, 1);
+        assert_eq!(stats.errors, 1);
+    }
+
+    #[test]
+    fn muse_null_content_is_truncated_only_for_length() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
+        // A null content surfaces as a BadResponse naming the finish reason;
+        // only "length" means the completion budget ran out.
+        for (reason, expected) in [("length", true), ("stop", false)] {
+            let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+            let null_body = muse_body_full(serde_json::Value::Null, reason);
+            let (muse_url, _, muse_handle) = mock_server(200, &null_body);
+            let jev = jev_client(jev_url, true);
+            let muse = muse_client(muse_url, true);
+            let cascade = Cascade::new(Some(&jev), Some(&muse));
+            let mut stats = zero_stats();
+            let d = cascade.decide(
+                "x",
+                Sensitivity::Sanitized,
+                RulesVerdict::Unsure,
+                &mut stats,
+            );
+            jev_handle.join().expect("server thread");
+            muse_handle.join().expect("server thread");
+            assert!(!d.try_it, "reason {reason}");
+            assert_eq!(d.stage, CascadeStage::FailClosed);
+            assert_eq!(d.truncated, expected, "reason {reason}");
+            assert_eq!(stats.muse_calls, 1);
+            assert_eq!(stats.muse_truncated, u64::from(expected), "reason {reason}");
+            assert_eq!(stats.fail_closed, 1);
+        }
     }
 
     #[test]
@@ -781,6 +924,7 @@ mod tests {
         assert_eq!(d.stage, CascadeStage::FailClosed);
         assert!(d.error.as_deref().unwrap().contains("429"));
         assert!(d.is_rate_limited());
+        assert!(!d.truncated);
         // The same cascade keeps working: rules decide without the network.
         let d2 = cascade.decide(
             "y",
@@ -809,6 +953,8 @@ mod tests {
         muse_handle.join().expect("server thread");
         assert_eq!(d.stage, CascadeStage::FailClosed);
         assert!(d.is_rate_limited());
+        assert!(!d.truncated);
+        assert_eq!(stats.muse_truncated, 0);
     }
 
     #[test]

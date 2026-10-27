@@ -117,6 +117,17 @@ fn muse_body(content: &str) -> String {
     .to_string()
 }
 
+/// Muse reply with an explicit content value (string or null) and finish
+/// reason, for the truncation test.
+fn muse_body_full(content: serde_json::Value, finish_reason: &str) -> String {
+    serde_json::json!({
+        "model": "muse-spark-1.3",
+        "choices": [{"message": {"role": "assistant", "content": content},
+                     "finish_reason": finish_reason}],
+    })
+    .to_string()
+}
+
 /// Run the binary with explicit env, killing it if it hangs. Outputs are
 /// small, so reading them after exit cannot deadlock.
 fn run_bin(args: &[&str], env: &[(&str, &str)], remove_env: &[&str]) -> (bool, String, String) {
@@ -269,7 +280,7 @@ fn full_cascade_through_all_stages() {
     );
     assert!(
         stdout.contains(
-            "calls: jev=2 jev_yes=0 muse=2 muse_yes=1 rules_yes=1 fail_closed=0 errors=0"
+            "calls: jev=2 jev_yes=0 muse=2 muse_yes=1 muse_truncated=0 rules_yes=1 fail_closed=0 errors=0"
         ),
         "{stdout}"
     );
@@ -285,12 +296,15 @@ fn full_cascade_through_all_stages() {
     assert_eq!(rows[0]["post_id"], "c1");
     assert_eq!(rows[0]["predicted"], true);
     assert_eq!(rows[0]["stage"], "rules");
+    assert_eq!(rows[0]["truncated"], false);
     assert_eq!(rows[1]["post_id"], "c2");
     assert_eq!(rows[1]["predicted"], true);
     assert_eq!(rows[1]["stage"], "muse");
+    assert_eq!(rows[1]["truncated"], false);
     assert_eq!(rows[2]["post_id"], "c3");
     assert_eq!(rows[2]["predicted"], false);
     assert_eq!(rows[2]["stage"], "muse");
+    assert_eq!(rows[2]["truncated"], false);
 
     // Wire proof: Jev got the noul question, Muse got the pinned stage-3 config.
     let jev_seen = jev_seen.lock().expect("seen lock");
@@ -304,7 +318,7 @@ fn full_cascade_through_all_stages() {
     for body in muse_seen.iter() {
         let sent: serde_json::Value = serde_json::from_str(body).expect("muse request is json");
         assert_eq!(sent["model"], "muse-spark-1.3");
-        assert_eq!(sent["max_completion_tokens"], 200);
+        assert_eq!(sent["max_completion_tokens"], 1024);
         assert_eq!(sent["reasoning_effort"], "low");
     }
 }
@@ -342,7 +356,7 @@ fn paid_off_runs_rules_only_with_zero_calls() {
     assert!(stdout.contains("rules only"), "{stdout}");
     assert!(
         stdout.contains(
-            "calls: jev=0 jev_yes=0 muse=0 muse_yes=0 rules_yes=1 fail_closed=0 errors=0"
+            "calls: jev=0 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 rules_yes=1 fail_closed=0 errors=0"
         ),
         "{stdout}"
     );
@@ -486,7 +500,7 @@ fn stops_on_rate_limit() {
     );
     assert!(
         stdout.contains(
-            "calls: jev=1 jev_yes=0 muse=0 muse_yes=0 rules_yes=0 fail_closed=1 errors=1"
+            "calls: jev=1 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 rules_yes=0 fail_closed=1 errors=1"
         ),
         "{stdout}"
     );
@@ -499,4 +513,76 @@ fn stops_on_rate_limit() {
     assert_eq!(rows[0]["stage"], "fail_closed");
     assert_eq!(rows[0]["predicted"], false);
     assert!(rows[0]["error"].as_str().unwrap().contains("429"));
+}
+
+#[test]
+fn truncation_is_counted_separately_from_ordinary_no() {
+    let (jev_url, _, jev_done) =
+        mock_server(vec![(200, jev_noul_body(0.2)), (200, jev_noul_body(0.1))]);
+    // c2: empty content + finish_reason "length" (truncated); c3: normal no.
+    let (muse_url, muse_seen, muse_done) = mock_server(vec![
+        (200, muse_body_full(serde_json::json!(""), "length")),
+        (200, muse_body("{\"try_it\":false}")),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (labels, bookmarks) = fixtures();
+    let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), &labels, &bookmarks);
+
+    let (ok, stdout, stderr) = run_bin(
+        &[
+            "--labels",
+            &labels_path,
+            "--bookmarks",
+            &bookmarks_path,
+            "--out",
+            &out_path,
+        ],
+        &[
+            ("JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_BASE_URL", &jev_url),
+            ("TYPESAFE_API_KEY", "test-key"),
+            ("META_API_BASE", &muse_url),
+            ("META_API_KEY", "test-key"),
+            ("ANCIENTOS_ALLOW_PAID", "1"),
+        ],
+        &[],
+    );
+    assert!(ok, "exit ok, stderr: {stderr}");
+    jev_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("jev got exactly 2 calls");
+    muse_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("muse got exactly 2 calls");
+
+    // The truncation still fails closed (fail_closed/errors) but is also
+    // counted separately, not as an ordinary Muse "no".
+    assert!(
+        stdout.contains(
+            "calls: jev=2 jev_yes=0 muse=2 muse_yes=0 muse_truncated=1 rules_yes=1 fail_closed=1 errors=1"
+        ),
+        "{stdout}"
+    );
+    let out = std::fs::read_to_string(&out_path).expect("read out");
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("out is jsonl"))
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["truncated"], false);
+    assert_eq!(rows[1]["post_id"], "c2");
+    assert_eq!(rows[1]["predicted"], false);
+    assert_eq!(rows[1]["stage"], "fail_closed");
+    assert_eq!(rows[1]["truncated"], true);
+    assert!(rows[1]["error"].is_string());
+    assert_eq!(rows[2]["stage"], "muse");
+    assert_eq!(rows[2]["truncated"], false);
+
+    // Both calls carry the shared 1024-token classify cap.
+    let muse_seen = muse_seen.lock().expect("seen lock");
+    assert_eq!(muse_seen.len(), 2);
+    for body in muse_seen.iter() {
+        let sent: serde_json::Value = serde_json::from_str(body).expect("muse request is json");
+        assert_eq!(sent["max_completion_tokens"], 1024);
+    }
 }

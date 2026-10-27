@@ -2,6 +2,8 @@
 
 Muse Code CLI 1.4.13, headless (`muse exec --prompt-file`), default model, auth via `META_API_KEY` env.
 
+Renumbered 2026-10-26 (duplicate #15/#16/#21/#22 rows from parallel branches), old->new in file order: 15->15, 18->16, 15->17, 16->18, 22->19, 16->20, 21->21, 22->22, 20->23, 21->24, 23->25. Commit messages keep the original numbers.
+
 | # | Date | Prompt summary | Outcome |
 |---|------|----------------|---------|
 | 1 | 2026-10-26 | Implement Muse Spark chat-completions client in `router` (`muse.rs`), env-only key, fail closed, `ANCIENTOS_ALLOW_PAID` switch default off, `muse_ping` example, tests | Done in ~3.5 min; CI green. Live ping revealed a bug: a 16-token cap was consumed by reasoning (content null). |
@@ -34,6 +36,4 @@ Muse Code CLI 1.4.13, headless (`muse exec --prompt-file`), default model, auth 
 | 26 | 2026-10-26 | language filter: non-English posts never surfaced (brief, web-ui, review cards), skipped silently like dead posts; X lang field + offline fail-closed heuristic; mock tests | muse_run.sh: exit 0, ~12 min (729s), `--trust-workspace`; tokens in/cached/out 11,397,200/11,130,447/66,087; est. cost $2.28. |
 | 27 | 2026-10-26 | never_author verdict: hides an author's posts from brief, web-ui and digest; local, undoable (unhide_author); mock tests | muse_run.sh: exit 0, ~9 min (566s), `--trust-workspace`; tokens in/cached/out 12,415,706/12,200,325/50,601; est. cost $2.31. |
 | 28 | 2026-10-26 | translate non-English posts (Muse, paid-gated, cached; private -> local only; untranslated shown, never hidden) in brief, web-ui, digest, review, eval; mock tests | muse_run.sh: exit 0, ~14 min (855s), `--trust-workspace`; tokens in/cached/out 27,045,243/26,746,888/76,505; est. cost $4.71. |
-
-
-Renumbered 2026-10-26 (duplicate #15/#16/#21/#22 rows from parallel branches), old->new in file order: 15->15, 18->16, 15->17, 16->18, 22->19, 16->20, 21->21, 22->22, 20->23, 21->24, 23->25. Commit messages keep the original numbers.
+| 29 | 2026-10-26 | try_it cascade Muse token cap 200->1024 (shared const), classify call sites checked, truncated (finish_reason=length) reported distinctly, still fail-closed; eval muse_truncated count; mock tests | muse_run.sh: exit 0, ~5 min (290s), `--trust-workspace`; tokens in/cached/out 2,886,147/2,754,434/26,998; est. cost $0.69. |

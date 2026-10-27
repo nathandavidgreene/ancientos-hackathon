@@ -9,14 +9,16 @@
 //!
 //! Items run through the cascade sequentially from env
 //! ([`JevClient::from_env`] with `JEV_BACKEND`, [`MuseClient::from_env`]
-//! pinned to muse-spark-1.3 / low reasoning / 200 completion tokens).
+//! pinned to muse-spark-1.3 / low reasoning / 1024 completion tokens).
 //! Bookmark text is public X content, so every item runs as
 //! [`Sensitivity::Sanitized`]. The run stops early on HTTP 429 instead of
 //! continuing. Without `ANCIENTOS_ALLOW_PAID=1` it still runs, rules only,
 //! and says so.
 use ancientos_router::jev_client::JevClient;
 use ancientos_router::muse::MuseClient;
-use ancientos_router::try_it_cascade::{Cascade, CascadeStats, RulesVerdict};
+use ancientos_router::try_it_cascade::{
+    Cascade, CascadeStats, RulesVerdict, TRY_IT_MUSE_MAX_COMPLETION_TOKENS,
+};
 use ancientos_router::Sensitivity;
 use bookmarks_agent::brief::topic_of;
 use bookmarks_agent::fixture::Bookmark;
@@ -225,7 +227,7 @@ fn run(args: &Args) -> Result<(), String> {
     let muse = MuseClient::from_env()
         .with_model("muse-spark-1.3")
         .with_reasoning_effort("low")
-        .with_max_completion_tokens(200);
+        .with_max_completion_tokens(TRY_IT_MUSE_MAX_COMPLETION_TOKENS);
     let cascade = Cascade::new(jev.as_ref(), Some(&muse));
 
     // Translations come from $TRANSLATIONS_CACHE_PATH when set, else
@@ -290,6 +292,7 @@ fn run(args: &Args) -> Result<(), String> {
             "predicted": decision.try_it,
             "stage": decision.stage.as_str(),
             "rules_confident": confident,
+            "truncated": decision.truncated,
             "error": decision.error,
         }));
         if decision.is_rate_limited() {
@@ -343,11 +346,12 @@ fn run(args: &Args) -> Result<(), String> {
         rules_prf.tn,
     );
     println!(
-        "calls: jev={} jev_yes={} muse={} muse_yes={} rules_yes={} fail_closed={} errors={}",
+        "calls: jev={} jev_yes={} muse={} muse_yes={} muse_truncated={} rules_yes={} fail_closed={} errors={}",
         stats.jev_calls,
         stats.jev_yes,
         stats.muse_calls,
         stats.muse_yes,
+        stats.muse_truncated,
         stats.rules_yes,
         stats.fail_closed,
         stats.errors,
