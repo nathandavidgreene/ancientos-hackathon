@@ -3,7 +3,8 @@
 //! Usage: `try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>]`.
 //! Labels lines carry an id (`post_id`, or `n`) plus a boolean `try_it`;
 //! bookmarks lines are [`Bookmark`] JSON joined by id. Labels without a
-//! bookmark are skipped with a count, as are malformed lines.
+//! bookmark are skipped with a count, as are malformed lines and
+//! non-English bookmarks (never sampled).
 //!
 //! Items run through the cascade sequentially from env
 //! ([`JevClient::from_env`] with `JEV_BACKEND`, [`MuseClient::from_env`]
@@ -231,12 +232,19 @@ fn run(args: &Args) -> Result<(), String> {
     let mut cascade_pairs: Vec<(bool, bool)> = Vec::new();
     let mut rules_pairs: Vec<(bool, bool)> = Vec::new();
     let mut missing = 0usize;
+    let mut non_english = 0usize;
     let mut stopped_early = false;
     for label in &labels {
         let Some(bookmark) = bookmarks.get(&label.id) else {
             missing += 1;
             continue;
         };
+        // Never sample a non-English post: skipped silently (aggregate
+        // count only), like labels without a bookmark.
+        if !bookmarks_agent::language::is_english(bookmark) {
+            non_english += 1;
+            continue;
+        }
         let confident = rules_confident(&topic_of(bookmark), &bookmark.text);
         let verdict = if confident {
             RulesVerdict::ConfidentYes
@@ -271,7 +279,7 @@ fn run(args: &Args) -> Result<(), String> {
 
     let decided = rows.len();
     println!(
-        "try_it_cascade: {decided} decided, {missing} missing, {} malformed",
+        "try_it_cascade: {decided} decided, {missing} missing, {} malformed, {non_english} non_english",
         labels_bad + bookmarks_bad
     );
     if stopped_early {

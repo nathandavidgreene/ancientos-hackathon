@@ -7,6 +7,7 @@ pub mod digest;
 pub mod fixture;
 pub mod idea_card;
 pub mod ingest;
+pub mod language;
 pub mod liveness;
 pub mod media;
 pub mod merge;

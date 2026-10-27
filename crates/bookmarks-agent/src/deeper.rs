@@ -1146,6 +1146,7 @@ pub fn run_with(
         label: None,
         had_note_tweet: false,
         media: media.clone(),
+        lang: None,
     };
     let is_try_it = crate::try_it::classify(&probe).is_some();
     let (output, model, usage, mode) = if allow_paid && offline_fixture.is_none() {

@@ -189,6 +189,30 @@ pub fn weekly_digest(
     }
 }
 
+/// Assemble the digest like [`weekly_digest`], skipping cards from a known
+/// non-English source post and nudges for known non-English posts (see
+/// [`crate::language`]). Skipped silently: no message, no placeholder.
+/// Cards and nudges whose source post is unknown (not in `bookmarks`) are
+/// kept: these surfaces show ids and locally generated idea text, never
+/// post text.
+pub fn weekly_digest_for_bookmarks(
+    cards: &[IdeaCard],
+    pending: &[String],
+    entries: &[Entry],
+    now: u64,
+    bookmarks: &[crate::fixture::Bookmark],
+) -> WeeklyDigest {
+    let cards: Vec<IdeaCard> = cards
+        .iter()
+        .filter(|c| {
+            crate::language::source_post_is_english(&c.source_url, bookmarks) != Some(false)
+        })
+        .cloned()
+        .collect();
+    let pending = crate::language::retain_not_known_non_english(pending, bookmarks);
+    weekly_digest(&cards, &pending, entries, now)
+}
+
 /// One due card, presented one at a time (`index/total`, 1-based) with the
 /// adopt/park/drop triage commands.
 pub fn render_card(card: &IdeaCard, resurfaced: bool, index: usize, total: usize) -> String {
@@ -542,5 +566,66 @@ mod tests {
         assert_eq!(d.cards.len(), 1);
         assert_eq!(d.nudges.len(), 1);
         assert_eq!(d.nudges[0].post_id, "p1");
+    }
+
+    fn stored_post(id: &str, text: &str, lang: Option<&str>) -> crate::fixture::Bookmark {
+        crate::fixture::Bookmark {
+            post_id: id.into(),
+            url: format!("https://x.com/i/status/{id}"),
+            text: text.into(),
+            author_username: Some(format!("syn_{id}")),
+            created_at: None,
+            folders: None,
+            label: None,
+            had_note_tweet: false,
+            media: Vec::new(),
+            lang: lang.map(str::to_string),
+        }
+    }
+
+    fn sourced_card(id: &str, post_id: &str) -> IdeaCard {
+        let mut c = card(id, Status::New, 1, None);
+        c.source_url = format!("https://x.com/i/status/{post_id}");
+        c
+    }
+
+    #[test]
+    fn digest_for_bookmarks_skips_non_english_and_keeps_unknown() {
+        let bookmarks = vec![
+            stored_post(
+                "en1",
+                "[synthetic] The government presented an economic plan to support small local businesses.",
+                None,
+            ),
+            stored_post(
+                "es1",
+                "[synthetic] The government presented an economic plan to support small local businesses.",
+                Some("es"),
+            ),
+        ];
+        let cards = vec![
+            sourced_card("card-en", "en1"),
+            sourced_card("card-es", "es1"),
+            sourced_card("card-ghost", "ghost"),
+        ];
+        let entries = shown_entries(
+            &[
+                ("en1", Some(NOW - NUDGE_SECS - 1)),
+                ("es1", Some(NOW - NUDGE_SECS - 1)),
+                ("ghost", Some(NOW - NUDGE_SECS - 1)),
+            ],
+            &[],
+        );
+        let pending = pending_of(&entries);
+        assert_eq!(pending.len(), 3);
+        let d = weekly_digest_for_bookmarks(&cards, &pending, &entries, NOW, &bookmarks);
+        let card_ids: Vec<&str> = d.cards.iter().map(|c| c.card.id.as_str()).collect();
+        assert_eq!(card_ids, vec!["card-en", "card-ghost"]);
+        let nudge_ids: Vec<&str> = d.nudges.iter().map(|n| n.post_id.as_str()).collect();
+        assert_eq!(nudge_ids, vec!["en1", "ghost"]);
+        // Rendered digest never mentions the filtered post.
+        let text = render(&d);
+        assert!(!text.contains("es1"), "{text}");
+        assert!(!text.contains("card-es"), "{text}");
     }
 }

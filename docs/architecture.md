@@ -66,6 +66,7 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `x_api` | bookmarks-agent | Read-only X client: bookmarks, hydrate, threads, quotes |
 | `ingest`, `merge`, `fixture` | bookmarks-agent | Incremental sync. Bookmarks are never removed. |
 | `sanitize` | bookmarks-agent | Strips PII before anything is sent to a hosted model |
+| `language` | bookmarks-agent | English-only filter: X `lang` wins, else offline script + stopword heuristic; non-English skipped silently, fail closed |
 | `brief` | bookmarks-agent | Candidate selection, one model call, local fallback |
 | `media` | bookmarks-agent | Photos and video under the full text, capped at 1080p |
 | `vote` | bookmarks-agent | Records verdicts |

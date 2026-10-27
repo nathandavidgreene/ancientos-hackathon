@@ -93,6 +93,9 @@ fn merge_pair(live: &Bookmark, fixture: &Bookmark) -> Bookmark {
     if merged.media.is_empty() {
         merged.media = fixture.media.clone();
     }
+    if merged.lang.is_none() {
+        merged.lang.clone_from(&fixture.lang);
+    }
     merged
 }
 
@@ -200,6 +203,7 @@ mod tests {
             label: None,
             had_note_tweet: false,
             media: Vec::new(),
+            lang: None,
         }
     }
 
@@ -333,6 +337,24 @@ mod tests {
         ];
         let out = merge(&rows, &[]);
         assert_eq!(out.counts.high_confidence, 2);
+    }
+
+    #[test]
+    fn keeps_fixture_lang_when_live_has_none() {
+        let mut live = bm("s", "live text");
+        live.lang = None;
+        let mut fixture = bm("s", "fixture text");
+        fixture.lang = Some("en".into());
+        let out = merge(std::slice::from_ref(&live), std::slice::from_ref(&fixture));
+        assert_eq!(out.rows[0].lang.as_deref(), Some("en"));
+        // Live lang wins when present.
+        let mut live_with = bm("s", "live text");
+        live_with.lang = Some("es".into());
+        let out = merge(
+            std::slice::from_ref(&live_with),
+            std::slice::from_ref(&fixture),
+        );
+        assert_eq!(out.rows[0].lang.as_deref(), Some("es"));
     }
 
     #[test]

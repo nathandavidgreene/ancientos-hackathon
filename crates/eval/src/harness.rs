@@ -6,7 +6,8 @@
 //! - brief ranking (`bookmarks_agent::brief::select_candidates` with an empty
 //!   live set, then `bookmarks_agent::brief::local_picks`)
 //!
-//! Reports carry aggregate numbers only, never post text, ids or urls.
+//! Non-English bookmarks are never sampled (skipped with an aggregate count
+//! only). Reports carry aggregate numbers only, never post text, ids or urls.
 
 use bookmarks_agent::fixture::Bookmark;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -118,21 +119,29 @@ pub struct EvalReport {
     pub n_labels: usize,
     pub n_matched: usize,
     pub n_unmatched_labels: usize,
+    /// Matched bookmarks skipped as non-English (never sampled for scoring).
+    pub n_non_english: usize,
     pub try_it: Confusion,
     pub ranking: RankingEval,
 }
 
 /// Join `labels` to `bookmarks` by `post_id` and score both tasks. Labels
 /// without a matching bookmark are counted in `n_unmatched_labels`: never an
-/// error, never a panic.
+/// error, never a panic. Matched bookmarks that are not English are skipped
+/// silently (counted in `n_non_english` only), mirroring how the brief
+/// drops non-English posts before candidate selection.
 pub fn evaluate(bookmarks: &[Bookmark], labels: &[Label], name: &str) -> EvalReport {
     let by_id: HashMap<&str, &Bookmark> =
         bookmarks.iter().map(|b| (b.post_id.as_str(), b)).collect();
     let mut matched: Vec<(&Bookmark, &Label)> = Vec::new();
     let mut unmatched = 0usize;
+    let mut non_english = 0usize;
     for label in labels {
         match by_id.get(label.post_id.as_str()) {
-            Some(bookmark) => matched.push((bookmark, label)),
+            Some(bookmark) if bookmarks_agent::language::is_english(bookmark) => {
+                matched.push((bookmark, label));
+            }
+            Some(_) => non_english += 1,
             None => unmatched += 1,
         }
     }
@@ -178,6 +187,7 @@ pub fn evaluate(bookmarks: &[Bookmark], labels: &[Label], name: &str) -> EvalRep
         n_labels: labels.len(),
         n_matched: matched.len(),
         n_unmatched_labels: unmatched,
+        n_non_english: non_english,
         try_it,
         ranking: RankingEval {
             precision_at_5: safe_div(picks_hit, picks.len()),
@@ -213,7 +223,7 @@ pub fn render_markdown(report: &EvalReport) -> String {
     format!(
         "# Eval report — {name}\n\
          \n\
-         Labels: {n_labels} total, {n_matched} matched, {n_unmatched} unmatched.\n\
+         Labels: {n_labels} total, {n_matched} matched, {n_unmatched} unmatched, {n_non_en} non-English skipped.\n\
          \n\
          | Task | n | TP | FP | FN | TN | Precision | Recall | F1 |\n\
          | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n\
@@ -235,6 +245,7 @@ pub fn render_markdown(report: &EvalReport) -> String {
         n_labels = report.n_labels,
         n_matched = report.n_matched,
         n_unmatched = report.n_unmatched_labels,
+        n_non_en = report.n_non_english,
         n = t.n(),
         tp = t.tp,
         fp = t.fp,
@@ -349,6 +360,58 @@ mod tests {
             assert!(!md.contains(&b.text), "leaked post text");
             assert!(!md.contains(&b.url), "leaked url");
         }
+    }
+
+    #[test]
+    fn non_english_bookmarks_are_never_sampled() {
+        let en = Bookmark {
+            post_id: "syn-en".to_string(),
+            url: "https://x.com/i/status/syn-en".to_string(),
+            text: "[synthetic] The government presented an economic plan to support small local businesses."
+                .to_string(),
+            author_username: None,
+            created_at: None,
+            folders: None,
+            label: None,
+            had_note_tweet: false,
+            media: Vec::new(),
+            lang: None,
+        };
+        let es = Bookmark {
+            post_id: "syn-es".to_string(),
+            url: "https://x.com/i/status/syn-es".to_string(),
+            text: "[synthetic] The government presented an economic plan to support small local businesses."
+                .to_string(),
+            author_username: None,
+            created_at: None,
+            folders: None,
+            label: None,
+            had_note_tweet: false,
+            media: Vec::new(),
+            lang: Some("es".to_string()),
+        };
+        let labels = vec![
+            Label {
+                post_id: "syn-en".to_string(),
+                try_it: false,
+                brief_worthy: true,
+            },
+            Label {
+                post_id: "syn-es".to_string(),
+                try_it: false,
+                brief_worthy: true,
+            },
+        ];
+        let report = evaluate(&[en, es], &labels, "synthetic");
+        assert_eq!(report.n_labels, 2);
+        assert_eq!(report.n_matched, 1);
+        assert_eq!(report.n_unmatched_labels, 0);
+        assert_eq!(report.n_non_english, 1);
+        assert_eq!(report.ranking.n_brief_worthy, 1);
+        assert_eq!(report.ranking.n_candidates, 1);
+        let md = render_markdown(&report);
+        assert!(md.contains("1 non-English skipped"), "{md}");
+        assert!(!md.contains("syn-es"), "{md}");
     }
 
     #[test]

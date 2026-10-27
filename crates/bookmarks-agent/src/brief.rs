@@ -469,10 +469,11 @@ pub fn render_markdown(
     md
 }
 
-/// Run the brief: filter dead/unavailable posts via liveness, select
-/// candidates, make at most one model call, gate every pick, hydrate
-/// truncated full text (display only), expand one thread root (display
-/// only), append to the decision log, and render markdown.
+/// Run the brief: filter dead/unavailable posts via liveness and
+/// non-English posts via the language filter, select candidates, make at
+/// most one model call, gate every pick, hydrate truncated full text
+/// (display only), expand one thread root (display only), append to the
+/// decision log, and render markdown.
 pub fn run(
     merged: &MergeOutput,
     model: &dyn BriefModel,
@@ -554,6 +555,7 @@ pub fn run_full(
 /// real X client. Dead/unknown posts are skipped before candidate selection
 /// (fail closed, excluded from model eval and the approval gate); only a
 /// liveness cache entry is recorded, never a decision-log entry.
+/// Non-English posts are skipped the same way right after (no log entry).
 #[allow(clippy::too_many_arguments)]
 pub fn run_full_with_liveness(
     merged: &MergeOutput,
@@ -591,6 +593,10 @@ pub fn run_full_with_liveness(
         Some(l) => crate::liveness::filter_with_lookup(&rows, &cache_path, offline, now, l)?,
         None => crate::liveness::filter_live(&rows, &cache_path, offline, now)?,
     };
+    // Language: never surface a non-English post. Skipped silently in
+    // memory only (fail closed), like dead posts above: no log entry, and
+    // the store is never modified.
+    let rows: Vec<Bookmark> = crate::language::english_only(&rows);
     if rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
@@ -808,6 +814,9 @@ mod tests {
             }),
             had_note_tweet: false,
             media: Vec::new(),
+            // Synthetic English posts: a determined code keeps brief tests
+            // hermetic (the language filter is covered by its own tests).
+            lang: Some("en".to_string()),
         }
     }
 
@@ -1634,6 +1643,105 @@ mod tests {
             !cache.contains_key("id3"),
             "unknown is never cached: {cache:?}"
         );
+    }
+
+    #[test]
+    fn language_non_english_are_excluded_without_log_or_delete() {
+        use std::collections::HashMap;
+        let _env = crate::test_support::EnvHold::paid_on();
+        let mut rows: Vec<Bookmark> = ["en1", "en2", "es1", "fr1", "cjk1", "short1"]
+            .into_iter()
+            .map(|id| bm(id, None, Some("TopicA"), Some(0.9)))
+            .collect();
+        for b in &mut rows {
+            match b.post_id.as_str() {
+                "en1" => {
+                    b.lang = None;
+                    b.text = "[synthetic] The government presented an economic plan to support small local businesses.".into();
+                }
+                "en2" => {
+                    b.lang = Some("en".into());
+                    b.text = "[synthetic] short".into();
+                }
+                "es1" => {
+                    b.lang = Some("es".into());
+                    b.text = "[synthetic] The government presented an economic plan to support small local businesses.".into();
+                }
+                "fr1" => {
+                    b.lang = None;
+                    b.text = "[synthetic] Le gouvernement présente un plan économique pour soutenir les petites entreprises locales.".into();
+                }
+                "cjk1" => {
+                    b.lang = None;
+                    b.text = "[synthetic] 这是一个中文测试帖子".into();
+                }
+                _ => {
+                    b.lang = None;
+                    b.text = "[synthetic] Wow".into();
+                }
+            }
+        }
+        let merged = merged_of(rows, &["en1", "en2", "es1", "fr1", "cjk1", "short1"]);
+        let before: Vec<String> = merged.rows.iter().map(|b| b.post_id.clone()).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("decision_log.jsonl");
+        // Liveness passes everything: only the language filter drops rows.
+        let lookup =
+            |chunk: &[String]| -> Result<HashMap<String, crate::x_api::PostLiveness>, String> {
+                Ok(chunk
+                    .iter()
+                    .map(|id| (id.clone(), crate::x_api::PostLiveness::Live))
+                    .collect())
+            };
+        let model = FakeModel::ok(r#"[{"n":1,"why":"ok one"},{"n":2,"why":"ok two"}]"#);
+        let res = run_full_with_liveness(
+            &merged,
+            &model,
+            &log_path,
+            "2026-10-26",
+            None,
+            None,
+            false,
+            Some(&lookup),
+        )
+        .unwrap();
+        // Filtered posts never surface: not candidates (model input), not
+        // picks (gate input), not markdown.
+        for gone in ["es1", "fr1", "cjk1", "short1"] {
+            assert!(
+                !res.candidates.iter().any(|c| c.post_id == gone),
+                "candidate {gone}"
+            );
+            assert!(!res.picks.iter().any(|p| p.post_id == gone), "pick {gone}");
+            assert!(
+                !res.markdown.contains(gone),
+                "markdown mentions {gone}: {}",
+                res.markdown
+            );
+            assert!(
+                !model.seen.borrow()[0].contains(gone),
+                "model prompt saw {gone}"
+            );
+        }
+        assert_eq!(res.candidates.len(), 2);
+        assert_eq!(res.picks.len(), 2);
+        // Merged input is unchanged: nothing deleted.
+        let after: Vec<String> = merged.rows.iter().map(|b| b.post_id.clone()).collect();
+        assert_eq!(before, after);
+        // No decision-log entry mentions a filtered post or language.
+        let entries = DecisionLog::open(&log_path).unwrap().verify().unwrap();
+        for e in &entries {
+            assert!(
+                !e.kind.contains("language"),
+                "no language log kind allowed: {}",
+                e.kind
+            );
+            let payload = e.payload.to_string();
+            for gone in ["es1", "fr1", "cjk1", "short1"] {
+                assert!(!payload.contains(gone), "log mentions {gone}: {payload}");
+            }
+        }
+        assert!(entries.iter().any(|e| e.kind == "brief.candidates"));
     }
 
     #[test]

@@ -154,13 +154,20 @@ fn run_bin(args: &[&str], env: &[(&str, &str)], remove_env: &[&str]) -> (bool, S
 }
 
 fn bookmark(id: &str, topic: &str, text: &str) -> String {
-    serde_json::json!({
+    bookmark_lang(id, topic, text, None)
+}
+
+fn bookmark_lang(id: &str, topic: &str, text: &str, lang: Option<&str>) -> String {
+    let mut row = serde_json::json!({
         "post_id": id,
         "url": format!("https://x.com/i/status/{id}"),
         "text": text,
         "label": {"parent_label": topic},
-    })
-    .to_string()
+    });
+    if let Some(lang) = lang {
+        row["lang"] = serde_json::json!(lang);
+    }
+    row.to_string()
 }
 
 /// Three synthetic bookmarks: one rules-confident yes, two rules-unsure.
@@ -356,6 +363,63 @@ fn paid_off_runs_rules_only_with_zero_calls() {
     assert_eq!(rows[0]["predicted"], true);
     assert_eq!(rows[1]["predicted"], false);
     assert_eq!(rows[2]["predicted"], false);
+}
+
+#[test]
+fn non_english_bookmarks_are_never_sampled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bookmarks = [
+        bookmark_lang(
+            "c-en",
+            "Art",
+            "[synthetic] The gallery reopened this week with a new exhibition of local artists.",
+            None,
+        ),
+        bookmark_lang(
+            "c-es",
+            "Art",
+            "[synthetic] The gallery reopened this week with a new exhibition of local artists.",
+            Some("es"),
+        ),
+    ]
+    .join("\n")
+        + "\n";
+    let labels =
+        "{\"post_id\":\"c-en\",\"try_it\":false}\n{\"post_id\":\"c-es\",\"try_it\":false}\n";
+    let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), labels, &bookmarks);
+    let jev_closed = closed_url();
+    let muse_closed = closed_url();
+
+    let (ok, stdout, stderr) = run_bin(
+        &[
+            "--labels",
+            &labels_path,
+            "--bookmarks",
+            &bookmarks_path,
+            "--out",
+            &out_path,
+        ],
+        &[
+            ("JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_BASE_URL", &jev_closed),
+            ("TYPESAFE_API_KEY", "test-key"),
+            ("META_API_BASE", &muse_closed),
+            ("META_API_KEY", "test-key"),
+        ],
+        &["ANCIENTOS_ALLOW_PAID"],
+    );
+    assert!(ok, "exit ok, stderr: {stderr}");
+    assert!(
+        stdout.contains("1 decided, 0 missing, 0 malformed, 1 non_english"),
+        "{stdout}"
+    );
+    let out = std::fs::read_to_string(&out_path).expect("read out");
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("out is jsonl"))
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["post_id"], "c-en");
 }
 
 #[test]

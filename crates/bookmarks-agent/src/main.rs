@@ -21,7 +21,7 @@
 //! unless `--dry-run` or `--now` is given.
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, merge, oauth,
+    brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, language, merge, oauth,
     token_store, try_it, vote, x_api,
 };
 use std::path::PathBuf;
@@ -322,13 +322,27 @@ fn format_idea_line(card: &idea_card::IdeaCard) -> String {
     )
 }
 
+/// Stored bookmarks for language filtering of id/card surfaces. A missing
+/// or unreadable store means every source is unknown (kept), so these
+/// read-only listings never fail just because the store is absent.
+fn bookmarks_for_filtering() -> Vec<fixture::Bookmark> {
+    ingest::Store::load()
+        .map(|s| s.by_id.into_values().collect())
+        .unwrap_or_default()
+}
+
 fn cmd_ideas(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err(USAGE.to_string());
     }
     let path = idea_card::idea_cards_path()?;
     let cards = idea_card::list_due_for_triage(&path, idea_card::now_secs())?;
+    let bookmarks = bookmarks_for_filtering();
     for card in &cards {
+        // Cards from a known non-English source post are skipped silently.
+        if language::source_post_is_english(&card.source_url, &bookmarks) == Some(false) {
+            continue;
+        }
         println!("{}", format_idea_line(card));
     }
     Ok(())
@@ -410,7 +424,9 @@ fn cmd_try_pending(args: &[String]) -> Result<(), String> {
     }
     let log_path = brief::decision_log_path()?;
     let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
-    for id in try_it::pending_followups(&log) {
+    let pending = try_it::pending_followups(&log);
+    // Known non-English posts are skipped silently (unknown ids are kept).
+    for id in language::retain_not_known_non_english(&pending, &bookmarks_for_filtering()) {
         println!("{id}");
     }
     Ok(())
@@ -482,7 +498,8 @@ fn cmd_digest(args: &[String]) -> Result<(), String> {
     let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let pending = try_it::pending_followups(&log);
-    let d = digest::weekly_digest(&cards, &pending, &entries, now);
+    let bookmarks = bookmarks_for_filtering();
+    let d = digest::weekly_digest_for_bookmarks(&cards, &pending, &entries, now, &bookmarks);
     print!("{}", digest::render(&d));
     if digest::should_record(parsed.dry_run, now_override) {
         digest::record_shown(&mut log, now)?;

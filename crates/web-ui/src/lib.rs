@@ -7,7 +7,8 @@
 //! data dir plus the append-only decision log. Liveness is checked once at
 //! startup via [`State::open_with_liveness`] (batched X lookup, 24h cache,
 //! `--demo`/paid-off skips with no network); dead posts are filtered in
-//! memory only and the store is never modified.
+//! memory only and the store is never modified. Non-English posts are
+//! filtered the same way right after (offline heuristic, no network).
 
 use bookmarks_agent::fixture::Bookmark;
 use std::collections::BTreeMap;
@@ -91,7 +92,12 @@ impl Response {
 #[derive(Debug, Clone)]
 pub struct State {
     pub data_dir: PathBuf,
+    /// Surfaced posts: live and English only (see [`State::open_with_liveness`]).
     pub bookmarks: Vec<Bookmark>,
+    /// Every post loaded from the store, before liveness/language filtering.
+    /// Used only to resolve a pending id or idea-card source to its stored
+    /// post for filtering; never rendered.
+    all_bookmarks: Vec<Bookmark>,
 }
 
 /// `store.jsonl` (demo/tests) if present, else the real synced
@@ -118,6 +124,8 @@ impl State {
     /// transient-unknown posts are filtered in memory only; the store file
     /// is never modified. Outcomes are recorded only in the 24h disk cache
     /// in this data dir — never the decision log, never the store.
+    /// Non-English posts are filtered the same way right after (silently,
+    /// in memory only, never logged).
     pub fn open_with_liveness(dir: impl AsRef<Path>, offline: bool) -> Result<Self, String> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| format!("data dir failed: {e}"))?;
@@ -129,8 +137,9 @@ impl State {
         };
         bookmarks.sort_by(|a, b| a.post_id.cmp(&b.post_id));
         let state = Self {
-            data_dir: dir,
-            bookmarks,
+            data_dir: dir.clone(),
+            bookmarks: bookmarks.clone(),
+            all_bookmarks: bookmarks,
         };
         let live = bookmarks_agent::liveness::filter_live(
             &state.bookmarks,
@@ -138,9 +147,11 @@ impl State {
             offline,
             bookmarks_agent::liveness::now_secs(),
         )?;
+        let live = bookmarks_agent::language::english_only(&live);
         Ok(Self {
-            data_dir: state.data_dir,
+            data_dir: dir,
             bookmarks: live,
+            all_bookmarks: state.all_bookmarks,
         })
     }
 
@@ -549,6 +560,15 @@ fn page_ideas(state: &State) -> Response {
         Ok(c) => c,
         Err(e) => return Response::status(500, error_page("Ideas failed", &e)),
     };
+    // Cards from a known non-English source post get no UI mention (cards
+    // whose source is unknown are kept: their idea text is locally generated).
+    let cards: Vec<_> = cards
+        .into_iter()
+        .filter(|c| {
+            bookmarks_agent::language::source_post_is_english(&c.source_url, &state.all_bookmarks)
+                != Some(false)
+        })
+        .collect();
     let mut body = String::from("<h1>Ideas due for triage</h1>");
     if cards.is_empty() {
         body.push_str("<p>No ideas due for triage.</p>");
@@ -615,11 +635,21 @@ fn page_try(state: &State) -> Response {
     };
     // Dead posts get no UI mention: skip pending ids with a fresh
     // `unavailable` liveness-cache entry (read-only reuse, no network).
+    // Non-English posts get no UI mention either: skip pending ids whose
+    // stored post is known non-English (unknown ids are kept: they show no
+    // post text, only "(not in store)").
     let cache = bookmarks_agent::liveness::load_cache(&state.liveness_cache_path());
     let now = bookmarks_agent::liveness::now_secs();
     let pending: Vec<&String> = pending
         .iter()
         .filter(|id| !bookmarks_agent::liveness::is_fresh_unavailable(&cache, id, now))
+        .filter(|id| {
+            state
+                .all_bookmarks
+                .iter()
+                .find(|b| &b.post_id == *id)
+                .is_none_or(bookmarks_agent::language::is_english)
+        })
         .collect();
     let mut body = String::from("<h1>Try it — pending check-ins</h1>");
     if pending.is_empty() {
@@ -1058,15 +1088,31 @@ mod tests {
         label: Option<&str>,
         media: Vec<serde_json::Value>,
     ) -> String {
+        bookmark_lang(id, text, label, media, Some("en"))
+    }
+
+    /// Bookmark row with an explicit `lang` (`None` omits the key, so the
+    /// offline heuristic decides).
+    fn bookmark_lang(
+        id: &str,
+        text: &str,
+        label: Option<&str>,
+        media: Vec<serde_json::Value>,
+        lang: Option<&str>,
+    ) -> String {
         let media_json: Vec<String> = media.iter().map(ToString::to_string).collect();
         let label_json = label
             .map(|l| format!(",\"label\":{{\"parent_label\":\"{l}\"}}"))
             .unwrap_or_default();
+        let lang_json = lang
+            .map(|l| format!(",\"lang\":\"{l}\""))
+            .unwrap_or_default();
         format!(
             "{{\"post_id\":\"{id}\",\"url\":\"https://example.invalid/a/status/{id}\",\
-             \"text\":{},\"author_username\":\"syn_{id}\"{label_json},\"media\":[{}]}}",
+             \"text\":{},\"author_username\":\"syn_{id}\"{label_json},\"media\":[{media}]{lang}}}",
             serde_json::to_string(text).unwrap(),
-            media_json.join(","),
+            media = media_json.join(","),
+            lang = lang_json,
         )
     }
 
@@ -1651,7 +1697,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("bookmarks.jsonl"),
-            "{\"post_id\":\"42\",\"url\":\"https://x.com/a/status/42\",\"text\":\"hello real\"}\n",
+            "{\"post_id\":\"42\",\"url\":\"https://x.com/a/status/42\",\"text\":\"hello real\",\"lang\":\"en\"}\n",
         )
         .unwrap();
         let state = State::open(dir.path()).unwrap();
@@ -1838,6 +1884,135 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert!(resp.body.contains("live1"), "{}", resp.body);
         assert!(!resp.body.contains("dead1"), "no UI mention: {}", resp.body);
+    }
+
+    #[test]
+    fn open_drops_non_english_without_deleting_or_logging() {
+        let _env = PaidGuard::paid_off();
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            bookmark_lang(
+                "en1",
+                "[synthetic] The government presented an economic plan to support small local businesses.",
+                None,
+                Vec::new(),
+                None,
+            ),
+            bookmark_lang("en2", "[synthetic] short", None, Vec::new(), Some("en")),
+            bookmark_lang(
+                "es1",
+                "[synthetic] The government presented an economic plan to support small local businesses.",
+                None,
+                Vec::new(),
+                Some("es"),
+            ),
+            bookmark_lang(
+                "fr1",
+                "[synthetic] Le gouvernement présente un plan économique pour soutenir les petites entreprises locales.",
+                None,
+                Vec::new(),
+                None,
+            ),
+        ];
+        let body = rows.join("\n") + "\n";
+        std::fs::write(dir.path().join("store.jsonl"), &body).unwrap();
+        let state = State::open(dir.path()).unwrap();
+        let ids: Vec<&str> = state.bookmarks.iter().map(|b| b.post_id.as_str()).collect();
+        assert_eq!(ids, vec!["en1", "en2"]);
+        // The store file is byte-identical: nothing deleted.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("store.jsonl")).unwrap(),
+            body
+        );
+        assert!(!state.log_path().exists());
+        // And the brief page never mentions a filtered post.
+        let resp = handle(&Request::get("/"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("post 1 of 2"), "{}", resp.body);
+        assert!(!resp.body.contains("es1"), "{}", resp.body);
+        assert!(!resp.body.contains("fr1"), "{}", resp.body);
+    }
+
+    #[test]
+    fn try_page_skips_non_english_pending_without_ui_mention() {
+        let _env = PaidGuard::paid_off();
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            bookmark_lang(
+                "en1",
+                "[synthetic] kept hands-on: 1. Do A 2. Do B",
+                None,
+                Vec::new(),
+                Some("en"),
+            ),
+            bookmark_lang(
+                "es1",
+                "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales.",
+                None,
+                Vec::new(),
+                Some("es"),
+            ),
+        ];
+        std::fs::write(dir.path().join("store.jsonl"), rows.join("\n") + "\n").unwrap();
+        let state = State::open(dir.path()).unwrap();
+        assert_eq!(state.bookmarks.len(), 1);
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        bookmarks_agent::try_it::record_shown(&mut log, "en1", 1_700_000_000).unwrap();
+        bookmarks_agent::try_it::record_shown(&mut log, "es1", 1_700_000_000).unwrap();
+        drop(log);
+        let resp = handle(&Request::get("/try"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("en1"), "{}", resp.body);
+        assert!(!resp.body.contains("es1"), "no UI mention: {}", resp.body);
+    }
+
+    #[test]
+    fn ideas_page_skips_non_english_source_cards_without_ui_mention() {
+        let _env = PaidGuard::paid_off();
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            bookmark_lang("en1", "[synthetic] kept post", None, Vec::new(), Some("en")),
+            bookmark_lang(
+                "es1",
+                "[synthetic] post filtrado",
+                None,
+                Vec::new(),
+                Some("es"),
+            ),
+        ];
+        std::fs::write(dir.path().join("store.jsonl"), rows.join("\n") + "\n").unwrap();
+        let card = |id: &str, source: &str| {
+            serde_json::json!({
+                "id": id,
+                "source_url": source,
+                "idea": format!("synthetic idea {id}"),
+                "ancientos_mapping": "gate",
+                "effort": "S",
+                "status": "new",
+                "created_at": 1_700_000_000u64,
+            })
+            .to_string()
+        };
+        let cards = [
+            card("card-en", "https://example.invalid/a/status/en1"),
+            card("card-es", "https://example.invalid/a/status/es1"),
+            card("card-ghost", "https://example.invalid/a/status/ghost"),
+        ];
+        std::fs::write(dir.path().join("idea_cards.jsonl"), cards.join("\n") + "\n").unwrap();
+        let state = State::open(dir.path()).unwrap();
+        let resp = handle(&Request::get("/ideas"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("card-en"), "{}", resp.body);
+        assert!(
+            resp.body.contains("card-ghost"),
+            "unknown kept: {}",
+            resp.body
+        );
+        assert!(
+            !resp.body.contains("card-es"),
+            "no UI mention: {}",
+            resp.body
+        );
     }
 
     #[test]

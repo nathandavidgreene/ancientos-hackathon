@@ -139,6 +139,7 @@ mod tests {
             label: None,
             had_note_tweet: false,
             media: Vec::new(),
+            lang: None,
         }
     }
 

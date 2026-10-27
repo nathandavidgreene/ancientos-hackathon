@@ -15,7 +15,7 @@ pub const ME_URL: &str = "https://api.x.com/2/users/me";
 pub fn bookmarks_url(user_id: &str) -> String {
     format!(
         "https://api.x.com/2/users/{}/bookmarks?max_results=100\
-         &tweet.fields=note_tweet,text,created_at,author_id,attachments&expansions=author_id,{}\
+         &tweet.fields=note_tweet,text,created_at,author_id,lang,attachments&expansions=author_id,{}\
          &media.fields={}&user.fields=username",
         crate::oauth::url_encode(user_id),
         crate::media::MEDIA_EXPANSION,
@@ -344,6 +344,11 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
                 label: None,
                 had_note_tweet: had_note_tweet(t),
                 media: crate::media::for_tweet(t, &media_index),
+                lang: t
+                    .get("lang")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
             });
         }
     }
@@ -831,6 +836,33 @@ mod tests {
             1_800_000_000,
             "tweet.read".into(),
         )
+    }
+
+    #[test]
+    fn bookmarks_url_requests_lang_field() {
+        let u = bookmarks_url("123");
+        assert!(u.contains("tweet.fields="), "{u}");
+        assert!(u.contains(",lang,"), "{u}");
+    }
+
+    #[test]
+    fn parses_bookmarks_page_stores_lang() {
+        let raw = serde_json::json!({
+            "data": [
+                {"id": "1", "text": "hello", "author_id": "u1", "lang": "en"},
+                {"id": "2", "text": "hola", "author_id": "u1", "lang": "es"},
+                {"id": "3", "text": "no lang here", "author_id": "u1"},
+                {"id": "4", "text": "blank lang", "author_id": "u1", "lang": "  "}
+            ],
+            "includes": {"users": [{"id": "u1", "username": "alice"}]},
+            "meta": {}
+        });
+        let page = parse_bookmarks_page(&raw).unwrap();
+        assert_eq!(page.items.len(), 4);
+        assert_eq!(page.items[0].lang.as_deref(), Some("en"));
+        assert_eq!(page.items[1].lang.as_deref(), Some("es"));
+        assert_eq!(page.items[2].lang, None);
+        assert_eq!(page.items[3].lang, None);
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub struct Bookmark {
     /// older fixtures and stores.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<crate::media::Media>,
+    /// X `lang` field (BCP 47, e.g. `en`). `None` for old stores and
+    /// fixtures that predate ingest storing it; see [`crate::language`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,5 +110,21 @@ mod tests {
         assert!(rows[0].media.is_empty());
         let back = serde_json::to_string(&rows[0]).unwrap();
         assert!(!back.contains("media"), "{back}");
+    }
+
+    #[test]
+    fn lang_defaults_to_none_and_round_trips() {
+        let old =
+            r#"{"post_id":"old1","url":"https://x.com/i/status/old1","text":"synthetic old"}"#;
+        let rows = parse_jsonl(old).unwrap();
+        assert_eq!(rows[0].lang, None);
+        let back = serde_json::to_string(&rows[0]).unwrap();
+        assert!(!back.contains("lang"), "{back}");
+        let tagged =
+            r#"{"post_id":"t1","url":"https://x.com/i/status/t1","text":"synthetic","lang":"es"}"#;
+        let rows = parse_jsonl(tagged).unwrap();
+        assert_eq!(rows[0].lang.as_deref(), Some("es"));
+        let back = serde_json::to_string(&rows[0]).unwrap();
+        assert!(back.contains("\"lang\":\"es\""), "{back}");
     }
 }
