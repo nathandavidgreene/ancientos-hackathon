@@ -3798,6 +3798,43 @@ mod tests {
     }
 
     #[test]
+    fn approvals_page_lists_and_decides_a_muse_runs_proposal() {
+        // Second app on the same core and log: a proposed Muse Code run shows
+        // up and is decided here with no web-ui code specific to it.
+        let (dir, state) = test_state();
+        let prompt = dir.path().join("prompt.md");
+        std::fs::write(&prompt, "synthetic prompt\n").unwrap();
+        let spec = muse_runs::RunSpec::from_prompt("62", "synthetic web run", &prompt).unwrap();
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        let req = muse_runs::propose(&mut log, &spec, now_secs()).unwrap();
+        let resp = handle(&Request::get("/approvals"), &state);
+        assert!(resp.body.contains("Approvals (1)"), "{}", resp.body);
+        assert!(resp.body.contains("muse-runs"), "{}", resp.body);
+        assert!(resp.body.contains("Muse Code run #62"), "{}", resp.body);
+        let resp = handle(
+            &Request::post(
+                "/approvals/approve",
+                &format!("id={}&payload_hash={}", req.id, req.payload_hash),
+            ),
+            &state,
+        );
+        assert_eq!(resp.status, 303);
+        let log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        assert_eq!(
+            muse_runs::status_of(&log, &req.id, now_secs()).unwrap(),
+            ancientos_core::approvals::Status::Approved
+        );
+        // Approval in the browser records the decision only; running still
+        // needs the paid switch (and never reaches real Muse in tests).
+        let mut log = log;
+        let runner = muse_runs::Runner {
+            repo: dir.path().to_path_buf(),
+            allow_paid: false,
+        };
+        assert!(muse_runs::run(&mut log, &req.id, &runner).is_err());
+    }
+
+    #[test]
     fn approvals_page_shows_tampered_badge() {
         let (_dir, state) = test_state();
         seed_approval(&state, "synthetic web tamper", "draft-h", now_secs(), None);

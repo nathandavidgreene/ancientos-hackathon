@@ -91,6 +91,7 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `daemon` | bookmarks-agent | Scheduler daemon: small agents ticking on a schedule, risky work via approvals |
 | `jev_client` | router | Jev (TypeSafe / localjev) classifier client, off by default |
 | `web-ui` | web-ui | Loopback-only, server-rendered demo UI (no JS); reuses bookmarks-agent and core, makes no network or paid calls |
+| `muse-runs` | muse-runs | Second app: a proposed Muse Code run is a gated `muse.run` action; only approved runs execute `scripts/muse_run.sh`, and only with `ANCIENTOS_ALLOW_PAID=1` |
 | `demo-runner` | demo-runner | Deterministic 14-shot demo on synthetic data |
 | `eval` | eval (package `ancientos-eval`) | Offline precision/recall harness plus classifier-backend scoring ([eval.md](eval.md)) |
 

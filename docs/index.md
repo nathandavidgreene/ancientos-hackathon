@@ -24,6 +24,7 @@ harness are views and tools around it. See [Core and apps](core-and-apps.md).
 | `ancientos-router` | core | Privacy router, data classes and egress ceilings, model clients (local Llama, Muse, Jev, Modal) | [page](reference/ancientos-router.md) |
 | `bookmarks-agent` | app | X sign-in and read-only sync, brief, votes and feedback, ranker, try-it cascade, deeper, wiki, daemon, CLI | [page](reference/bookmarks-agent.md) |
 | `web-ui` | app (view) | Loopback-only, server-rendered UI over the agent's data | [page](reference/web-ui.md) |
+| `muse-runs` | app | Second app: Muse Code runs proposed, approved and logged through the core | [page](reference/muse-runs.md) |
 | `demo-runner` | tool | Deterministic offline demo on synthetic fixtures | [page](reference/demo-runner.md) |
 | `ancientos-eval` | tool | Offline scoring of classifiers, the try-it cascade and brief ranking | [page](reference/ancientos-eval.md) |
 

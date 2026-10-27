@@ -33,7 +33,7 @@ fi
 # App, transport and UI specifics that must not appear in core or router.
 # The "bookmarks" ANCIENTOS_JEV_TASKS env value is kept for config
 # compatibility, so the bare word is not denied; identifiers are.
-deny='[Dd]iscord|web[-_ ][Uu][Ii]|bookmarks_agent|BookmarkClassification|SENSITIVE_CATEGORIES|class_of_category|Health & Personal|BRIEF_PAID|DEEPER_PAID|WIKI_EDIT|brief\.paid|deeper\.paid|wiki\.edit|default_gate|try_it_cascade|topic_filter|feedback::'
+deny='[Dd]iscord|web[-_ ][Uu][Ii]|bookmarks_agent|BookmarkClassification|SENSITIVE_CATEGORIES|class_of_category|Health & Personal|BRIEF_PAID|DEEPER_PAID|WIKI_EDIT|brief\.paid|deeper\.paid|wiki\.edit|default_gate|try_it_cascade|topic_filter|feedback::|muse_runs|muse-runs'
 if hits=$(rg -n -e "$deny" crates/core/src crates/router/src); then
   echo "boundary: app specifics in core/router:" >&2
   echo "$hits" >&2

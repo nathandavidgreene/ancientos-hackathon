@@ -1,0 +1,21 @@
+[package]
+name = "muse-runs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "muse-runs"
+path = "src/main.rs"
+
+[dependencies]
+ancientos-core = { path = "../core" }
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

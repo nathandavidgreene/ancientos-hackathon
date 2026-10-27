@@ -17,6 +17,7 @@ flowchart BT
   subgraph APPS[apps]
     agent[bookmarks-agent<br/>first app: X bookmarks curator + CLI]
     web[web-ui<br/>loopback view]
+    muse[muse-runs<br/>second app: gated Muse Code runs + CLI]
   end
   subgraph TOOLS[tools]
     demo[demo-runner<br/>offline demo]
@@ -27,11 +28,37 @@ flowchart BT
   agent --> router
   web --> core
   web --> agent
+  muse --> core
   demo --> core
   demo --> router
   demo --> agent
   eval --> router
   eval --> agent
+```
+
+## Two apps on one core
+
+`bookmarks-agent` and `muse-runs` share the same gate, approvals and decision
+log without either depending on the other. `muse-runs` depends on
+`ancientos-core` only and registers one action, `muse.run`, in its own gate
+(anything else is denied). Its pending runs show on web-ui's `/approvals`
+page with no web-ui code specific to it.
+
+```mermaid
+sequenceDiagram
+  participant Person
+  participant App as muse-runs
+  participant Appr as core::approvals
+  participant Log as core::log
+  participant Script as scripts/muse_run.sh
+  App->>Appr: propose muse.run (app_gate, prompt sha256 in payload)
+  Appr->>Log: approval.requested
+  Person->>Appr: approve or deny (CLI or web-ui /approvals)
+  Appr->>Log: approval.approved / approval.denied
+  App->>App: run: approved? ANCIENTOS_ALLOW_PAID=1? prompt unchanged?
+  App->>Log: approval.released (once)
+  App->>Script: log-no, summary, prompt file
+  App->>Log: muse_runs.finished (exit code)
 ```
 
 ## What stays in core, what moved out

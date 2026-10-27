@@ -20,4 +20,5 @@ ancientos-eval = { path = "../eval" }
 serde_json.workspace = true
 
 [dev-dependencies]
+muse-runs = { path = "../muse-runs" }
 tempfile.workspace = true
