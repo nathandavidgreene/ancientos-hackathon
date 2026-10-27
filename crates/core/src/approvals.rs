@@ -664,8 +664,8 @@ pub fn sweep_expired(log: &mut DecisionLog, now: u64) -> Result<usize, ApprovalE
     Ok(n)
 }
 
-/// Recover a [`ReleaseToken`] for an already-approved request. The CLI and
-/// web UI record the human decision but drop the token from [`approve`] (it
+/// Recover a [`ReleaseToken`] for an already-approved request. Front ends (the CLI,
+/// a UI) record the human decision but drop the token from [`approve`] (it
 /// is deliberately not serializable), so a later daemon tick re-derives it
 /// from the log: only a request whose folded status is exactly Approved
 /// yields a token, and only when `expected_payload_hash` matches the stored
@@ -1351,7 +1351,7 @@ mod tests {
     fn request_with_empty_gate_denies_every_action() {
         for gate in [Gate::new(), Gate::default()] {
             let (_dir, mut log, _path) = open_log();
-            for action in ["x.post", "brief.include", "deeper.paid", "anything.at.all"] {
+            for action in ["x.post", "brief.include", "paid.action", "anything.at.all"] {
                 let err = request(
                     &mut log,
                     &gate,

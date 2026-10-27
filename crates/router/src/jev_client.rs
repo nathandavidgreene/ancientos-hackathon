@@ -1,6 +1,6 @@
 //! Jev model backend: TypeSafe frontier API or a local Jev server.
 //!
-//! Backend selection uses discord-luna's env names. `JEV_BACKEND` picks
+//! Backend selection uses the shared Luna env names. `JEV_BACKEND` picks
 //! `auto` (default), `typesafe`, or `localjev`; under `auto`,
 //! `LUNA_MODEL_MODE=frontier` selects TypeSafe and `LUNA_MODEL_MODE=local`
 //! selects the local server. Any other value, or an unset mode under `auto`,
@@ -357,7 +357,7 @@ fn endpoint_for(base: &str) -> String {
 /// Shared Jev System One call used by BOTH backends (TypeSafe and localjev):
 /// `POST /v1/systemone` with `{model, state, questions}` and Bearer auth.
 /// Shape verified live against TypeSafe on 2026-10-26; the localjev server is
-/// assumed to share it (discord-luna uses one SystemOneClient for both).
+/// assumed to share it (the Luna stack uses one SystemOneClient for both).
 fn post_systemone(
     endpoint: &str,
     model: &str,
