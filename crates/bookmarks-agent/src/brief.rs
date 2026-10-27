@@ -700,22 +700,6 @@ pub fn run_local_full(
     )
 }
 
-/// [`run_local_full`] with the production services (real hydrator, thread
-/// expander and liveness lookup) and the system clock. Deterministic callers
-/// (the daemon) use [`run_local_full`] with explicit `offline`/`now_secs`.
-pub fn run_local(merged: &MergeOutput, log_path: &Path, date: &str) -> Result<BriefResult, String> {
-    run_local_full(
-        merged,
-        log_path,
-        date,
-        Some(&crate::x_api::hydrate),
-        Some(&crate::x_api::fetch_thread_if_root),
-        false,
-        None,
-        crate::idea_card::now_secs(),
-    )
-}
-
 /// Shared implementation: `model=None` skips the model call entirely and
 /// takes the local fallback; `model=Some` keeps the historical route-then-
 /// call behavior (one call at most, fallback on error or non-Muse route).

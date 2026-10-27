@@ -390,32 +390,6 @@ pub fn translate_with_env(
     translate_one(b, cache, Some(&muse), Some(&local), log)
 }
 
-/// Translate every non-English bookmark, sharing one cache. English posts
-/// are skipped (no entry). Failures yield `Untranslated` entries: every
-/// non-English post gets a translation, never an error.
-// The log is lent to one call per bookmark; each `as_deref_mut` reborrow
-// is required (a move would not compile) despite the lint name.
-#[allow(clippy::needless_option_as_deref)]
-pub fn translate_all(
-    bookmarks: &[Bookmark],
-    cache: &mut HashMap<String, CacheEntry>,
-    muse: Option<&dyn ancientos_router::ModelClient>,
-    local: Option<&dyn ancientos_router::ModelClient>,
-    mut log: Option<&mut DecisionLog>,
-) -> HashMap<String, Translation> {
-    let mut out = HashMap::new();
-    for b in bookmarks {
-        if crate::language::is_english(b) {
-            continue;
-        }
-        out.insert(
-            b.post_id.clone(),
-            translate_one(b, cache, muse, local, log.as_deref_mut()),
-        );
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

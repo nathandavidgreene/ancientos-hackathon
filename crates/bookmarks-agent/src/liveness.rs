@@ -256,18 +256,6 @@ pub fn check_with_lookup(
     Ok(out)
 }
 
-/// Production check via the existing X client ([`crate::x_api::check_liveness`]).
-pub fn check_ids(
-    ids: &[String],
-    cache_path: &Path,
-    explicit_offline: bool,
-    now: u64,
-) -> Result<HashMap<String, PostLiveness>, String> {
-    check_with_lookup(ids, cache_path, explicit_offline, now, &|chunk| {
-        crate::x_api::check_liveness(chunk)
-    })
-}
-
 /// Keep only positively live bookmarks, preserving order. Dead and unknown
 /// are skipped (fail closed). Pure; never touches the store.
 pub fn live_only(

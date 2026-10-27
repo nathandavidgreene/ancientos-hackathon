@@ -523,23 +523,6 @@ impl XApiSource {
         Ok((crate::unroll::unroll(root, &candidates), count))
     }
 
-    /// Search one author's posts in the root's conversation (recent search
-    /// only) and unroll the self-reply chain. Prefer [`fetch_thread`](Self::fetch_thread),
-    /// which retries zero-match searches against the full archive.
-    pub fn search_replies(
-        &mut self,
-        root: &ThreadPost,
-        username: &str,
-    ) -> Result<Vec<ThreadPost>, String> {
-        require_paid()?;
-        let cid = root
-            .conversation_id
-            .as_deref()
-            .ok_or_else(|| "root post has no conversation_id".to_string())?;
-        let url = thread_search_url(cid, username)?;
-        Ok(self.run_search(&url, root)?.0)
-    }
-
     /// Recent search plus ONE full-archive fallback when recent returns zero
     /// matches. Never more than 2 search calls. Any search failure yields the
     /// root post only with `search_ok` false and the error (HTTP status,
