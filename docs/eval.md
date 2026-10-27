@@ -83,6 +83,19 @@ Try-it accuracy: 0.958
 | Brief-worthy (n) | 9 |
 | Topic coverage | 20 |
 
+## Ranking by meaning (synthetic, n=24 votes, 2026-10-27)
+
+Leave-later-out by vote time: 16 earlier votes train, the later 8 posts (4 brief-worthy) are scored. Vectors from `all-minilm` (local Ollama) are cached in `fixtures/eval/synthetic_vectors.json`, so CI and the web UI's `/accuracy` panel never need the model.
+
+| Picks | P@5 |
+| --- | --- |
+| Today's order | 0.600 |
+| Votes (personal ranker) | 0.400 |
+| Meaning (local embeddings) | 0.600 |
+| Votes + meaning (blend, weight 0.5) | 0.600 |
+
+Blending meaning in recovers the drop from votes alone on this set but does not beat today's order; 8 test posts is too few to claim more. Reproduce: `ancientos-eval --bookmarks fixtures/eval/synthetic_bookmarks.jsonl --labels fixtures/eval/synthetic_labels.jsonl --verdicts fixtures/eval/synthetic_verdicts.jsonl --vectors fixtures/eval/synthetic_vectors.json`.
+
 ## Reading the numbers
 
 - Try it on real posts: 7 of 10 hands-on posts found, 7 of 9 tags correct (F1 0.74, up from 0.35).

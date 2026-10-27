@@ -260,6 +260,12 @@ pub fn load_verdicts(path: impl AsRef<Path>) -> Result<Vec<VerdictEntry>, String
     let path = path.as_ref();
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    parse_verdicts(&text)
+}
+
+/// Parse verdicts JSONL. Blank lines are skipped; a malformed line fails
+/// the whole parse naming its line number.
+fn parse_verdicts(text: &str) -> Result<Vec<VerdictEntry>, String> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -313,6 +319,12 @@ pub struct RankingComparison {
     pub ranked_precision_at_5: f64,
     /// Whether the ranker trained on enough labels to activate.
     pub ranker_active: bool,
+    /// Local picks P@5 ranked by meaning alone (local embeddings); `None`
+    /// when no vectors were given, a post lacks one, or the ranker is inactive.
+    pub semantic_precision_at_5: Option<f64>,
+    /// Local picks P@5 with votes and meaning blended; `None` like
+    /// `semantic_precision_at_5`.
+    pub blended_precision_at_5: Option<f64>,
 }
 
 /// Share of numbered picks that are labeled worthy (precision at 5).
@@ -338,14 +350,18 @@ fn precision_at_5(
 /// Compare local-picks P@5 with and without the ranker. Verdicts resolving
 /// to a bookmark split by `voted_at` (ties break by post id): the earlier
 /// two thirds train the ranker (minimum `min_records` labels to activate),
-/// the later third is the scored pool. Deterministic with no wall clock.
-/// Offline: no network, no paid calls.
+/// the later third is the scored pool. With cached `vectors`, also scores
+/// ranking by meaning alone and blended with votes at `weight` (see
+/// [`bookmarks_agent::semantic`]). Deterministic with no wall clock.
+/// Offline: no network, no paid calls; reads vectors only, never embeds.
 pub fn compare_ranking(
     bookmarks: &[Bookmark],
     labels: &[Label],
     verdicts: &[VerdictEntry],
     name: &str,
     min_records: usize,
+    vectors: Option<&bookmarks_agent::semantic::VectorCache>,
+    weight: f64,
 ) -> Result<RankingComparison, String> {
     let by_id: HashMap<&str, &Bookmark> =
         bookmarks.iter().map(|b| (b.post_id.as_str(), b)).collect();
@@ -390,14 +406,35 @@ pub fn compare_ranking(
     let candidates = bookmarks_agent::brief::select_candidates(&test_rows, &BTreeSet::new());
     let baseline_picks = bookmarks_agent::brief::local_picks(&candidates);
     let baseline = precision_at_5(&candidates, &baseline_picks, &worthy);
-    let ranked = if ranker.is_active() {
-        let scores = ranker.score_all(test_rows.iter());
+    // P@5 of local picks after re-ranking the test pool by `scores`.
+    let p5_with = |scores: &HashMap<String, f64>| {
         let reranked =
-            bookmarks_agent::brief::select_candidates_ranked(&test_rows, &BTreeSet::new(), &scores);
-        let picks = bookmarks_agent::brief::local_picks(&reranked);
-        precision_at_5(&reranked, &picks, &worthy)
+            bookmarks_agent::brief::select_candidates_ranked(&test_rows, &BTreeSet::new(), scores);
+        precision_at_5(
+            &reranked,
+            &bookmarks_agent::brief::local_picks(&reranked),
+            &worthy,
+        )
+    };
+    let vote_scores = ranker.score_all(test_rows.iter());
+    let ranked = if ranker.is_active() {
+        p5_with(&vote_scores)
     } else {
         baseline
+    };
+    let semantic = vectors.filter(|_| ranker.is_active()).and_then(|cache| {
+        bookmarks_agent::semantic::Taste::train(&events, cache)?.score_all(&test_rows, cache)
+    });
+    let (semantic_p5, blended_p5) = match &semantic {
+        Some(sem) => (
+            Some(p5_with(sem)),
+            Some(p5_with(&bookmarks_agent::semantic::blend(
+                &vote_scores,
+                sem,
+                weight,
+            ))),
+        ),
+        None => (None, None),
     };
     Ok(RankingComparison {
         name: name.to_string(),
@@ -409,6 +446,8 @@ pub fn compare_ranking(
         baseline_precision_at_5: baseline,
         ranked_precision_at_5: ranked,
         ranker_active: ranker.is_active(),
+        semantic_precision_at_5: semantic_p5,
+        blended_precision_at_5: blended_p5,
     })
 }
 
@@ -425,7 +464,9 @@ pub fn render_comparison_markdown(c: &RankingComparison) -> String {
          | Picks | P@5 |\n\
          | --- | --- |\n\
          | Baseline (today's order) | {base:.3} |\n\
-         | Ranked (personal ranker{inactive}) | {ranked:.3} |\n",
+         | Ranked (personal ranker{inactive}) | {ranked:.3} |\n\
+         | By meaning (local embeddings) | {semantic} |\n\
+         | Blended (votes + meaning) | {blended} |\n",
         name = c.name,
         n_train = c.n_train,
         n_test = c.n_test,
@@ -434,7 +475,48 @@ pub fn render_comparison_markdown(c: &RankingComparison) -> String {
         base = c.baseline_precision_at_5,
         ranked = c.ranked_precision_at_5,
         inactive = if c.ranker_active { "" } else { ", inactive" },
+        semantic = fmt_opt(c.semantic_precision_at_5),
+        blended = fmt_opt(c.blended_precision_at_5),
     )
+}
+
+/// Three-decimal number, or "n/a" when the metric was not computed.
+fn fmt_opt(v: Option<f64>) -> String {
+    v.map_or_else(|| "n/a".to_string(), |x| format!("{x:.3}"))
+}
+
+/// Committed synthetic eval data, compiled in so callers can never point
+/// the panel at private data: bookmarks, labels, verdicts, cached vectors.
+const SYNTHETIC_BOOKMARKS: &str = include_str!("../../../fixtures/eval/synthetic_bookmarks.jsonl");
+/// Synthetic reference labels (see [`SYNTHETIC_BOOKMARKS`]).
+const SYNTHETIC_LABELS: &str = include_str!("../../../fixtures/eval/synthetic_labels.jsonl");
+/// Synthetic verdicts (see [`SYNTHETIC_BOOKMARKS`]).
+const SYNTHETIC_VERDICTS: &str = include_str!("../../../fixtures/eval/synthetic_verdicts.jsonl");
+/// Synthetic embedding cache (see [`SYNTHETIC_BOOKMARKS`]).
+const SYNTHETIC_VECTORS: &str = include_str!("../../../fixtures/eval/synthetic_vectors.json");
+/// Minimum labels for the ranker on the synthetic set (the shipped default).
+const SYNTHETIC_MIN_RECORDS: usize = bookmarks_agent::ranker::MIN_RECORDS_DEFAULT;
+
+/// Eval report and ranking comparison on the committed synthetic data only
+/// (compiled in; never reads eval-private or any path). Offline and
+/// deterministic: same binary, same numbers.
+pub fn synthetic_panel() -> Result<(EvalReport, RankingComparison), String> {
+    let bookmarks = bookmarks_agent::fixture::parse_jsonl(SYNTHETIC_BOOKMARKS)
+        .map_err(|e| format!("synthetic bookmarks: {e}"))?;
+    let labels = parse_labels(SYNTHETIC_LABELS)?;
+    let verdicts = parse_verdicts(SYNTHETIC_VERDICTS)?;
+    let vectors = bookmarks_agent::semantic::VectorCache::parse(SYNTHETIC_VECTORS)?;
+    let report = evaluate(&bookmarks, &labels, "synthetic");
+    let comparison = compare_ranking(
+        &bookmarks,
+        &labels,
+        &verdicts,
+        "synthetic",
+        SYNTHETIC_MIN_RECORDS,
+        Some(&vectors),
+        bookmarks_agent::semantic::DEFAULT_WEIGHT,
+    )?;
+    Ok((report, comparison))
 }
 
 /// Load bookmarks and labels from JSONL files and score both tasks.
@@ -553,7 +635,8 @@ mod tests {
         let (bookmarks, labels) = load_synthetic();
         let verdicts = load_verdicts(fixture_path("synthetic_verdicts.jsonl")).unwrap();
         assert_eq!(verdicts.len(), 24);
-        let c = compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10).unwrap();
+        let c =
+            compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10, None, 0.5).unwrap();
         assert_eq!(c.n_verdicts, 24);
         assert_eq!(c.n_unmatched, 0);
         assert_eq!(c.n_train, 16);
@@ -563,7 +646,8 @@ mod tests {
         assert!((0.0..=1.0).contains(&c.baseline_precision_at_5));
         assert!((0.0..=1.0).contains(&c.ranked_precision_at_5));
         // Deterministic: same inputs give the same comparison.
-        let again = compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10).unwrap();
+        let again =
+            compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10, None, 0.5).unwrap();
         assert_eq!(c, again);
         let md = render_comparison_markdown(&c);
         assert!(md.contains("Baseline (today's order)"), "{md}");
@@ -590,7 +674,8 @@ mod tests {
             verdict: "unhide_author".to_string(),
             voted_at: 9_999_999_998,
         });
-        let c = compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10).unwrap();
+        let c =
+            compare_ranking(&bookmarks, &labels, &verdicts, "synthetic", 10, None, 0.5).unwrap();
         assert_eq!(c.n_unmatched, 1);
         assert_eq!(c.n_verdicts, 24);
         let bad = vec![VerdictEntry {
@@ -598,7 +683,7 @@ mod tests {
             verdict: "maybe".to_string(),
             voted_at: 1,
         }];
-        assert!(compare_ranking(&bookmarks, &labels, &bad, "synthetic", 10).is_err());
+        assert!(compare_ranking(&bookmarks, &labels, &bad, "synthetic", 10, None, 0.5).is_err());
     }
 
     #[test]
@@ -606,15 +691,71 @@ mod tests {
         let (bookmarks, labels) = load_synthetic();
         // Too few labels to activate: ranked equals baseline.
         let verdicts = load_verdicts(fixture_path("synthetic_verdicts.jsonl")).unwrap();
-        let c = compare_ranking(&bookmarks, &labels, &verdicts[..5], "tiny", 10).unwrap();
+        let c =
+            compare_ranking(&bookmarks, &labels, &verdicts[..5], "tiny", 10, None, 0.5).unwrap();
         assert!(!c.ranker_active);
         assert_eq!(c.ranked_precision_at_5, c.baseline_precision_at_5);
         // Empty verdicts: zeros, no panic.
-        let c = compare_ranking(&bookmarks, &labels, &[], "empty", 10).unwrap();
+        let c = compare_ranking(&bookmarks, &labels, &[], "empty", 10, None, 0.5).unwrap();
         assert_eq!(c.n_train, 0);
         assert_eq!(c.n_test, 0);
         assert_eq!(c.baseline_precision_at_5, 0.0);
         assert_eq!(c.ranked_precision_at_5, 0.0);
+    }
+
+    #[test]
+    fn ranking_comparison_scores_meaning_from_committed_vectors() {
+        let (bookmarks, labels) = load_synthetic();
+        let verdicts = load_verdicts(fixture_path("synthetic_verdicts.jsonl")).unwrap();
+        let text = std::fs::read_to_string(fixture_path("synthetic_vectors.json")).unwrap();
+        let vectors = bookmarks_agent::semantic::VectorCache::parse(&text).unwrap();
+        // Every synthetic post has a cached vector: CI never needs the model.
+        assert!(bookmarks.iter().all(|b| vectors.vector_for(b).is_some()));
+        let c = compare_ranking(
+            &bookmarks,
+            &labels,
+            &verdicts,
+            "synthetic",
+            10,
+            Some(&vectors),
+            0.5,
+        )
+        .unwrap();
+        let (sem, blended) = (
+            c.semantic_precision_at_5.unwrap(),
+            c.blended_precision_at_5.unwrap(),
+        );
+        assert!((0.0..=1.0).contains(&sem) && (0.0..=1.0).contains(&blended));
+        // Blending meaning in never does worse than votes alone on this set.
+        assert!(blended >= c.ranked_precision_at_5, "{c:?}");
+        let md = render_comparison_markdown(&c);
+        assert!(md.contains("Blended (votes + meaning)"), "{md}");
+        // Fail closed: vectors for another model match nothing, so no semantic metric.
+        let other = bookmarks_agent::semantic::VectorCache::new("other-model");
+        let c = compare_ranking(
+            &bookmarks,
+            &labels,
+            &verdicts,
+            "synthetic",
+            10,
+            Some(&other),
+            0.5,
+        )
+        .unwrap();
+        assert_eq!(
+            (c.semantic_precision_at_5, c.blended_precision_at_5),
+            (None, None)
+        );
+        assert!(render_comparison_markdown(&c).contains("n/a"));
+    }
+
+    #[test]
+    fn synthetic_panel_matches_the_fixture_files() {
+        let (report, comparison) = synthetic_panel().unwrap();
+        let (bookmarks, labels) = load_synthetic();
+        assert_eq!(report, evaluate(&bookmarks, &labels, "synthetic"));
+        assert_eq!(comparison.n_verdicts, 24);
+        assert!(comparison.blended_precision_at_5.is_some());
     }
 
     #[test]
