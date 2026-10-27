@@ -2,10 +2,27 @@
 
 Offline harness: `cargo run -p eval -- --bookmarks <jsonl> --labels <jsonl> [--out <md>] [--name <name>]`. It uses no network and makes no paid calls. The output holds aggregate numbers only, with no post text, ids or urls.
 
-- **Try it**: precision and recall of `try_it::classify` against a hand label for "a hands-on practice you could physically try".
-- **Brief ranking**: `brief::select_candidates` plus `brief::local_picks` (the deterministic path used when paid calls are off) against a hand label for "worth resurfacing". This scores the local fallback, not Muse Spark's picks.
+- **Try it**: precision and recall of `try_it::classify` against a reference label for "a hands-on practice you could physically try".
+- **Brief ranking**: `brief::select_candidates` plus `brief::local_picks` (the deterministic path used when paid calls are off) against a reference label for "worth resurfacing". This scores the local fallback, not Muse Spark's picks.
 
-The labels for the real bookmarks are kept outside the repo. They cover a random sample of 120 (seed 7), hand-labeled by Flint on 2026-10-26, so expect noise from a single labeler. Only the synthetic sample (`fixtures/eval/`) is committed.
+**Reference labeler: Muse Spark** (`muse-spark-1.3`). It labeled all 1,022 real bookmarks (try it, worth resurfacing, category) on 2026-10-26. Labels and post text stay outside the repo; only aggregates appear here. Only the synthetic sample (`fixtures/eval/`) is committed.
+
+Correction: an earlier 120-post sample (seed 7), previously described as hand-labeled, was actually labeled by the local `llama3.2:1b` model, not by a person. Those numbers are kept below for history but are superseded by the Muse Spark scores.
+
+## Try it vs Muse Spark reference labels (n=1,022, 2026-10-26)
+
+Rules were retuned with Muse Code (log #21) on a tune split (odd lines, n=511) and checked on a held-out split (even lines, n=511) that Muse Code never read.
+
+| Version | Set | P / R / F1 | Accuracy |
+| --- | --- | --- | --- |
+| Before `08f7732` | all 1,022 | 0.358 / 0.171 / 0.231 | 0.811 |
+| `08f7732` | all 1,022 | 0.373 / 0.112 / 0.172 | 0.821 |
+| Retuned (#21) | tune 511 | 0.910 / 0.899 / 0.904 | - |
+| Retuned (#21) | **held-out 511** | **0.590 / 0.396 / 0.474** | - |
+| Retuned (#21) | all 1,022 | 0.770 / 0.629 / 0.693 | 0.907 |
+| Retuned (#21) | synthetic 24 | 1.000 / 0.900 / 0.947 | - |
+
+The held-out row is the honest number; the tune split overfits. Muse Spark tags more posts as Try it (170 of 1,022) than the earlier llama labels did, including software setups and runnable prompts, so the earlier gain did not carry over.
 
 ## Try it classifier: before / after (2026-10-26)
 
@@ -13,12 +30,12 @@ Change: structural cues (numbered/bulleted lists, durations, imperatives) no lon
 
 | Sample | Before P / R / F1 | After P / R / F1 | Accuracy before → after |
 | --- | --- | --- | --- |
-| Real (n=120, private labels) | 0.308 / 0.400 / 0.348 | 0.778 / 0.700 / 0.737 | 0.875 → 0.958 |
+| Real (n=120, llama3.2:1b labels, superseded) | 0.308 / 0.400 / 0.348 | 0.778 / 0.700 / 0.737 | 0.875 → 0.958 |
 | Synthetic (n=24) | 0.889 / 0.800 / 0.842 | 1.000 / 0.900 / 0.947 | 0.875 → 0.958 |
 
-Remaining real errors (aggregate): 3 misses are long self-help/practice posts without physical cues; 2 false tags are short link posts about AI agents. The real fixture carries no media field, so the video rule is exercised by tests and live X data, not this sample. Single labeler; small n, so treat as directional.
+Remaining real errors (aggregate): 3 misses are long self-help/practice posts without physical cues; 2 false tags are short link posts about AI agents. The real fixture carries no media field, so the video rule is exercised by tests and live X data, not this sample. Labels were from llama3.2:1b, not a person; superseded by the Muse Spark section above.
 
-## Eval report — real bookmarks, hand-labeled sample (n=120, labels private)
+## Eval report — real bookmarks, llama3.2:1b-labeled sample (n=120, superseded)
 
 Labels: 120 total, 120 matched, 0 unmatched.
 

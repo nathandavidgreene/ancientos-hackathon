@@ -1,6 +1,6 @@
 //! Offline evaluation harness for the bookmarks agent.
 //!
-//! Joins human labels (JSONL) with bookmarks by `post_id` and scores two
+//! Joins reference labels (JSONL) with bookmarks by `post_id` and scores two
 //! tasks with no network and no paid calls:
 //! - try-it classification (`bookmarks_agent::try_it::classify`)
 //! - brief ranking (`bookmarks_agent::brief::select_candidates` with an empty
@@ -12,7 +12,7 @@ use bookmarks_agent::fixture::Bookmark;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-/// One human label, as one JSONL line:
+/// One reference label, as one JSONL line:
 /// `{"post_id": "...", "try_it": true|false, "brief_worthy": true|false}`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct Label {
