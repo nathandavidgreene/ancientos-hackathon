@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+pub mod accuracy;
+pub mod muse_runs_demo;
+
 /// Categories whose content is treated as sensitive (stays on local Llama).
 /// Single source: the bookmarks agent's category table maps these to Confidential.
 pub const SENSITIVE_CATEGORIES: &[&str] = bookmarks_agent::SENSITIVE_CATEGORIES;
@@ -643,7 +646,7 @@ pub fn approvals_demo_now() -> u64 {
 
 /// New demos are paid-off only: the real paid switch must stay unset while
 /// paid work is simulated through mocks that can never touch the network.
-fn require_paid_off() -> Result<(), String> {
+pub(crate) fn require_paid_off() -> Result<(), String> {
     if std::env::var("ANCIENTOS_ALLOW_PAID")
         .map(|v| v == "1")
         .unwrap_or(false)

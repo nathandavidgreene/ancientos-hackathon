@@ -5,6 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 unset ANCIENTOS_ALLOW_PAID
 unset META_API_KEY MODAL_LLAMA_URL ANCIENTOS_LOCAL_LLM_URL ANCIENTOS_LOCAL_LLM_MODEL X_CLIENT_ID || true
+# Semantic ranking stays opt-in: never on in the demo.
+unset ANCIENTOS_EMBED_MODEL ANCIENTOS_SEMANTIC_WEIGHT || true
 DATA="$(mktemp -d)"
 trap 'rm -rf "$DATA"' EXIT
 # Print usage and exit.
@@ -57,6 +59,9 @@ shot2() {
   echo "crates/core"
   echo "crates/router"
   echo "crates/bookmarks-agent"
+  echo "crates/muse-runs"
+  echo "crates/web-ui"
+  echo "crates/eval"
   echo "crates/demo-runner"
 }
 
@@ -138,6 +143,8 @@ shot11() {
 shot12() {
   echo "==== Shot 12/14: Try it, decided in stages ===="
   run cascade-demo
+  # web-ui's /accuracy page, rendered offline from the synthetic eval set.
+  run accuracy-demo
 }
 
 # Shot 13: print the "Built with Meta" beat.
@@ -147,13 +154,15 @@ shot13() {
   echo "Muse Code runs: $RUNS (from docs/muse-code-log.md)"
   echo "Muse Spark writes the briefs; tokens per brief: ~1.6k"
   cat docs/muse-code-log.md
+  # Second app: a Muse Code run is a gated action (stub script, paid unset).
+  run muse-runs-demo
 }
 
 # Shot 14: print the "Roadmap" beat.
 shot14() {
   echo "==== Shot 14/14: Roadmap ===="
   echo "Roadmap: more agents on core, custom X feed ranking, go-deeper sessions."
-  echo "Bookmarks is the first agent; the rest of AncientOS plugs into the same core."
+  echo "Bookmarks and muse-runs are the first two apps; the rest of AncientOS plugs into the same core."
   # Core-plus-apps (P7): the same check CI runs; deterministic, offline.
   HOME="$REAL_HOME" scripts/check_core_boundary.sh
   echo "Go deeper (offline, quoted + linked, shortened):"

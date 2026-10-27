@@ -8,8 +8,11 @@ license.workspace = true
 ancientos-core = { path = "../core" }
 ancientos-router = { path = "../router" }
 bookmarks-agent = { path = "../bookmarks-agent" }
+web-ui = { path = "../web-ui" }
+muse-runs = { path = "../muse-runs" }
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+ancientos-eval = { path = "../eval" }
 tempfile.workspace = true

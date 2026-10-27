@@ -200,6 +200,13 @@ fn demo_runs_all_shots_deterministically_without_private_data() {
         "never_author",
         "already decided",
         "exactly once",
+        "Accuracy panel (web-ui /accuracy, rendered offline):",
+        "Votes + meaning (blend): 0.600",
+        "semantic ranking in the brief: off",
+        "muse-runs: second app on the same core",
+        "web-ui /approvals: Pending (2)",
+        "deny #D2",
+        "stub muse_run.sh calls: 0 (paid switch unset)",
     ] {
         assert!(
             quotes.iter().any(|q| q.contains(key)),
@@ -319,6 +326,52 @@ fn demo_shot_12_cascade_stages() {
     ] {
         assert!(out.contains(want), "--shot 12 missing {want}");
     }
+    assert!(!has_15plus_digits(&out));
+}
+
+#[test]
+fn demo_shot_12_shows_accuracy_panel_with_semantic_off() {
+    let (code, out, err) = run_demo(&["--shot", "12"]);
+    assert_eq!(code, Some(0), "--shot 12 failed: {err}");
+    for want in [
+        "Accuracy panel (web-ui /accuracy, rendered offline):",
+        "committed synthetic eval set",
+        "Try-it classification",
+        "Picks: P@5",
+        "Today's order: 0.600",
+        "Meaning (local embeddings): 0.600",
+        "Votes + meaning (blend): 0.600",
+        "semantic ranking in the brief: off",
+    ] {
+        assert!(out.contains(want), "--shot 12 missing {want}");
+    }
+    assert!(!out.contains("eval-private"));
+    assert!(!out.contains('<'), "HTML tags must be stripped");
+}
+
+#[test]
+fn demo_shot_13_muse_runs_propose_approve_deny_with_stub() {
+    let (code, out, err) = run_demo(&["--shot", "13"]);
+    assert_eq!(code, Some(0), "--shot 13 failed: {err}");
+    for want in [
+        "muse-runs: second app on the same core (stub muse_run.sh, never real Muse)",
+        "muse.run.unattended -> action refused by gate",
+        "fail closed",
+        "proposed Muse Code run #D1: [synthetic] add a why-badge test",
+        "proposed Muse Code run #D2: [synthetic] rewrite the approval gate",
+        "web-ui /approvals: Pending (2), both as muse-runs · muse.run",
+        "approve #D1 (human)",
+        "deny #D2",
+        "run #D2: refused: approval '#D2' is not approved (status: denied)",
+        "run #D1: refused: Muse Code runs are paid: set ANCIENTOS_ALLOW_PAID=1 to run (fail closed; approval kept)",
+        "muse-runs list: #D1 approved, #D2 denied",
+        "web-ui /approvals: Pending (0)",
+        "stub muse_run.sh calls: 0 (paid switch unset)",
+        "shared hash chain verified: 4 entries",
+    ] {
+        assert!(out.contains(want), "--shot 13 missing {want}");
+    }
+    assert!(!out.contains("/tmp/"), "no temp paths on screen");
     assert!(!has_15plus_digits(&out));
 }
 

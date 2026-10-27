@@ -8,7 +8,7 @@ use bookmarks_agent::feedback::{ThresholdPolicy, Verdict};
 use demo_runner::{demo_date, demo_now_secs, routing_demo, Workspace};
 use std::path::Path;
 
-const USAGE: &str = "usage: demo-runner --data DIR <sync FIXTURE | brief DAY | brief-rich DAY | feedback PICK VERDICT | thresholds | log | count FIXTURE... | routing | route [--sensitive|--sanitized] TEXT | vote-demo | delegate-demo POST_ID | try-demo | tamper-demo | approvals-propose | approvals-release | approvals-chain | cascade-demo | translate-demo | author-demo>";
+const USAGE: &str = "usage: demo-runner --data DIR <sync FIXTURE | brief DAY | brief-rich DAY | feedback PICK VERDICT | thresholds | log | count FIXTURE... | routing | route [--sensitive|--sanitized] TEXT | vote-demo | delegate-demo POST_ID | try-demo | tamper-demo | approvals-propose | approvals-release | approvals-chain | cascade-demo | translate-demo | author-demo | accuracy-demo | muse-runs-demo>";
 
 /// Parse `route` args: `--sensitive TEXT` (default) or `--sanitized TEXT`.
 /// A bare `route TEXT` is treated as sensitive (fail closed).
@@ -334,6 +334,70 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("unhide-author {} (undone):", demo.author);
             println!("hidden authors: {{}}");
             println!("visible after unhide: {}", demo.visible_after_unhide);
+        }
+        [c] if c == "accuracy-demo" => {
+            let demo = ws.accuracy_demo()?;
+            println!("Accuracy panel (web-ui /accuracy, rendered offline):");
+            for line in &demo.lines {
+                println!("  {line}");
+            }
+            println!(
+                "semantic ranking in the brief: {} (opt-in: ANCIENTOS_LOCAL_LLM_URL + ANCIENTOS_EMBED_MODEL)",
+                if demo.semantic_in_brief { "on" } else { "off" }
+            );
+        }
+        [c] if c == "muse-runs-demo" => {
+            let demo = ws.muse_runs_demo()?;
+            println!("muse-runs: second app on the same core (stub muse_run.sh, never real Muse)");
+            println!(
+                "gate: muse.run.unattended -> {}",
+                demo.unknown_action_refusal
+            );
+            for p in &demo.proposed {
+                println!("proposed {p}");
+            }
+            println!(
+                "web-ui /approvals: Pending ({}){}",
+                demo.page_pending_before,
+                if demo.page_lists_both {
+                    ", both as muse-runs · muse.run"
+                } else {
+                    ""
+                }
+            );
+            println!(
+                "approve #{} (human)",
+                demo_runner::muse_runs_demo::APPROVED_RUN.0
+            );
+            println!(
+                "deny #{} ({})",
+                demo_runner::muse_runs_demo::DENIED_RUN.0,
+                demo_runner::muse_runs_demo::DENY_REASON
+            );
+            println!(
+                "run #{}: refused: {}",
+                demo_runner::muse_runs_demo::DENIED_RUN.0,
+                demo.denied_run_refusal
+            );
+            println!(
+                "run #{}: refused: {}",
+                demo_runner::muse_runs_demo::APPROVED_RUN.0,
+                demo.approved_run_refusal
+            );
+            println!(
+                "muse-runs list: {}",
+                demo.statuses
+                    .iter()
+                    .map(|(n, s)| format!("{n} {s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!("web-ui /approvals: Pending ({})", demo.page_pending_after);
+            println!(
+                "stub muse_run.sh calls: {} (paid switch unset)",
+                demo.stub_calls
+            );
+            println!("shared hash chain verified: {} entries", demo.chain_len);
         }
         _ => return Err(USAGE.into()),
     }

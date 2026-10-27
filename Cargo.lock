@@ -129,11 +129,14 @@ name = "demo-runner"
 version = "0.1.0"
 dependencies = [
  "ancientos-core",
+ "ancientos-eval",
  "ancientos-router",
  "bookmarks-agent",
+ "muse-runs",
  "serde",
  "serde_json",
  "tempfile",
+ "web-ui",
 ]
 
 [[package]]
