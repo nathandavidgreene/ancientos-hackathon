@@ -5,7 +5,8 @@
 //! | `delegate <post_id>` | `deeper <post_id> [--offline <fixture.jsonl>]`
 //! | `ideas` | `triage <id> <adopt|park|drop>`
 //! | `tried <post_id> <yes|no|later> [note]` | `try-pending`
-//! | `digest [--now SECS] [--dry-run]`.
+//! | `digest [--now SECS] [--dry-run]`
+//! | `approvals` | `approve <id>` | `deny <id> [reason]`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
@@ -22,7 +23,9 @@
 //! `tried` records a try-it follow-up; `try-pending` lists tagged posts
 //! without a yes/no follow-up yet. `digest` prints the weekly idea-card
 //! triage digest plus "did you try it?" nudges, recording the showing
-//! unless `--dry-run` or `--now` is given.
+//! unless `--dry-run` or `--now` is given. `approvals` lists pending human
+//! approvals; `approve`/`deny` record the decision (the CLI user is the
+//! human) and print the outcome — nothing executes from the CLI.
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
     author_filter, brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, merge,
@@ -30,7 +33,7 @@ use bookmarks_agent::{
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run]";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> | deny <id> [reason]";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -543,6 +546,85 @@ fn cmd_digest(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Decider recorded for CLI approvals: the human at the keyboard.
+const CLI_DECIDER: &str = "cli";
+
+/// One-line rendering of a summary for the `approvals` list.
+fn one_line_summary(summary: &str) -> String {
+    summary
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn cmd_approvals(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let now = idea_card::now_secs();
+    let list = ancientos_core::approvals::pending(&log, now).map_err(|e| e.to_string())?;
+    if list.is_empty() {
+        println!("no pending approvals");
+        return Ok(());
+    }
+    for a in &list {
+        println!(
+            "{} {} {} expires_at={} {}",
+            a.request.id,
+            a.request.agent,
+            a.request.action,
+            a.request.expires_at,
+            one_line_summary(&a.request.summary),
+        );
+    }
+    Ok(())
+}
+
+/// Payload hash read from the stored request: the CLI caller never supplies
+/// it, so the decision always binds to the request as logged.
+fn stored_hash(log: &ancientos_core::log::DecisionLog, id: &str) -> Result<String, String> {
+    ancientos_core::approvals::get(log, id)
+        .map(|a| a.request.payload_hash)
+        .map_err(|e| e.to_string())
+}
+
+fn cmd_approve(args: &[String]) -> Result<(), String> {
+    if args.len() != 1 || args[0].is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let hash = stored_hash(&log, &args[0])?;
+    let now = idea_card::now_secs();
+    let token = ancientos_core::approvals::approve(&mut log, &args[0], &hash, CLI_DECIDER, now)
+        .map_err(|e| e.to_string())?;
+    // The release token is single-process by design (not Clone, not
+    // Serialize): approving records the decision only. Nothing executes.
+    drop(token);
+    println!("approved {} (release-ready)", args[0]);
+    Ok(())
+}
+
+fn cmd_deny(args: &[String]) -> Result<(), String> {
+    if args.is_empty() || args[0].is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let reason = args[1..].join(" ");
+    let log_path = brief::decision_log_path()?;
+    let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let hash = stored_hash(&log, &args[0])?;
+    let now = idea_card::now_secs();
+    ancientos_core::approvals::deny(&mut log, &args[0], &hash, CLI_DECIDER, &reason, now)
+        .map_err(|e| e.to_string())?;
+    println!("denied {}", args[0]);
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -561,6 +643,9 @@ fn main() {
         Some("tried") => cmd_tried(&args[1..]),
         Some("try-pending") => cmd_try_pending(&args[1..]),
         Some("digest") => cmd_digest(&args[1..]),
+        Some("approvals") => cmd_approvals(&args[1..]),
+        Some("approve") => cmd_approve(&args[1..]),
+        Some("deny") => cmd_deny(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {
@@ -708,6 +793,27 @@ mod tests {
             cmd_hidden_authors(&["extra".to_string()]).unwrap_err(),
             USAGE
         );
+    }
+
+    #[test]
+    fn approval_commands_reject_bad_args() {
+        assert_eq!(cmd_approvals(&["extra".to_string()]).unwrap_err(), USAGE);
+        assert_eq!(cmd_approve(&[]).unwrap_err(), USAGE);
+        assert_eq!(cmd_approve(&["".to_string()]).unwrap_err(), USAGE);
+        assert_eq!(
+            cmd_approve(&["a".to_string(), "b".to_string()]).unwrap_err(),
+            USAGE
+        );
+        assert_eq!(cmd_deny(&[]).unwrap_err(), USAGE);
+        assert_eq!(cmd_deny(&["".to_string()]).unwrap_err(), USAGE);
+    }
+
+    #[test]
+    fn summary_folds_to_one_line() {
+        assert_eq!(one_line_summary("plain"), "plain");
+        assert_eq!(one_line_summary("first\nsecond"), "first");
+        assert_eq!(one_line_summary("  spaced   out  "), "spaced out");
+        assert_eq!(one_line_summary(""), "");
     }
 
     #[test]

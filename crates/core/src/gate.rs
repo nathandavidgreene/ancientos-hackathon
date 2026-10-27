@@ -47,6 +47,25 @@ impl Gate {
     }
 }
 
+/// Canonical policy used by the approval queue: read-only agent work is
+/// low risk, X writes (which no agent performs without a human) are high
+/// risk, and anything unlisted is denied (fail closed).
+pub fn default_gate() -> Gate {
+    let mut g = Gate::new();
+    g.register("brief.include", Risk::Low);
+    for action in [
+        "x.post",
+        "x.reply",
+        "x.repost",
+        "x.like",
+        "x.follow",
+        "x.dm.send",
+    ] {
+        g.register(action, Risk::High);
+    }
+    g
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +93,15 @@ mod tests {
         g.register("post", Risk::High);
         assert_eq!(g.evaluate(&p("read")), Verdict::Allow);
         assert_eq!(g.evaluate(&p("post")), Verdict::NeedsHuman);
+    }
+
+    #[test]
+    fn default_policy_allows_reads_needs_human_for_x_writes_denies_unknown() {
+        let g = default_gate();
+        assert_eq!(g.evaluate(&p("brief.include")), Verdict::Allow);
+        for action in ["x.post", "x.reply", "x.repost", "x.like", "x.follow"] {
+            assert_eq!(g.evaluate(&p(action)), Verdict::NeedsHuman, "{action}");
+        }
+        assert!(matches!(g.evaluate(&p("wipe.drive")), Verdict::Deny { .. }));
     }
 }

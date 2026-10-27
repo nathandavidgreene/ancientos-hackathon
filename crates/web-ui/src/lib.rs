@@ -3,7 +3,9 @@
 //! [`handle`] is a pure-ish `(Request, &State) -> Response` handler; `main.rs`
 //! owns sockets and HTTP/1.1 parsing. Request handling makes no network or
 //! paid calls: votes reuse `bookmarks_agent::vote`, triage reuses `idea_card`,
-//! try-it follow-ups reuse `try_it`, translations reuse the on-disk cache
+//! try-it follow-ups reuse `try_it`, approval decisions reuse
+//! `ancientos_core::approvals` (recorded only, nothing executes),
+//! translations reuse the on-disk cache
 //! only (never live-translate), and everything lands in files under the
 //! data dir plus the append-only decision log. Liveness is checked once at
 //! startup via [`State::open_with_liveness`] (batched X lookup, 24h cache,
@@ -313,27 +315,46 @@ const CSS: &str = ":root{color-scheme:light}\
      table{border-collapse:collapse;width:100%}th{background:#f5f5f5}\
      td,th{border:1px solid #ddd;padding:.35em .6em;text-align:left;vertical-align:top}";
 
-fn layout(title: &str, body: &str) -> String {
+fn now_secs() -> u64 {
+    bookmarks_agent::idea_card::now_secs()
+}
+
+/// Pending approvals for the nav badge. Best-effort like
+/// `hidden_authors_of`: a missing or unreadable log reads as zero
+/// (tampering is surfaced on `/approvals` and `/log` instead).
+fn pending_count(state: &State) -> usize {
+    let Ok(log) = ancientos_core::log::DecisionLog::open(state.log_path()) else {
+        return 0;
+    };
+    ancientos_core::approvals::pending(&log, now_secs())
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
+fn layout(title: &str, body: &str, state: &State) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{}</title><style>{CSS}</style></head><body>\
          <nav><a href=\"/\">Brief</a><a href=\"/ideas\">Ideas</a>\
          <a href=\"/try\">Try it</a><a href=\"/hidden-authors\">Hidden</a>\
+         <a href=\"/approvals\">Approvals ({})</a>\
          <a href=\"/log\">Log</a></nav><hr>{body}</body></html>",
         escape(title),
+        pending_count(state),
     )
 }
 
-fn error_page(title: &str, msg: &str) -> String {
+fn error_page(title: &str, msg: &str, state: &State) -> String {
     layout(
         title,
         &format!("<h1>{}</h1><p>{}</p>", escape(title), escape(msg)),
+        state,
     )
 }
 
-fn not_found() -> Response {
-    Response::status(404, error_page("Not found", "Unknown route."))
+fn not_found(state: &State) -> Response {
+    Response::status(404, error_page("Not found", "Unknown route.", state))
 }
 
 /// One bookmark as a thread post (same shape `unroll` consumes for X data).
@@ -528,13 +549,17 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
     let idx: usize = match raw.parse() {
         Ok(n) => n,
         Err(_) => {
-            return Response::status(400, error_page("Bad index", "Query ?i=N needs a number."))
+            return Response::status(
+                400,
+                error_page("Bad index", "Query ?i=N needs a number.", state),
+            )
         }
     };
     if state.bookmarks.is_empty() {
         return Response::ok(layout(
             "Brief",
             "<h1>Brief</h1><p>No bookmarks synced into this data dir yet.</p>",
+            state,
         ));
     }
     let visible = visible_bookmarks(state);
@@ -543,10 +568,14 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
             "Brief",
             "<h1>Brief</h1><p>Every post is hidden by an author filter. \
              <a href=\"/hidden-authors\">Manage hidden authors</a>.</p>",
+            state,
         ));
     }
     let Some(bm) = visible.get(idx) else {
-        return Response::status(404, error_page("Not found", "No post at that index."));
+        return Response::status(
+            404,
+            error_page("Not found", "No post at that index.", state),
+        );
     };
     let root = thread_post_of(bm);
     let candidates: Vec<_> = visible
@@ -601,14 +630,14 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
     if idx + 1 < visible.len() {
         body.push_str(&format!("<p><a href=\"/?i={}\">Next post</a></p>", idx + 1));
     }
-    Response::ok(layout("Brief", &body))
+    Response::ok(layout("Brief", &body, state))
 }
 
 fn do_vote(state: &State, body: &[u8]) -> Response {
     let form = parse_body(body);
     let post_id = form.get("post_id").map(String::as_str).unwrap_or("");
     if post_id.trim().is_empty() {
-        return Response::status(400, error_page("Bad vote", "Missing post_id."));
+        return Response::status(400, error_page("Bad vote", "Missing post_id.", state));
     }
     let verdict: ancientos_core::feedback::Verdict = match form
         .get("verdict")
@@ -617,20 +646,20 @@ fn do_vote(state: &State, body: &[u8]) -> Response {
         .parse()
     {
         Ok(v) => v,
-        Err(e) => return Response::status(400, error_page("Bad vote", &e)),
+        Err(e) => return Response::status(400, error_page("Bad vote", &e, state)),
     };
     let idx: usize = form.get("i").and_then(|s| s.parse().ok()).unwrap_or(0);
     let store = state.store_path();
     let Some(store_str) = store.to_str() else {
         return Response::status(
             500,
-            error_page("Vote failed", "Data dir path is not UTF-8."),
+            error_page("Vote failed", "Data dir path is not UTF-8.", state),
         );
     };
     if let Err(e) =
         bookmarks_agent::vote::run_vote(post_id, verdict, &[], Some(store_str), &state.log_path())
     {
-        return Response::status(500, error_page("Vote failed", &e));
+        return Response::status(500, error_page("Vote failed", &e, state));
     }
     // Redirect within the still-visible posts (a never_author vote may have
     // just shrunk the list); when nothing is visible, offer the undo page.
@@ -646,7 +675,7 @@ fn page_ideas(state: &State) -> Response {
     let now = bookmarks_agent::idea_card::now_secs();
     let cards = match list_due_for_triage(&state.cards_path(), now) {
         Ok(c) => c,
-        Err(e) => return Response::status(500, error_page("Ideas failed", &e)),
+        Err(e) => return Response::status(500, error_page("Ideas failed", &e, state)),
     };
     // Cards by a hidden author get no UI mention. Cards are never hidden
     // for language: their idea text is locally generated English.
@@ -683,7 +712,7 @@ fn page_ideas(state: &State) -> Response {
             escape(&c.id),
         ));
     }
-    Response::ok(layout("Ideas", &body))
+    Response::ok(layout("Ideas", &body, state))
 }
 
 fn do_triage(state: &State, body: &[u8]) -> Response {
@@ -697,12 +726,12 @@ fn do_triage(state: &State, body: &[u8]) -> Response {
         _ => {
             return Response::status(
                 400,
-                error_page("Bad triage", "Decision must be adopt, park or drop."),
+                error_page("Bad triage", "Decision must be adopt, park or drop.", state),
             )
         }
     };
     if id.trim().is_empty() {
-        return Response::status(400, error_page("Bad triage", "Missing id."));
+        return Response::status(400, error_page("Bad triage", "Missing id.", state));
     }
     let now = bookmarks_agent::idea_card::now_secs();
     match bookmarks_agent::idea_card::triage(
@@ -714,9 +743,9 @@ fn do_triage(state: &State, body: &[u8]) -> Response {
     ) {
         Ok(_) => Response::redirect("/ideas".to_string()),
         Err(e) if e.starts_with("no idea card") => {
-            Response::status(400, error_page("Bad triage", &e))
+            Response::status(400, error_page("Bad triage", &e, state))
         }
-        Err(e) => Response::status(500, error_page("Triage failed", &e)),
+        Err(e) => Response::status(500, error_page("Triage failed", &e, state)),
     }
 }
 
@@ -769,22 +798,22 @@ fn page_try(state: &State) -> Response {
             escape(id),
         ));
     }
-    Response::ok(layout("Try it", &body))
+    Response::ok(layout("Try it", &body, state))
 }
 
 fn do_try(state: &State, body: &[u8]) -> Response {
     let form = parse_body(body);
     let post_id = form.get("post_id").map(String::as_str).unwrap_or("");
     if post_id.trim().is_empty() {
-        return Response::status(400, error_page("Bad follow-up", "Missing post_id."));
+        return Response::status(400, error_page("Bad follow-up", "Missing post_id.", state));
     }
     let tried: bookmarks_agent::try_it::Tried =
         match form.get("tried").map(String::as_str).unwrap_or("").parse() {
             Ok(t) => t,
-            Err(e) => return Response::status(400, error_page("Bad follow-up", &e)),
+            Err(e) => return Response::status(400, error_page("Bad follow-up", &e, state)),
         };
     if let Err(e) = bookmarks_agent::try_it::run_tried(post_id, tried, None, &state.log_path()) {
-        return Response::status(500, error_page("Follow-up failed", &e));
+        return Response::status(500, error_page("Follow-up failed", &e, state));
     }
     Response::redirect("/try".to_string())
 }
@@ -799,14 +828,21 @@ fn page_hidden_authors(state: &State) -> Response {
                     "<h1>Hidden authors</h1><p><span class=\"badge-bad\">TAMPERED at row {n}</span></p>\
                      <p>The hash chain failed verification; the list is withheld (fail closed).</p>"
                 ),
+                state,
             ));
         }
         Err(e) => {
-            return Response::status(500, error_page("Hidden authors failed", &e.to_string()))
+            return Response::status(
+                500,
+                error_page("Hidden authors failed", &e.to_string(), state),
+            )
         }
         Ok(log) => match ancientos_core::feedback::records_from_log(&log) {
             Err(e) => {
-                return Response::status(500, error_page("Hidden authors failed", &e.to_string()));
+                return Response::status(
+                    500,
+                    error_page("Hidden authors failed", &e.to_string(), state),
+                );
             }
             Ok(records) => ancientos_core::feedback::hidden_authors(&records),
         },
@@ -828,41 +864,46 @@ fn page_hidden_authors(state: &State) -> Response {
         }
         body.push_str("</ul>");
     }
-    Response::ok(layout("Hidden authors", &body))
+    Response::ok(layout("Hidden authors", &body, state))
 }
 
 fn do_unhide_author(state: &State, body: &[u8]) -> Response {
     let form = parse_body(body);
     let username = form.get("username").map(String::as_str).unwrap_or("");
     if username.trim().is_empty() {
-        return Response::status(400, error_page("Bad unhide", "Missing username."));
+        return Response::status(400, error_page("Bad unhide", "Missing username.", state));
     }
     if let Err(e) = bookmarks_agent::vote::run_unhide_author(username, &state.log_path()) {
-        return Response::status(500, error_page("Unhide failed", &e));
+        return Response::status(500, error_page("Unhide failed", &e, state));
     }
     Response::redirect("/hidden-authors".to_string())
 }
 
-fn tampered_page(row: usize) -> Response {
+fn tampered_page(row: usize, state: &State) -> Response {
     Response::ok(layout(
         "Decision log",
         &format!(
             "<h1>Decision log</h1><p><span class=\"badge-bad\">TAMPERED at row {row}</span></p>\
              <p>The hash chain failed verification; entries are withheld (fail closed).</p>"
         ),
+        state,
     ))
 }
 
 fn page_log(state: &State) -> Response {
     use ancientos_core::log::{DecisionLog, LogError};
     let log = match DecisionLog::open(state.log_path()) {
-        Err(LogError::Chain(n)) => return tampered_page(n),
-        Err(e) => return Response::status(500, error_page("Log failed", &e.to_string())),
+        Err(LogError::Chain(n)) => return tampered_page(n, state),
+        Err(e) => {
+            return Response::status(500, error_page("Log failed", &e.to_string(), state));
+        }
         Ok(log) => log,
     };
     let entries = match log.verify_or_empty() {
-        Err(LogError::Chain(n)) => return tampered_page(n),
-        Err(e) => return Response::status(500, error_page("Log failed", &e.to_string())),
+        Err(LogError::Chain(n)) => return tampered_page(n, state),
+        Err(e) => {
+            return Response::status(500, error_page("Log failed", &e.to_string(), state));
+        }
         Ok(entries) => entries,
     };
     let mut body = format!(
@@ -881,7 +922,7 @@ fn page_log(state: &State) -> Response {
         }
         body.push_str("</table>");
     }
-    Response::ok(layout("Decision log", &body))
+    Response::ok(layout("Decision log", &body, state))
 }
 
 /// Fail-closed id check for `/deeper/<id>`: non-empty ASCII word chars
@@ -953,7 +994,7 @@ fn markdown_html(md: &str) -> String {
 
 fn page_deeper(state: &State, post_id: &str) -> Response {
     if !valid_deeper_id(post_id) {
-        return Response::status(400, error_page("Bad id", "Invalid post id."));
+        return Response::status(400, error_page("Bad id", "Invalid post id.", state));
     }
     let path = state
         .data_dir
@@ -964,17 +1005,23 @@ fn page_deeper(state: &State, post_id: &str) -> Response {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Response::status(
                 404,
-                error_page("Not found", "No walkthrough yet — use Go deeper first."),
+                error_page(
+                    "Not found",
+                    "No walkthrough yet — use Go deeper first.",
+                    state,
+                ),
             )
         }
-        Err(e) => return Response::status(500, error_page("Walkthrough failed", &e.to_string())),
+        Err(e) => {
+            return Response::status(500, error_page("Walkthrough failed", &e.to_string(), state))
+        }
     };
     let mut body = format!(
         "<p><a href=\"/\">Back to brief</a></p><h1>Go deeper — {}</h1>",
         escape(post_id)
     );
     body.push_str(&markdown_html(&md));
-    Response::ok(layout(&format!("Go deeper — {post_id}"), &body))
+    Response::ok(layout(&format!("Go deeper — {post_id}"), &body, state))
 }
 
 /// Run the existing deeper flow offline against this data dir's store
@@ -983,13 +1030,13 @@ fn page_deeper(state: &State, post_id: &str) -> Response {
 /// Any failure closes without redirecting.
 fn do_deeper(state: &State, post_id: &str) -> Response {
     if !valid_deeper_id(post_id) {
-        return Response::status(400, error_page("Bad id", "Invalid post id."));
+        return Response::status(400, error_page("Bad id", "Invalid post id.", state));
     }
     if !state.bookmarks.iter().any(|b| b.post_id == post_id) {
-        return Response::status(404, error_page("Not found", "No post with that id."));
+        return Response::status(404, error_page("Not found", "No post with that id.", state));
     }
     if let Err(e) = bookmarks_agent::deeper::validate_post_id(post_id) {
-        return Response::status(400, error_page("Bad id", &e));
+        return Response::status(400, error_page("Bad id", &e, state));
     }
     // Offline mode never calls these (no thread lookups, no model call);
     // they fail closed if that ever changes.
@@ -1019,15 +1066,171 @@ fn do_deeper(state: &State, post_id: &str) -> Response {
         &out_dir,
     ) {
         Ok(_) => Response::redirect(format!("/deeper/{post_id}")),
-        Err(e) => Response::status(500, error_page("Go deeper failed", &e)),
+        Err(e) => Response::status(500, error_page("Go deeper failed", &e, state)),
+    }
+}
+
+/// Decider recorded for web-UI approvals: the human at the browser. There is
+/// no login, so the channel is the identity (mirroring the CLI's `cli`).
+const WEB_DECIDER: &str = "web-ui";
+
+fn tampered_approvals_page(row: usize, state: &State) -> Response {
+    Response::ok(layout(
+        "Approvals",
+        &format!(
+            "<h1>Approvals</h1><p><span class=\"badge-bad\">TAMPERED at row {row}</span></p>\
+             <p>The hash chain failed verification; requests are withheld (fail closed).</p>"
+        ),
+        state,
+    ))
+}
+
+fn page_approvals(state: &State) -> Response {
+    use ancientos_core::approvals::{decided, pending, ApprovalError};
+    use ancientos_core::log::{DecisionLog, LogError};
+    let log = match DecisionLog::open(state.log_path()) {
+        Err(LogError::Chain(n)) => return tampered_approvals_page(n, state),
+        Err(e) => {
+            return Response::status(500, error_page("Approvals failed", &e.to_string(), state));
+        }
+        Ok(log) => log,
+    };
+    let now = now_secs();
+    let pend = match pending(&log, now) {
+        Err(ApprovalError::Log(LogError::Chain(n))) => {
+            return tampered_approvals_page(n, state);
+        }
+        Err(e) => {
+            return Response::status(500, error_page("Approvals failed", &e.to_string(), state));
+        }
+        Ok(v) => v,
+    };
+    let done = match decided(&log, now) {
+        Err(ApprovalError::Log(LogError::Chain(n))) => {
+            return tampered_approvals_page(n, state);
+        }
+        Err(e) => {
+            return Response::status(500, error_page("Approvals failed", &e.to_string(), state));
+        }
+        Ok(v) => v,
+    };
+    let mut body = format!("<h1>Approvals</h1><h2>Pending ({})</h2>", pend.len());
+    if pend.is_empty() {
+        body.push_str("<p>No pending approvals.</p>");
+    }
+    for a in &pend {
+        let r = &a.request;
+        body.push_str(&format!(
+            "<div class=\"card\"><p><strong>{}</strong> {} · {} · expires {}</p>\
+             <blockquote>{}</blockquote>\
+             <form method=\"post\" action=\"/approvals/approve\">\
+             <input type=\"hidden\" name=\"id\" value=\"{}\">\
+             <input type=\"hidden\" name=\"payload_hash\" value=\"{}\">\
+             <button type=\"submit\">Approve</button></form> \
+             <form method=\"post\" action=\"/approvals/deny\">\
+             <input type=\"hidden\" name=\"id\" value=\"{}\">\
+             <input type=\"hidden\" name=\"payload_hash\" value=\"{}\">\
+             <input name=\"reason\" placeholder=\"reason (optional)\"> \
+             <button type=\"submit\">Deny</button></form></div>",
+            escape(&r.id),
+            escape(&r.agent),
+            escape(&r.action),
+            r.expires_at,
+            escape(&r.summary),
+            escape(&r.id),
+            escape(&r.payload_hash),
+            escape(&r.id),
+            escape(&r.payload_hash),
+        ));
+    }
+    body.push_str("<h2>Recently decided</h2>");
+    if done.is_empty() {
+        body.push_str("<p>No decisions yet.</p>");
+    } else {
+        body.push_str("<ul>");
+        for a in &done {
+            let status = a.status_at(now).as_str().to_string();
+            let (by, reason) = match a.decision_at(now) {
+                Some(d) => (d.decided_by, d.reason.unwrap_or_default()),
+                None => ("-".to_string(), String::new()),
+            };
+            let reason = if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", escape(&reason))
+            };
+            body.push_str(&format!(
+                "<li>{} — {} by {}{}</li>",
+                escape(&a.request.id),
+                escape(&status),
+                escape(&by),
+                reason,
+            ));
+        }
+        body.push_str("</ul>");
+    }
+    Response::ok(layout("Approvals", &body, state))
+}
+
+/// Shared tail of the approve/deny handlers: the id and payload hash come
+/// from the form's hidden fields, so a stale form (hash mismatch) fails with
+/// an error page and no state change.
+fn decide_approval(state: &State, body: &[u8], approve_it: bool) -> Response {
+    use ancientos_core::approvals::{approve, deny, ApprovalError};
+    use ancientos_core::log::{DecisionLog, LogError};
+    let form = parse_body(body);
+    let id = form.get("id").map(String::as_str).unwrap_or("");
+    if id.trim().is_empty() {
+        return Response::status(400, error_page("Bad approval", "Missing id.", state));
+    }
+    let hash = form.get("payload_hash").map(String::as_str).unwrap_or("");
+    if hash.trim().is_empty() {
+        return Response::status(
+            400,
+            error_page("Bad approval", "Missing payload_hash.", state),
+        );
+    }
+    let mut log = match DecisionLog::open(state.log_path()) {
+        Err(LogError::Chain(n)) => return tampered_approvals_page(n, state),
+        Err(e) => {
+            return Response::status(500, error_page("Approvals failed", &e.to_string(), state));
+        }
+        Ok(log) => log,
+    };
+    let now = now_secs();
+    let outcome: Result<(), ApprovalError> = if approve_it {
+        // The release token is single-process by design: the web UI records
+        // the decision only. Nothing executes.
+        approve(&mut log, id, hash, WEB_DECIDER, now).map(|_| ())
+    } else {
+        let reason = form.get("reason").map(String::as_str).unwrap_or("");
+        deny(&mut log, id, hash, WEB_DECIDER, reason, now)
+    };
+    match outcome {
+        Ok(()) => Response::redirect("/approvals".to_string()),
+        Err(ApprovalError::Log(e)) => {
+            Response::status(500, error_page("Approvals failed", &e.to_string(), state))
+        }
+        Err(e @ ApprovalError::HashMismatch(_)) => Response::status(
+            400,
+            error_page(
+                "Stale approval",
+                &format!("{e}; nothing was decided — reload and retry."),
+                state,
+            ),
+        ),
+        Err(e) => Response::status(400, error_page("Approval failed", &e.to_string(), state)),
     }
 }
 
 /// Route one request. Pure over `(Request, &State)` apart from the file
-/// appends that votes, triage and follow-ups require by design.
+/// appends that votes, triage, follow-ups and approval decisions require.
 pub fn handle(req: &Request, state: &State) -> Response {
     if req.body.len() > MAX_BODY_BYTES {
-        return Response::status(413, error_page("Too large", "Request body exceeds 64KB."));
+        return Response::status(
+            413,
+            error_page("Too large", "Request body exceeds 64KB.", state),
+        );
     }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => page_brief(state, &req.query),
@@ -1039,16 +1242,19 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("GET", "/hidden-authors") => page_hidden_authors(state),
         ("POST", "/unhide-author") => do_unhide_author(state, &req.body),
         ("GET", "/log") => page_log(state),
+        ("GET", "/approvals") => page_approvals(state),
+        ("POST", "/approvals/approve") => decide_approval(state, &req.body, true),
+        ("POST", "/approvals/deny") => decide_approval(state, &req.body, false),
         ("GET", path) if path.starts_with("/deeper/") => {
             page_deeper(state, &path["/deeper/".len()..])
         }
         ("POST", path) if path.starts_with("/deeper/") => {
             do_deeper(state, &path["/deeper/".len()..])
         }
-        ("GET", _) | ("POST", _) => not_found(),
+        ("GET", _) | ("POST", _) => not_found(state),
         _ => Response::status(
             405,
-            error_page("Method not allowed", "Only GET and POST are served."),
+            error_page("Method not allowed", "Only GET and POST are served.", state),
         ),
     }
 }
@@ -2387,5 +2593,240 @@ mod tests {
         assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
         assert!(second.contains("post 3 of 3"), "{second}");
         server.join().unwrap();
+    }
+
+    /// Seed one approval request into this state's decision log.
+    fn seed_approval(
+        state: &State,
+        summary: &str,
+        draft: &str,
+        now: u64,
+        ttl: Option<u64>,
+    ) -> ancientos_core::approvals::ApprovalRequest {
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        ancientos_core::approvals::request(
+            &mut log,
+            "bookmarks-agent",
+            "x.post",
+            summary,
+            serde_json::json!({"draft": draft}),
+            now,
+            ttl,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn approvals_page_lists_pending_with_forms_nav_count_and_escaping() {
+        let (_dir, state) = test_state();
+        let now = now_secs();
+        let a = seed_approval(&state, "synthetic web proposal one", "draft-a", now, None);
+        let b = seed_approval(
+            &state,
+            "synthetic <script>alert('x')</script> & \"quotes\"",
+            "draft-b",
+            now,
+            None,
+        );
+        let resp = handle(&Request::get("/approvals"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("<h1>Approvals</h1>"), "{}", resp.body);
+        assert!(resp.body.contains("Approvals (2)"), "{}", resp.body);
+        for r in [&a, &b] {
+            for want in [
+                r.id.as_str(),
+                "bookmarks-agent",
+                "x.post",
+                &r.expires_at.to_string(),
+                &format!("name=\"id\" value=\"{}\"", r.id),
+                &format!("name=\"payload_hash\" value=\"{}\"", r.payload_hash),
+            ] {
+                assert!(resp.body.contains(want), "missing {want}: {}", resp.body);
+            }
+        }
+        assert!(
+            resp.body.contains("action=\"/approvals/approve\""),
+            "{}",
+            resp.body
+        );
+        assert!(resp.body.contains(">Approve</button>"), "{}", resp.body);
+        assert!(
+            resp.body.contains("action=\"/approvals/deny\""),
+            "{}",
+            resp.body
+        );
+        assert!(resp.body.contains(">Deny</button>"), "{}", resp.body);
+        assert!(
+            resp.body.contains(
+                "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt; &amp; &quot;quotes&quot;"
+            ),
+            "{}",
+            resp.body
+        );
+        assert!(!resp.body.contains("<script>"), "raw script leaked");
+        // The count travels with the shared nav on other pages too.
+        let brief = handle(&Request::get("/"), &state);
+        assert!(brief.body.contains("Approvals (2)"), "{}", brief.body);
+    }
+
+    #[test]
+    fn approvals_page_empty_state() {
+        let (_dir, state) = test_state();
+        let resp = handle(&Request::get("/approvals"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("No pending approvals."), "{}", resp.body);
+        assert!(resp.body.contains("No decisions yet."), "{}", resp.body);
+        assert!(resp.body.contains("Approvals (0)"), "{}", resp.body);
+    }
+
+    #[test]
+    fn approve_and_deny_handlers_record_and_list_decided() {
+        let (_dir, state) = test_state();
+        let now = now_secs();
+        let a = seed_approval(&state, "synthetic web approve", "draft-c", now, None);
+        let b = seed_approval(&state, "synthetic web deny", "draft-d", now, None);
+        // Long-expired seed: shows under Recently decided without a sweep.
+        let c = seed_approval(
+            &state,
+            "synthetic web stale",
+            "draft-e",
+            1_700_000_000,
+            Some(60),
+        );
+        let resp = handle(
+            &Request::post(
+                "/approvals/approve",
+                &format!("id={}&payload_hash={}", a.id, a.payload_hash),
+            ),
+            &state,
+        );
+        assert_eq!(resp.status, 303);
+        assert_eq!(resp.location.as_deref(), Some("/approvals"));
+        let resp = handle(
+            &Request::post(
+                "/approvals/deny",
+                &format!(
+                    "id={}&payload_hash={}&reason=needs+%3Cb%3Ework%3C%2Fb%3E",
+                    b.id, b.payload_hash
+                ),
+            ),
+            &state,
+        );
+        assert_eq!(resp.status, 303);
+        assert_eq!(resp.location.as_deref(), Some("/approvals"));
+        let entries = log_entries(&state);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[3].kind, "approval.approved");
+        assert_eq!(entries[3].payload["decided_by"], "web-ui");
+        assert_eq!(entries[4].kind, "approval.denied");
+        assert_eq!(entries[4].payload["reason"], "needs <b>work</b>");
+        let resp = handle(&Request::get("/approvals"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("Approvals (0)"), "{}", resp.body);
+        assert!(resp.body.contains("No pending approvals."), "{}", resp.body);
+        assert!(resp.body.contains("Recently decided"), "{}", resp.body);
+        assert!(
+            resp.body
+                .contains(&format!("{} — approved by web-ui", a.id)),
+            "{}",
+            resp.body
+        );
+        assert!(
+            resp.body.contains(&format!(
+                "{} — denied by web-ui — needs &lt;b&gt;work&lt;/b&gt;",
+                b.id
+            )),
+            "{}",
+            resp.body
+        );
+        assert!(
+            resp.body.contains(&format!("{} — expired by system", c.id)),
+            "{}",
+            resp.body
+        );
+        assert!(!resp.body.contains("<b>work</b>"), "raw HTML leaked");
+    }
+
+    #[test]
+    fn stale_hash_unknown_and_bad_forms_rejected_without_state_change() {
+        let (_dir, state) = test_state();
+        let r = seed_approval(
+            &state,
+            "synthetic web stale-hash",
+            "draft-f",
+            now_secs(),
+            None,
+        );
+        let bad = "0".repeat(64);
+        let resp = handle(
+            &Request::post(
+                "/approvals/approve",
+                &format!("id={}&payload_hash={bad}", r.id),
+            ),
+            &state,
+        );
+        assert_eq!(resp.status, 400);
+        assert!(resp.body.contains("Stale approval"), "{}", resp.body);
+        let resp = handle(
+            &Request::post(
+                "/approvals/deny",
+                &format!("id={}&payload_hash={bad}", r.id),
+            ),
+            &state,
+        );
+        assert_eq!(resp.status, 400);
+        assert!(resp.body.contains("Stale approval"), "{}", resp.body);
+        let resp = handle(
+            &Request::post(
+                "/approvals/approve",
+                &format!("id=deadbeefdeadbeef&payload_hash={bad}"),
+            ),
+            &state,
+        );
+        assert_eq!(resp.status, 400);
+        assert!(resp.body.contains("Approval failed"), "{}", resp.body);
+        assert_eq!(
+            handle(
+                &Request::post("/approvals/approve", "payload_hash=x"),
+                &state
+            )
+            .status,
+            400
+        );
+        assert_eq!(
+            handle(&Request::post("/approvals/deny", "id=x"), &state).status,
+            400
+        );
+        // Nothing was decided or appended.
+        assert_eq!(log_entries(&state).len(), 1);
+        let resp = handle(&Request::get("/approvals"), &state);
+        assert!(resp.body.contains("Approvals (1)"), "{}", resp.body);
+        assert!(resp.body.contains(&r.id), "{}", resp.body);
+    }
+
+    #[test]
+    fn second_decision_is_rejected() {
+        let (_dir, state) = test_state();
+        let r = seed_approval(&state, "synthetic web twice", "draft-g", now_secs(), None);
+        let form = format!("id={}&payload_hash={}", r.id, r.payload_hash);
+        assert_eq!(
+            handle(&Request::post("/approvals/approve", &form), &state).status,
+            303
+        );
+        let resp = handle(&Request::post("/approvals/deny", &form), &state);
+        assert_eq!(resp.status, 400);
+        assert!(resp.body.contains("already decided"), "{}", resp.body);
+        assert_eq!(log_entries(&state).len(), 2);
+    }
+
+    #[test]
+    fn approvals_page_shows_tampered_badge() {
+        let (_dir, state) = test_state();
+        seed_approval(&state, "synthetic web tamper", "draft-h", now_secs(), None);
+        let body = std::fs::read_to_string(state.log_path()).unwrap();
+        std::fs::write(state.log_path(), body.replacen("x.post", "x.POST", 1)).unwrap();
+        let resp = handle(&Request::get("/approvals"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("TAMPERED at row 0"), "{}", resp.body);
     }
 }

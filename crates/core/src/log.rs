@@ -32,6 +32,7 @@ fn digest(seq: u64, prev: &str, kind: &str, payload: &serde_json::Value) -> Stri
     hex::encode(h.finalize())
 }
 
+#[derive(Debug)]
 pub struct DecisionLog {
     path: PathBuf,
     next_seq: u64,
