@@ -92,7 +92,7 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `jev_client` | router | Jev (TypeSafe / localjev) classifier client, off by default |
 | `web-ui` | web-ui | Loopback-only, server-rendered demo UI (no JS); reuses bookmarks-agent and core, makes no network or paid calls |
 | `muse-runs` | muse-runs | Second app: a proposed Muse Code run is a gated `muse.run` action; only approved runs execute `scripts/muse_run.sh`, and only with `ANCIENTOS_ALLOW_PAID=1` |
-| `demo-runner` | demo-runner | Deterministic 14-shot demo on synthetic data |
+| `demo-runner` | demo-runner | Deterministic 14-shot demo on synthetic data; renders web-ui's `/accuracy` and `/approvals` pages offline and drives muse-runs against a stub `muse_run.sh` (paid switch unset) |
 | `eval` | eval (package `ancientos-eval`) | Offline precision/recall harness plus classifier-backend scoring ([eval.md](eval.md)) |
 
 ## Guarantees and the tests that prove them

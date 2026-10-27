@@ -12,6 +12,7 @@ first citizen:
 - **Verdicts that teach it**: approve / skip / never_post / never_category / delegate. A category auto-approves after ≥3 votes at ≥80%.
 - **Delegate → idea cards**: the agent unrolls the thread and writes an idea card (source, idea, AncientOS mapping, effort, status). Weekly triage: adopt / park / drop. Bookmark → idea → roadmap.
 - **"Try it"**: hands-on posts get numbered steps and a next-day "did you try it?" check.
+- **Measured, not claimed**: a web-ui accuracy page scores try-it classification and brief ranking on a committed synthetic eval set (no private data). Ranking by meaning (local embeddings) is built and opt-in; on that set it ties today's order (P@5 0.60), so it stays off by default.
 
 The project's own origin story: a bookmarked Rust Word clone (WordCraft) is what
 convinced the author to rebuild AncientOS in Rust.
@@ -20,10 +21,11 @@ convinced the author to rebuild AncientOS in Rust.
 - **Muse Code is the primary builder.** Every feature run is logged in `docs/muse-code-log.md`: Muse Spark client with fail-closed paid switch (run 1), X OAuth2 PKCE + incremental sync (run 2, 54 tests), daily brief with merge/sanitize/gate (run 3, 86 tests), full-text hydration (run 4, 95 tests), verdicts + unroll + delegate (run 5), thread-fetch fix (run 6). Each run took ~3.5-13 min and landed with CI green after human review. The one scaffold step not done by Muse is marked as such (run 2b).
 - **Muse Spark (Meta Model API)** writes each brief in one call (~1.6k tokens live) and delegate notes (~1.1k tokens for an 8-post thread).
 - **Llama** handles sensitive categories via the privacy router, so private data never reaches a cloud model.
+- **Muse Code runs are governed too**: `muse-runs`, the second app on the core, turns each proposed run into a gated action. A person approves or denies it (CLI or the web-ui approvals page), the approval binds the prompt's sha256, and an approved run still refuses to start unless the paid switch is on.
 
 ## Technical depth
-- Rust workspace: `core` (scheduler, fail-closed approval gate, append-only hash-chained decision log), `router` (privacy router, Muse/Llama clients), `bookmarks-agent`.
-- **Core plus apps**: `core` and `router` hold no app code. Each app (bookmarks-agent is the first) brings its own gate policy and data rules, and the core denies anything an app has not registered. `scripts/check_core_boundary.sh` runs in CI and fails if app code leaks into the core.
+- Rust workspace: `core` (scheduler, fail-closed approval gate, append-only hash-chained decision log), `router` (privacy router, Muse/Llama clients), two apps (`bookmarks-agent`, `muse-runs`), `web-ui` (local brief, votes, approvals, log and accuracy pages), `eval` (offline scoring) and `demo-runner`.
+- **Core plus apps**: `core` and `router` hold no app code. Each app (bookmarks-agent and muse-runs today) brings its own gate policy and data rules, and the core denies anything an app has not registered. `scripts/check_core_boundary.sh` runs in CI and fails if app code leaks into the core.
 - Fail closed everywhere: missing key, paid switch off (`ANCIENTOS_ALLOW_PAID` default off), or gate denial all stop the action.
 - Sync never deletes and never infers removals; merge of live + fixture by post_id keeps the best label.
 - Liveness: brief and web-ui confirm posts still exist via a batched read-only X lookup (deleted/suspended/protected dropped silently, 24h disk cache, offline/demo skip, transient errors fail closed); X is never written to and stored bookmarks are never deleted.
@@ -39,4 +41,4 @@ same core governs any future agent, so the pattern generalizes beyond X.
 - Full AncientOS rebuild on this core (more agents on the same gate and log).
 - Custom X feed ranking from accumulated verdicts.
 - "Go deeper" scheduled walkthroughs.
-- Local Llama backend live via Ollama/llama.cpp; Modal stays an optional future target.
+- Modal as an optional hosted target for the local Llama path (Ollama/llama.cpp works today).

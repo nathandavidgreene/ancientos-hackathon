@@ -28,10 +28,13 @@ flowchart BT
   agent --> router
   web --> core
   web --> agent
+  web --> eval
   muse --> core
   demo --> core
   demo --> router
   demo --> agent
+  demo --> web
+  demo --> muse
   eval --> router
   eval --> agent
 ```
