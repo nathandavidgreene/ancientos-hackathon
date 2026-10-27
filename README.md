@@ -19,7 +19,7 @@ agent (read-only OAuth2 PKCE, incremental ingest that never infers removals).
 ## Run
 ```sh
 cp .env.example .env   # fill in locally; never commit
-scripts/ci_local.sh    # fmt, clippy, tests
+scripts/ci_local.sh    # boundary, docs, strict Pyright, fmt, clippy, tests
 cargo run -p bookmarks-agent -- load fixtures/sample_bookmarks.jsonl
 ```
 

@@ -41,7 +41,7 @@ harness are views and tools around it. See [Core and apps](core-and-apps.md).
 
 ```sh
 cp .env.example .env      # fill in locally; never commit
-scripts/ci_local.sh       # boundary, doc coverage, fmt, clippy, tests
+scripts/ci_local.sh       # boundary, doc coverage, strict Pyright, fmt, clippy, tests
 scripts/demo.sh           # offline 14-shot demo
 cargo run -p web-ui -- --demo   # then open http://127.0.0.1:8787/
 tools/build_docs.sh       # this site -> site/index.html
