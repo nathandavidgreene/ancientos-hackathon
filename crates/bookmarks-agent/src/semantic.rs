@@ -546,9 +546,32 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
+            // Read the whole request (headers and body) before replying, so a
+            // loaded machine never sees the reply race the body upload.
+            let mut got = Vec::new();
             let mut buf = [0u8; 4096];
-            let n = s.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if got.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&got).to_string();
             let body = r#"{"embeddings":[[1.0,2.0]]}"#;
             write!(
                 s,
