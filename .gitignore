@@ -10,3 +10,5 @@
 !fixtures/demo/expected_idea_cards.jsonl
 !fixtures/demo/deeper_thread_bookmarks.jsonl
 !fixtures/muse_run_sample.jsonl
+!fixtures/eval/synthetic_bookmarks.jsonl
+!fixtures/eval/synthetic_labels.jsonl
