@@ -624,7 +624,12 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
     ));
     body.push_str(&format!(
         "<h2>Go deeper</h2><form method=\"post\" action=\"/deeper/{}\">\
-         <button type=\"submit\">Go deeper</button></form>",
+         <button type=\"submit\">Go deeper</button></form>\
+         <form method=\"post\" action=\"/deeper/{}\">\
+         <input type=\"hidden\" name=\"later\" value=\"1\">\
+         <label>Later at <input type=\"datetime-local\" name=\"at\"></label> \
+         <button type=\"submit\">Later</button></form>",
+        escape(&bm.post_id),
         escape(&bm.post_id),
     ));
     if idx + 1 < visible.len() {
@@ -1024,11 +1029,36 @@ fn page_deeper(state: &State, post_id: &str) -> Response {
     Response::ok(layout(&format!("Go deeper — {post_id}"), &body, state))
 }
 
+/// Parse the Later form's `at` value: an HTML `datetime-local`
+/// (`YYYY-MM-DDTHH:MM`, optional `:SS`, no zone, assumed UTC) or a full
+/// RFC 3339 timestamp. Past or unparseable values are refused.
+fn parse_later_at(raw: &str, now: u64) -> Result<u64, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("Missing time.".to_string());
+    }
+    let normalized = if s.len() == 16 {
+        format!("{s}:00Z")
+    } else if s.len() == 19 {
+        format!("{s}Z")
+    } else {
+        s.to_string()
+    };
+    let at = bookmarks_agent::idea_card::parse_rfc3339(&normalized)
+        .ok_or_else(|| "Unparseable time (want YYYY-MM-DDTHH:MM).".to_string())?;
+    if at < now {
+        return Err("Time is in the past.".to_string());
+    }
+    Ok(at)
+}
+
 /// Run the existing deeper flow offline against this data dir's store
 /// (local fallback, no network; paid switch on still stays offline
 /// because a fixture is given) and redirect to the walkthrough page.
+/// With `later=1` plus an `at` time, queue the walkthrough for later
+/// instead of running it and redirect to the brief page.
 /// Any failure closes without redirecting.
-fn do_deeper(state: &State, post_id: &str) -> Response {
+fn do_deeper(state: &State, post_id: &str, body: &[u8]) -> Response {
     if !valid_deeper_id(post_id) {
         return Response::status(400, error_page("Bad id", "Invalid post id.", state));
     }
@@ -1037,6 +1067,30 @@ fn do_deeper(state: &State, post_id: &str) -> Response {
     }
     if let Err(e) = bookmarks_agent::deeper::validate_post_id(post_id) {
         return Response::status(400, error_page("Bad id", &e, state));
+    }
+    let form = parse_body(body);
+    if let Some(later) = form.get("later") {
+        if later != "1" {
+            return Response::status(400, error_page("Bad queue", "Invalid later value.", state));
+        }
+        let raw = form.get("at").map(String::as_str).unwrap_or("");
+        let now = now_secs();
+        let at = match parse_later_at(raw, now) {
+            Ok(t) => t,
+            Err(e) => return Response::status(400, error_page("Bad time", &e, state)),
+        };
+        return match bookmarks_agent::deeper::queue_later_at_path(
+            post_id,
+            at,
+            now,
+            &state.log_path(),
+        ) {
+            Ok(_) => Response::redirect("/".to_string()),
+            Err(e) => Response::status(500, error_page("Queue failed", &e, state)),
+        };
+    }
+    if form.contains_key("at") {
+        return Response::status(400, error_page("Bad queue", "Time without later=1.", state));
     }
     // Offline mode never calls these (no thread lookups, no model call);
     // they fail closed if that ever changes.
@@ -1249,7 +1303,7 @@ pub fn handle(req: &Request, state: &State) -> Response {
             page_deeper(state, &path["/deeper/".len()..])
         }
         ("POST", path) if path.starts_with("/deeper/") => {
-            do_deeper(state, &path["/deeper/".len()..])
+            do_deeper(state, &path["/deeper/".len()..], &req.body)
         }
         ("GET", _) | ("POST", _) => not_found(state),
         _ => Response::status(
@@ -2114,6 +2168,98 @@ mod tests {
             resp.body
         );
         assert!(resp.body.contains(">Go deeper</button>"), "{}", resp.body);
+    }
+
+    #[test]
+    fn brief_has_later_form_with_datetime() {
+        let (_dir, state) = test_state();
+        let resp = handle(&Request::get("/"), &state);
+        assert!(
+            resp.body.contains("name=\"later\" value=\"1\""),
+            "{}",
+            resp.body
+        );
+        assert!(
+            resp.body
+                .contains("<input type=\"datetime-local\" name=\"at\">"),
+            "{}",
+            resp.body
+        );
+        assert!(resp.body.contains(">Later</button>"), "{}", resp.body);
+    }
+
+    #[test]
+    fn deeper_later_queues_instead_of_running() {
+        let (_dir, state) = deeper_state();
+        let resp = handle(
+            &Request::post("/deeper/demo-9001", "later=1&at=2030-05-01T09%3A30"),
+            &state,
+        );
+        assert_eq!(resp.status, 303, "{}", resp.body);
+        assert_eq!(resp.location.as_deref(), Some("/"));
+        // Queued, not run: a deeper.queued entry, no walkthrough file.
+        let entries = log_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "deeper.queued");
+        assert_eq!(entries[0].payload["post_id"], "demo-9001");
+        assert_eq!(
+            entries[0].payload["at"],
+            bookmarks_agent::idea_card::parse_rfc3339("2030-05-01T09:30:00Z").unwrap()
+        );
+        assert!(!state.data_dir.join("deeper").join("demo-9001.md").exists());
+        // With seconds, and full RFC 3339 with a zone, also queue.
+        for body in [
+            "later=1&at=2030-05-02T09%3A30%3A00",
+            "later=1&at=2030-05-03T09%3A30%3A00%2B02%3A00",
+        ] {
+            let resp = handle(&Request::post("/deeper/demo-9002", body), &state);
+            assert_eq!(resp.status, 303, "{}", resp.body);
+        }
+        assert_eq!(
+            log_entries(&state)
+                .iter()
+                .filter(|e| e.kind == "deeper.queued")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn deeper_later_refuses_bad_time_bad_flag_and_unknown() {
+        let (_dir, state) = deeper_state();
+        // Past, unparseable and missing times are refused.
+        for body in [
+            "later=1&at=2020-01-01T00%3A00",
+            "later=1&at=someday",
+            "later=1&at=",
+            "later=1",
+        ] {
+            let resp = handle(&Request::post("/deeper/demo-9001", body), &state);
+            assert_eq!(resp.status, 400, "{body}: {}", resp.body);
+        }
+        // Wrong flag value, and a time without the flag, are refused.
+        for body in ["later=0&at=2030-05-01T09%3A30", "at=2030-05-01T09%3A30"] {
+            let resp = handle(&Request::post("/deeper/demo-9001", body), &state);
+            assert_eq!(resp.status, 400, "{body}: {}", resp.body);
+        }
+        assert!(!state.log_path().exists(), "refusals append nothing");
+        // Unknown posts and bad ids still fail closed on the later path.
+        assert_eq!(
+            handle(
+                &Request::post("/deeper/demo-9999", "later=1&at=2030-05-01T09%3A30"),
+                &state
+            )
+            .status,
+            404
+        );
+        assert_eq!(
+            handle(
+                &Request::post("/deeper/zz9", "later=1&at=2030-05-01T09%3A30"),
+                &state
+            )
+            .status,
+            400
+        );
     }
 
     #[test]

@@ -47,8 +47,15 @@ impl Gate {
     }
 }
 
+/// Paid brief ranking: proposed by the daemon, never executed without a human.
+pub const BRIEF_PAID_ACTION: &str = "brief.paid";
+/// Paid go-deeper walkthrough: proposed by the daemon, executed only after
+/// a human approval is claimed and released.
+pub const DEEPER_PAID_ACTION: &str = "deeper.paid";
+
 /// Canonical policy used by the approval queue: read-only agent work is
-/// low risk, X writes (which no agent performs without a human) are high
+/// low risk, X writes (which no agent performs without a human) and paid
+/// agent work (proposed by the daemon, approved by a human) are high
 /// risk, and anything unlisted is denied (fail closed).
 pub fn default_gate() -> Gate {
     let mut g = Gate::new();
@@ -60,6 +67,8 @@ pub fn default_gate() -> Gate {
         "x.like",
         "x.follow",
         "x.dm.send",
+        BRIEF_PAID_ACTION,
+        DEEPER_PAID_ACTION,
     ] {
         g.register(action, Risk::High);
     }
@@ -103,5 +112,19 @@ mod tests {
             assert_eq!(g.evaluate(&p(action)), Verdict::NeedsHuman, "{action}");
         }
         assert!(matches!(g.evaluate(&p("wipe.drive")), Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn default_policy_needs_human_for_daemon_paid_actions() {
+        let g = default_gate();
+        assert_eq!(g.evaluate(&p(BRIEF_PAID_ACTION)), Verdict::NeedsHuman);
+        assert_eq!(g.evaluate(&p(DEEPER_PAID_ACTION)), Verdict::NeedsHuman);
+        // Neighbouring names still fail closed.
+        for action in ["brief.paid.extra", "deeper.paid2", "brief", "deeper"] {
+            assert!(
+                matches!(g.evaluate(&p(action)), Verdict::Deny { .. }),
+                "{action}"
+            );
+        }
     }
 }

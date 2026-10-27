@@ -611,6 +611,81 @@ pub fn run_full_with_liveness(
     offline: bool,
     lookup: Option<&crate::liveness::Lookup<'_>>,
 ) -> Result<BriefResult, String> {
+    run_impl(
+        merged,
+        Some(model),
+        log_path,
+        date,
+        hydrator,
+        thread_expander,
+        offline,
+        lookup,
+        crate::idea_card::now_secs(),
+    )
+}
+
+/// Local-only brief: the deterministic fallback path with no model call at
+/// all (the daemon's brief agent uses this, so paid mode can never trigger
+/// a network call from the daemon). Same candidate selection, gate,
+/// hydration/expansion/translation handling and log entries as [`run_full`];
+/// `model` is always `"local"` and `fallback` is always true. `now_secs`
+/// stamps liveness-cache reads and `try_it.shown` entries (pass a fixed
+/// clock for deterministic runs).
+#[allow(clippy::too_many_arguments)]
+pub fn run_local_full(
+    merged: &MergeOutput,
+    log_path: &Path,
+    date: &str,
+    hydrator: Option<&Hydrator<'_>>,
+    thread_expander: Option<&ThreadExpander<'_>>,
+    offline: bool,
+    lookup: Option<&crate::liveness::Lookup<'_>>,
+    now_secs: u64,
+) -> Result<BriefResult, String> {
+    run_impl(
+        merged,
+        None,
+        log_path,
+        date,
+        hydrator,
+        thread_expander,
+        offline,
+        lookup,
+        now_secs,
+    )
+}
+
+/// [`run_local_full`] with the production services (real hydrator, thread
+/// expander and liveness lookup) and the system clock. Deterministic callers
+/// (the daemon) use [`run_local_full`] with explicit `offline`/`now_secs`.
+pub fn run_local(merged: &MergeOutput, log_path: &Path, date: &str) -> Result<BriefResult, String> {
+    run_local_full(
+        merged,
+        log_path,
+        date,
+        Some(&crate::x_api::hydrate),
+        Some(&crate::x_api::fetch_thread_if_root),
+        false,
+        None,
+        crate::idea_card::now_secs(),
+    )
+}
+
+/// Shared implementation: `model=None` skips the model call entirely and
+/// takes the local fallback; `model=Some` keeps the historical route-then-
+/// call behavior (one call at most, fallback on error or non-Muse route).
+#[allow(clippy::too_many_arguments)]
+fn run_impl(
+    merged: &MergeOutput,
+    model: Option<&dyn BriefModel>,
+    log_path: &Path,
+    date: &str,
+    hydrator: Option<&Hydrator<'_>>,
+    thread_expander: Option<&ThreadExpander<'_>>,
+    offline: bool,
+    lookup: Option<&crate::liveness::Lookup<'_>>,
+    now_secs: u64,
+) -> Result<BriefResult, String> {
     if merged.rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
@@ -640,10 +715,9 @@ pub fn run_full_with_liveness(
     // written for them. Non-English posts are kept: they are translated for
     // display (see below), never skipped for language.
     let cache_path = crate::liveness::cache_path_for_log(log_path)?;
-    let now = crate::liveness::now_secs();
     let rows: Vec<Bookmark> = match lookup {
-        Some(l) => crate::liveness::filter_with_lookup(&rows, &cache_path, offline, now, l)?,
-        None => crate::liveness::filter_live(&rows, &cache_path, offline, now)?,
+        Some(l) => crate::liveness::filter_with_lookup(&rows, &cache_path, offline, now_secs, l)?,
+        None => crate::liveness::filter_live(&rows, &cache_path, offline, now_secs)?,
     };
     if rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
@@ -655,18 +729,18 @@ pub fn run_full_with_liveness(
 
     // Only sanitized text may leave the device. The prompt is built from
     // stored excerpts only; hydration happens after picks and is display only.
+    // `None` (local-only callers like the daemon) never calls a model.
     let dest = route(Sensitivity::Sanitized, false);
-    let (resolved, model_id, usage, fallback) = if dest == Destination::MuseSpark {
-        match model.call(&build_prompt(&candidates)) {
+    let (resolved, model_id, usage, fallback) = match model {
+        Some(m) if dest == Destination::MuseSpark => match m.call(&build_prompt(&candidates)) {
             Ok(reply) => {
                 let picks = parse_model_picks(&reply.content, candidates.len());
                 let resolved = resolve_model_picks(&candidates, &picks);
                 (resolved, reply.model, reply.usage, false)
             }
             Err(_) => (local_picks(&candidates), "local".to_string(), None, true),
-        }
-    } else {
-        (local_picks(&candidates), "local".to_string(), None, true)
+        },
+        _ => (local_picks(&candidates), "local".to_string(), None, true),
     };
 
     let stored: HashMap<&str, &Bookmark> = rows.iter().map(|b| (b.post_id.as_str(), b)).collect();
@@ -851,7 +925,7 @@ pub fn run_full_with_liveness(
     // Tag hands-on picks for follow-up: one `try_it.shown` entry per
     // rendered tagged pick (post id plus timestamp, never text).
     // Classification scores the English translation when available.
-    let shown_at = crate::idea_card::now_secs();
+    let shown_at = now_secs;
     for p in &picks {
         if crate::try_it::classify_text(&p.topic, english_for_try_it(p)).is_some() {
             crate::try_it::record_shown(&mut log, &p.post_id, shown_at)?;
@@ -2017,5 +2091,103 @@ mod tests {
             .unwrap();
             assert_eq!(res.picks[0].full_text, "synthetic text for id0", "{name}");
         }
+    }
+
+    #[test]
+    fn local_full_matches_fallback_with_fixed_clock_and_no_model() {
+        // run_local_full makes no model call (there is no model to call) and
+        // stamps try_it.shown with the passed clock.
+        let merged = merged_of(
+            vec![
+                bm("id1", Some("2026-10-20T00:00:00+00:00"), Some("T"), None),
+                bm("id2", Some("2026-10-21T00:00:00+00:00"), Some("T"), None),
+                bm("id3", Some("2026-10-22T00:00:00+00:00"), Some("T"), None),
+            ],
+            &["id1", "id2", "id3"],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        let res = run_local_full(
+            &merged,
+            &log_path,
+            "2026-10-27",
+            None,
+            None,
+            true,
+            None,
+            7_777,
+        )
+        .unwrap();
+        assert!(res.fallback);
+        assert_eq!(res.model, "local");
+        assert!(res.usage.is_none());
+        assert_eq!(res.picks.len(), 3);
+        let entries = ancientos_core::log::DecisionLog::open(&log_path)
+            .unwrap()
+            .verify()
+            .unwrap();
+        let kinds: Vec<&str> = entries.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"brief.candidates"), "{kinds:?}");
+        assert!(kinds.contains(&"brief.model_call"), "{kinds:?}");
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.kind == "brief.model_call")
+                .unwrap()
+                .payload["fallback"],
+            true
+        );
+        for e in entries
+            .iter()
+            .filter(|e| e.kind == crate::try_it::SHOWN_KIND)
+        {
+            assert_eq!(e.payload[crate::try_it::SHOWN_AT_FIELD], 7_777);
+        }
+        // Same inputs twice: identical markdown (deterministic local path).
+        let log2 = dir.path().join("d2.jsonl");
+        let again =
+            run_local_full(&merged, &log2, "2026-10-27", None, None, true, None, 7_777).unwrap();
+        assert_eq!(res.markdown, again.markdown);
+    }
+
+    #[test]
+    fn local_full_matches_failing_model_output() {
+        // The local-only path renders exactly what a failing model call
+        // falls back to (same picks, same markdown).
+        let _env = crate::test_support::EnvHold::paid_off();
+        let merged = merged_of(
+            vec![
+                bm("id1", Some("2026-10-20T00:00:00+00:00"), Some("T"), None),
+                bm("id2", Some("2026-10-21T00:00:00+00:00"), Some("T"), None),
+            ],
+            &["id1", "id2"],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let via_model = run_full_with_liveness(
+            &merged,
+            &FakeModel::failing(),
+            &dir.path().join("m.jsonl"),
+            "2026-10-27",
+            None,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let via_local = run_local_full(
+            &merged,
+            &dir.path().join("l.jsonl"),
+            "2026-10-27",
+            None,
+            None,
+            true,
+            None,
+            crate::idea_card::now_secs(),
+        )
+        .unwrap();
+        assert!(via_model.fallback);
+        assert_eq!(via_model.markdown, via_local.markdown);
+        assert_eq!(via_model.model, "local");
+        assert_eq!(via_local.model, "local");
     }
 }

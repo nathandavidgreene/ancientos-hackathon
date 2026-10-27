@@ -2,6 +2,7 @@
 pub mod author_filter;
 pub mod brief;
 pub mod callback;
+pub mod daemon;
 pub mod deeper;
 pub mod delegate;
 pub mod digest;

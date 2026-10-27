@@ -665,6 +665,41 @@ pub fn sweep_expired(log: &mut DecisionLog, now: u64) -> Result<usize, ApprovalE
     Ok(n)
 }
 
+/// Recover a [`ReleaseToken`] for an already-approved request. The CLI and
+/// web UI record the human decision but drop the token from [`approve`] (it
+/// is deliberately not serializable), so a later daemon tick re-derives it
+/// from the log: only a request whose folded status is exactly Approved
+/// yields a token, and only when `expected_payload_hash` matches the stored
+/// request. Anything else — unknown id, pending, denied, expired, released,
+/// hash mismatch — is an error that appends nothing. The caller still passes
+/// the token to [`release`], which enforces exactly-once execution on the
+/// log check. This never bypasses the human: the log must already show an
+/// approval decision.
+pub fn claim_release_token(
+    log: &DecisionLog,
+    id: &str,
+    expected_payload_hash: &str,
+) -> Result<ReleaseToken, ApprovalError> {
+    let a = get(log, id)?;
+    match a.status {
+        Status::Approved => {}
+        Status::Released => return Err(ApprovalError::AlreadyReleased(a.request.id)),
+        other => {
+            return Err(ApprovalError::NotApproved(
+                a.request.id,
+                other.as_str().to_string(),
+            ))
+        }
+    }
+    if a.request.payload_hash != expected_payload_hash {
+        return Err(ApprovalError::HashMismatch(a.request.id));
+    }
+    Ok(ReleaseToken {
+        approval_id: a.request.id,
+        payload_hash: a.request.payload_hash,
+    })
+}
+
 /// Consume a [`ReleaseToken`] and authorize one execution of the approved
 /// payload. Re-checks the payload hash against the request (redacting first,
 /// so callers pass the original payload) and requires the request to be
@@ -1167,5 +1202,100 @@ mod tests {
         // c (expired at +12).
         assert_eq!(ids, vec![c.id.as_str(), b.id.as_str(), a.id.as_str()]);
         assert_eq!(done[0].status_at(NOW + 100), Status::Expired);
+    }
+
+    #[test]
+    fn claim_recovers_token_for_approved_only() {
+        let (_dir, mut log, _path) = open_log();
+        let approved = propose(&mut log, NOW, json!({"n": 11}));
+        let pending_req = propose(&mut log, NOW + 1, json!({"n": 12}));
+        let denied = propose(&mut log, NOW + 2, json!({"n": 13}));
+        deny(
+            &mut log,
+            &denied.id,
+            &denied.payload_hash,
+            "human",
+            "no",
+            NOW + 3,
+        )
+        .unwrap();
+        // Approve then drop the token, like the CLI does.
+        approve(
+            &mut log,
+            &approved.id,
+            &approved.payload_hash,
+            "human",
+            NOW + 4,
+        )
+        .unwrap();
+        // Pending, denied, unknown and wrong-hash claims all fail closed.
+        assert!(matches!(
+            claim_release_token(&log, &pending_req.id, &pending_req.payload_hash).unwrap_err(),
+            ApprovalError::NotApproved(_, _)
+        ));
+        assert!(matches!(
+            claim_release_token(&log, &denied.id, &denied.payload_hash).unwrap_err(),
+            ApprovalError::NotApproved(_, _)
+        ));
+        assert!(matches!(
+            claim_release_token(&log, "deadbeefdeadbeef", &approved.payload_hash).unwrap_err(),
+            ApprovalError::Unknown(_)
+        ));
+        assert!(matches!(
+            claim_release_token(&log, &approved.id, &"0".repeat(64)).unwrap_err(),
+            ApprovalError::HashMismatch(_)
+        ));
+        let before = len(&log);
+        // The approved claim succeeds and releases exactly once.
+        let token = claim_release_token(&log, &approved.id, &approved.payload_hash).unwrap();
+        assert_eq!(token.approval_id(), approved.id);
+        release(&mut log, token, &json!({"n": 11})).unwrap();
+        assert_eq!(get(&log, &approved.id).unwrap().status, Status::Released);
+        // After release the claim is refused (already released).
+        assert!(matches!(
+            claim_release_token(&log, &approved.id, &approved.payload_hash).unwrap_err(),
+            ApprovalError::AlreadyReleased(_)
+        ));
+        assert_eq!(len(&log), before + 1, "claim appends nothing");
+    }
+
+    #[test]
+    fn claim_refuses_expired_requests() {
+        let (_dir, mut log, _path) = open_log();
+        let r = request(
+            &mut log,
+            AGENT,
+            RISKY,
+            "short-lived",
+            json!({"n": 14}),
+            NOW,
+            Some(10),
+        )
+        .unwrap();
+        sweep_expired(&mut log, NOW + 11).unwrap();
+        assert!(matches!(
+            claim_release_token(&log, &r.id, &r.payload_hash).unwrap_err(),
+            ApprovalError::NotApproved(_, _)
+        ));
+    }
+
+    #[test]
+    fn daemon_paid_actions_round_trip_through_request() {
+        use crate::gate::{BRIEF_PAID_ACTION, DEEPER_PAID_ACTION};
+        let (_dir, mut log, _path) = open_log();
+        for action in [BRIEF_PAID_ACTION, DEEPER_PAID_ACTION] {
+            let r = request(
+                &mut log,
+                AGENT,
+                action,
+                "synthetic daemon proposal",
+                json!({"n": 15}),
+                NOW,
+                None,
+            )
+            .unwrap();
+            assert_eq!(r.action, action);
+            assert_eq!(get(&log, &r.id).unwrap().status, Status::Pending);
+        }
     }
 }

@@ -13,12 +13,19 @@
 use crate::delegate::ThreadFetcher;
 use crate::fixture::Bookmark;
 use crate::unroll::{ReferencedTweet, ThreadPost};
-use ancientos_core::log::DecisionLog;
+use ancientos_core::log::{DecisionLog, Entry};
 use ancientos_router::muse::MuseUsage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const DEEPER_DONE_KIND: &str = "deeper.write";
+/// Log kind appended by [`queue_later`]: `{post_id, at, queued_at}`.
+pub const DEEPER_QUEUED_KIND: &str = "deeper.queued";
+/// Log kind appended when a queued job finishes: `{post_id, at, mode, done_at}`.
+pub const DEEPER_QUEUE_DONE_KIND: &str = "deeper.done";
+/// Log kind appended when a queued paid job is proposed for approval:
+/// `{post_id, at, approval_id, proposed_at}`.
+pub const DEEPER_PROPOSED_KIND: &str = "deeper.proposed";
 pub const DEEPER_DIR_NAME: &str = "deeper";
 pub const DEEPER_MAX_COMPLETION_TOKENS: u32 = 3000;
 pub const DEEPER_REASONING_EFFORT: &str = "low";
@@ -70,6 +77,155 @@ pub fn validate_post_id(id: &str) -> Result<(), String> {
     } else {
         Err("invalid post id (digits only, or demo-<digits>)".to_string())
     }
+}
+
+/// Queue state of one go-deeper job, folded from the decision log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueStatus {
+    /// Queued, not yet proposed or done.
+    Queued,
+    /// A paid approval was proposed for this job (still runs only after
+    /// the human approves and the daemon releases it).
+    Proposed,
+    /// Finished (local fallback ran, or a released paid walkthrough ran).
+    Done,
+}
+
+impl QueueStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Proposed => "proposed",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// One queued go-deeper job: `post_id` to walk through at unix-secs `at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedJob {
+    pub post_id: String,
+    pub at: u64,
+    pub queued_at: u64,
+    pub status: QueueStatus,
+    pub approval_id: Option<String>,
+}
+
+/// Queue a go-deeper walkthrough for later: validates the post id and
+/// appends [`DEEPER_QUEUED_KIND`] (`{post_id, at, queued_at}`, metadata
+/// only). Times in the past (`at < now`) are refused; callers parse
+/// RFC 3339 with [`crate::idea_card::parse_rfc3339`] and refuse
+/// unparseable input before calling here.
+pub fn queue_later(
+    log: &mut DecisionLog,
+    post_id: &str,
+    at: u64,
+    now: u64,
+) -> Result<Entry, String> {
+    validate_post_id(post_id)?;
+    if at < now {
+        return Err("cannot queue a go-deeper job in the past".to_string());
+    }
+    log.append(
+        DEEPER_QUEUED_KIND,
+        serde_json::json!({"post_id": post_id, "at": at, "queued_at": now}),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Queue a job in the decision log at `log_path` (creating parent
+/// directories), for the `deeper --later` CLI command and the web UI.
+pub fn queue_later_at_path(
+    post_id: &str,
+    at: u64,
+    now: u64,
+    log_path: &Path,
+) -> Result<Entry, String> {
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            crate::token_store::ensure_dir_0700(parent)
+                .map_err(|e| format!("log dir failed: {e}"))?;
+        }
+    }
+    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    queue_later(&mut log, post_id, at, now)
+}
+
+fn queued_key(post_id: &str, at: u64) -> (String, u64) {
+    (post_id.to_string(), at)
+}
+
+/// Fold [`DEEPER_QUEUED_KIND`] / [`DEEPER_PROPOSED_KIND`] /
+/// [`DEEPER_QUEUE_DONE_KIND`] entries into jobs keyed by `(post_id, at)`,
+/// sorted by `(at, post_id)`. First valid entry wins per key transition;
+/// malformed entries and proposed/done entries for unknown jobs are
+/// ignored (fail closed: they prove no queue state).
+pub fn list_queue(entries: &[Entry]) -> Vec<QueuedJob> {
+    let mut jobs: std::collections::BTreeMap<(String, u64), QueuedJob> =
+        std::collections::BTreeMap::new();
+    for e in entries {
+        match e.kind.as_str() {
+            DEEPER_QUEUED_KIND => {
+                let (Some(post_id), Some(at), Some(queued_at)) = (
+                    e.payload.get("post_id").and_then(|v| v.as_str()),
+                    e.payload.get("at").and_then(|v| v.as_u64()),
+                    e.payload.get("queued_at").and_then(|v| v.as_u64()),
+                ) else {
+                    continue;
+                };
+                if post_id.is_empty() || validate_post_id(post_id).is_err() {
+                    continue;
+                }
+                jobs.entry(queued_key(post_id, at)).or_insert(QueuedJob {
+                    post_id: post_id.to_string(),
+                    at,
+                    queued_at,
+                    status: QueueStatus::Queued,
+                    approval_id: None,
+                });
+            }
+            DEEPER_PROPOSED_KIND => {
+                let (Some(post_id), Some(at), Some(approval_id)) = (
+                    e.payload.get("post_id").and_then(|v| v.as_str()),
+                    e.payload.get("at").and_then(|v| v.as_u64()),
+                    e.payload.get("approval_id").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                if let Some(job) = jobs.get_mut(&queued_key(post_id, at)) {
+                    if job.status == QueueStatus::Queued && !approval_id.is_empty() {
+                        job.status = QueueStatus::Proposed;
+                        job.approval_id = Some(approval_id.to_string());
+                    }
+                }
+            }
+            DEEPER_QUEUE_DONE_KIND => {
+                let (Some(post_id), Some(at)) = (
+                    e.payload.get("post_id").and_then(|v| v.as_str()),
+                    e.payload.get("at").and_then(|v| v.as_u64()),
+                ) else {
+                    continue;
+                };
+                if let Some(job) = jobs.get_mut(&queued_key(post_id, at)) {
+                    job.status = QueueStatus::Done;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<QueuedJob> = jobs.into_values().collect();
+    out.sort_by(|a, b| (a.at, &a.post_id).cmp(&(b.at, &b.post_id)));
+    out
+}
+
+/// Jobs whose time has come (`at <= now`) and are not done, sorted by
+/// `(at, post_id)`. Proposed jobs are included: they still need their
+/// approval claimed, released and executed.
+pub fn due_jobs(entries: &[Entry], now: u64) -> Vec<QueuedJob> {
+    list_queue(entries)
+        .into_iter()
+        .filter(|j| j.status != QueueStatus::Done && j.at <= now)
+        .collect()
 }
 
 /// Post ids linked from post text: `x.com`/`twitter.com` URLs with a
@@ -1255,18 +1411,16 @@ pub fn run_with(
     })
 }
 
-/// Production run: real thread/post fetches plus up to two real Muse Spark
-/// calls (first try plus one continuation on truncation, paid switch on,
-/// online only), paths from the data directory. `offline` selects fixture
-/// mode with the local fallback.
-pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String> {
-    let allow_paid = std::env::var("ANCIENTOS_ALLOW_PAID")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let client = ancientos_router::muse::MuseClient::from_env()
-        .with_max_completion_tokens(DEEPER_MAX_COMPLETION_TOKENS)
-        .with_reasoning_effort(DEEPER_REASONING_EFFORT);
-    let call = |prompt: &str, prior: Option<&str>| {
+/// Build the production Muse caller for [`run_with`] from a configured
+/// client: one user prompt first, then a single continuation (user prompt
+/// plus assistant prior plus [`DEEPER_CONTINUE_PROMPT`]) when the first
+/// reply truncates with `finish_reason` "length".
+#[allow(clippy::type_complexity)]
+pub fn production_muse_caller(
+    client: &ancientos_router::muse::MuseClient,
+) -> impl Fn(&str, Option<&str>) -> Result<(String, String, Option<MuseUsage>, Option<String>), String>
+       + '_ {
+    move |prompt: &str, prior: Option<&str>| {
         let resp = match prior {
             None => client.chat(prompt),
             Some(prior_content) => {
@@ -1285,7 +1439,21 @@ pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String>
             resp.model
         };
         Ok((resp.content, model, resp.usage, resp.finish_reason))
-    };
+    }
+}
+
+/// Production run: real thread/post fetches plus up to two real Muse Spark
+/// calls (first try plus one continuation on truncation, paid switch on,
+/// online only), paths from the data directory. `offline` selects fixture
+/// mode with the local fallback.
+pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String> {
+    let allow_paid = std::env::var("ANCIENTOS_ALLOW_PAID")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let client = ancientos_router::muse::MuseClient::from_env()
+        .with_max_completion_tokens(DEEPER_MAX_COMPLETION_TOKENS)
+        .with_reasoning_effort(DEEPER_REASONING_EFFORT);
+    let call = production_muse_caller(&client);
     run_with(
         post_id,
         allow_paid,
@@ -1295,6 +1463,38 @@ pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String>
         &call,
         &crate::brief::decision_log_path()?,
         &deeper_dir()?,
+    )
+}
+
+/// Online paid run with explicit paths for the daemon: fails closed unless
+/// `ANCIENTOS_ALLOW_PAID=1`, fetches the thread read-only over the network
+/// and makes up to two Muse Spark calls (first try plus one continuation).
+/// The daemon calls this only after claiming and releasing a human approval
+/// for the job's exact payload.
+pub fn run_paid_with_paths(
+    post_id: &str,
+    log_path: &Path,
+    out_dir: &Path,
+) -> Result<DeeperResult, String> {
+    let allow_paid = std::env::var("ANCIENTOS_ALLOW_PAID")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !allow_paid {
+        return Err("paid calls are disabled (set ANCIENTOS_ALLOW_PAID=1 to enable)".to_string());
+    }
+    let client = ancientos_router::muse::MuseClient::from_env()
+        .with_max_completion_tokens(DEEPER_MAX_COMPLETION_TOKENS)
+        .with_reasoning_effort(DEEPER_REASONING_EFFORT);
+    let call = production_muse_caller(&client);
+    run_with(
+        post_id,
+        true,
+        None,
+        &crate::x_api::fetch_thread,
+        &crate::x_api::fetch_post,
+        &call,
+        log_path,
+        out_dir,
     )
 }
 
@@ -2506,5 +2706,120 @@ mod tests {
             "fallback leaked mapping word:\n{}",
             res.output
         );
+    }
+
+    fn queue_log(dir: &tempfile::TempDir) -> (DecisionLog, PathBuf) {
+        let path = dir.path().join("q.jsonl");
+        (DecisionLog::open(&path).unwrap(), path)
+    }
+
+    fn queue_entries(path: &Path) -> Vec<Entry> {
+        DecisionLog::open(path).unwrap().verify_or_empty().unwrap()
+    }
+
+    #[test]
+    fn queue_later_appends_and_folds_to_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, path) = queue_log(&dir);
+        let e = queue_later(&mut log, "100", 2_000, 1_000).unwrap();
+        assert_eq!(e.kind, DEEPER_QUEUED_KIND);
+        assert_eq!(
+            e.payload,
+            serde_json::json!({"post_id": "100", "at": 2_000, "queued_at": 1_000})
+        );
+        queue_later(&mut log, "demo-7", 1_500, 1_000).unwrap();
+        let entries = queue_entries(&path);
+        // Sorted by (at, post_id), none due before their time.
+        let jobs = list_queue(&entries);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].post_id, "demo-7");
+        assert_eq!(jobs[0].status, QueueStatus::Queued);
+        assert!(due_jobs(&entries, 1_499).is_empty());
+        let due = due_jobs(&entries, 1_500);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].post_id, "demo-7");
+        // Boundary inclusive: at == now is due.
+        assert_eq!(due_jobs(&entries, 2_000).len(), 2);
+    }
+
+    #[test]
+    fn queue_later_refuses_past_bad_id_and_keeps_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, path) = queue_log(&dir);
+        assert_eq!(
+            queue_later(&mut log, "100", 999, 1_000).unwrap_err(),
+            "cannot queue a go-deeper job in the past"
+        );
+        assert!(queue_later(&mut log, "../x", 2_000, 1_000).is_err());
+        assert!(queue_later(&mut log, "", 2_000, 1_000).is_err());
+        assert!(queue_entries(&path).is_empty(), "refusals append nothing");
+        // Same post+time twice: first queued_at wins, still one job.
+        queue_later(&mut log, "100", 2_000, 1_000).unwrap();
+        queue_later(&mut log, "100", 2_000, 1_100).unwrap();
+        let jobs = list_queue(&queue_entries(&path));
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].queued_at, 1_000);
+    }
+
+    #[test]
+    fn queue_fold_tracks_proposed_then_done_and_ignores_strays() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, path) = queue_log(&dir);
+        queue_later(&mut log, "100", 2_000, 1_000).unwrap();
+        // Proposed/done for unknown jobs are ignored.
+        log.append(
+            DEEPER_PROPOSED_KIND,
+            serde_json::json!({"post_id": "999", "at": 2_000, "approval_id": "x"}),
+        )
+        .unwrap();
+        log.append(
+            DEEPER_QUEUE_DONE_KIND,
+            serde_json::json!({"post_id": "999", "at": 2_000}),
+        )
+        .unwrap();
+        // Malformed queue entries are ignored.
+        log.append(DEEPER_QUEUED_KIND, serde_json::json!({"post_id": "100"}))
+            .unwrap();
+        log.append(
+            DEEPER_QUEUED_KIND,
+            serde_json::json!({"post_id": "nope!", "at": 3_000, "queued_at": 1_000}),
+        )
+        .unwrap();
+        let mut jobs = list_queue(&queue_entries(&path));
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, QueueStatus::Queued);
+        log.append(
+            DEEPER_PROPOSED_KIND,
+            serde_json::json!({"post_id": "100", "at": 2_000, "approval_id": "abc"}),
+        )
+        .unwrap();
+        jobs = list_queue(&queue_entries(&path));
+        assert_eq!(jobs[0].status, QueueStatus::Proposed);
+        assert_eq!(jobs[0].approval_id.as_deref(), Some("abc"));
+        // Proposed jobs are still due (they need claim+release+execute).
+        assert_eq!(due_jobs(&queue_entries(&path), 2_000).len(), 1);
+        log.append(
+            DEEPER_QUEUE_DONE_KIND,
+            serde_json::json!({"post_id": "100", "at": 2_000, "mode": "local"}),
+        )
+        .unwrap();
+        jobs = list_queue(&queue_entries(&path));
+        assert_eq!(jobs[0].status, QueueStatus::Done);
+        assert!(due_jobs(&queue_entries(&path), 9_999).is_empty());
+    }
+
+    #[test]
+    fn paid_with_paths_needs_the_switch_and_touches_no_network() {
+        let _env = crate::test_support::EnvHold::paid_off();
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_paid_with_paths(
+            "100",
+            &dir.path().join("d.jsonl"),
+            &dir.path().join("deeper"),
+        )
+        .unwrap_err();
+        assert!(err.contains("ANCIENTOS_ALLOW_PAID=1"), "{err}");
+        assert!(!dir.path().join("d.jsonl").exists());
+        assert!(!dir.path().join("deeper").exists());
     }
 }

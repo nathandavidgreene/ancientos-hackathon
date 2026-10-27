@@ -3,10 +3,12 @@
 //! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
 //! | `unhide-author <username>` | `hidden-authors`
 //! | `delegate <post_id>` | `deeper <post_id> [--offline <fixture.jsonl>]`
+//! | `deeper --later <post_id> --at <rfc3339>` | `deeper-queue`
 //! | `ideas` | `triage <id> <adopt|park|drop>`
 //! | `tried <post_id> <yes|no|later> [note]` | `try-pending`
 //! | `digest [--now SECS] [--dry-run]`
-//! | `approvals` | `approve <id>` | `deny <id> [reason]`.
+//! | `approvals` | `approve <id>` | `deny <id> [reason]`
+//! | `run [--once] [--now <rfc3339>] [--offline <fixture>]`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
@@ -18,6 +20,8 @@
 //! Spark into inspiration.md (paid, off by default); `deeper` writes a
 //! step-by-step walkthrough of one thread plus its quoted/linked posts to
 //! deeper/<post_id>.md (one paid call at most, offline fixture supported).
+//! `deeper --later` queues the walkthrough for a later time instead of
+//! running it; `deeper-queue` lists queued/proposed/done jobs.
 //! `ideas` lists idea cards due for triage; `triage` records an
 //! adopt/park/drop decision.
 //! `tried` records a try-it follow-up; `try-pending` lists tagged posts
@@ -25,15 +29,17 @@
 //! triage digest plus "did you try it?" nudges, recording the showing
 //! unless `--dry-run` or `--now` is given. `approvals` lists pending human
 //! approvals; `approve`/`deny` record the decision (the CLI user is the
-//! human) and print the outcome — nothing executes from the CLI.
+//! human) and print the outcome — nothing executes from the CLI. `run`
+//! ticks the scheduled agents (`--once` runs every due agent once, exit
+//! non-zero on any agent error; otherwise loops until Ctrl-C).
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    author_filter, brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, merge,
-    oauth, token_store, try_it, vote, x_api,
+    author_filter, brief, callback, daemon, deeper, delegate, digest, fixture, idea_card, ingest,
+    merge, oauth, token_store, try_it, vote, x_api,
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> | deny <id> [reason]";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> | deny <id> [reason] | run [--once] [--now <rfc3339>] [--offline <fixture>]";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -284,22 +290,51 @@ fn cmd_hidden_authors(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_deeper_args(args: &[String]) -> Result<(String, Option<String>), String> {
-    if args.is_empty() || args[0].is_empty() {
-        return Err(USAGE.to_string());
-    }
-    let post_id = args[0].clone();
+/// Parsed `deeper` args: immediate run (`post_id` plus optional
+/// `--offline` fixture) or a queued job (`--later` plus `--at`).
+#[derive(Debug)]
+struct DeeperArgs {
+    post_id: String,
+    offline: Option<String>,
+    later_at: Option<u64>,
+}
+
+/// `deeper <post_id> [--offline PATH]` runs now;
+/// `deeper --later <post_id> --at <rfc3339>` (or
+/// `deeper <post_id> --later --at <rfc3339>`) queues instead. `--at`
+/// without `--later`, `--later` without `--at`, `--later` with `--offline`,
+/// duplicates and unknown args are errors; unparseable `--at` values are
+/// refused (fail closed).
+fn parse_deeper_args(args: &[String]) -> Result<DeeperArgs, String> {
+    let mut post_id: Option<String> = None;
     let mut offline: Option<String> = None;
-    let mut i = 1;
+    let mut offline_seen = false;
+    let mut later = false;
+    let mut later_seen = false;
+    let mut at: Option<u64> = None;
+    let mut at_seen = false;
+    let mut set_post_id = |v: &str| -> Result<(), String> {
+        if v.is_empty() || post_id.is_some() {
+            return Err(USAGE.to_string());
+        }
+        post_id = Some(v.to_string());
+        Ok(())
+    };
+    let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         if let Some(v) = arg.strip_prefix("--offline=") {
-            if v.is_empty() {
+            if offline_seen || v.is_empty() {
                 return Err(USAGE.to_string());
             }
+            offline_seen = true;
             offline = Some(v.to_string());
             i += 1;
         } else if arg == "--offline" {
+            if offline_seen {
+                return Err(USAGE.to_string());
+            }
+            offline_seen = true;
             i += 1;
             let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
             if v.is_empty() {
@@ -307,16 +342,92 @@ fn parse_deeper_args(args: &[String]) -> Result<(String, Option<String>), String
             }
             offline = Some(v.clone());
             i += 1;
-        } else {
+        } else if let Some(v) = arg.strip_prefix("--later=") {
+            if later_seen {
+                return Err(USAGE.to_string());
+            }
+            later_seen = true;
+            later = true;
+            set_post_id(v)?;
+            i += 1;
+        } else if arg == "--later" {
+            if later_seen {
+                return Err(USAGE.to_string());
+            }
+            later_seen = true;
+            later = true;
+            // `--later <post_id>`: consume the id when the next token is a
+            // bare value; otherwise `--later` is a bare flag.
+            if let Some(next) = args.get(i + 1) {
+                if !next.starts_with("--") {
+                    set_post_id(next)?;
+                    i += 1;
+                }
+            }
+            i += 1;
+        } else if let Some(v) = arg.strip_prefix("--at=") {
+            if at_seen {
+                return Err(USAGE.to_string());
+            }
+            at_seen = true;
+            at = Some(
+                idea_card::parse_rfc3339(v)
+                    .ok_or_else(|| "invalid --at value (want RFC 3339)".to_string())?,
+            );
+            i += 1;
+        } else if arg == "--at" {
+            if at_seen {
+                return Err(USAGE.to_string());
+            }
+            at_seen = true;
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            at = Some(
+                idea_card::parse_rfc3339(v)
+                    .ok_or_else(|| "invalid --at value (want RFC 3339)".to_string())?,
+            );
+            i += 1;
+        } else if arg.starts_with("--") {
             return Err(USAGE.to_string());
+        } else {
+            set_post_id(arg)?;
+            i += 1;
         }
     }
-    Ok((post_id, offline))
+    let post_id = post_id.ok_or_else(|| USAGE.to_string())?;
+    if later {
+        if offline.is_some() {
+            return Err("--later cannot be combined with --offline".to_string());
+        }
+        match at {
+            Some(t) => Ok(DeeperArgs {
+                post_id,
+                offline: None,
+                later_at: Some(t),
+            }),
+            None => Err("--later needs --at <rfc3339>".to_string()),
+        }
+    } else {
+        if at.is_some() {
+            return Err(USAGE.to_string());
+        }
+        Ok(DeeperArgs {
+            post_id,
+            offline,
+            later_at: None,
+        })
+    }
 }
 
 fn cmd_deeper(args: &[String]) -> Result<(), String> {
-    let (post_id, offline) = parse_deeper_args(args)?;
-    let res = deeper::run(&post_id, offline.as_deref())?;
+    let parsed = parse_deeper_args(args)?;
+    if let Some(at) = parsed.later_at {
+        let log_path = brief::decision_log_path()?;
+        deeper::queue_later_at_path(&parsed.post_id, at, idea_card::now_secs(), &log_path)?;
+        println!("queued {} at {at}", parsed.post_id);
+        return Ok(());
+    }
+    let res = deeper::run(&parsed.post_id, parsed.offline.as_deref())?;
     print!("{}", res.output);
     if !res.output.ends_with('\n') {
         println!();
@@ -324,6 +435,29 @@ fn cmd_deeper(args: &[String]) -> Result<(), String> {
     println!("\nSaved: {}", res.path.display());
     if res.mode == "paid" {
         println!("Tokens: {}", res.usage.unwrap_or_default());
+    }
+    Ok(())
+}
+
+fn cmd_deeper_queue(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
+    let jobs = deeper::list_queue(&entries);
+    if jobs.is_empty() {
+        println!("no queued go-deeper jobs");
+        return Ok(());
+    }
+    for job in &jobs {
+        println!(
+            "{} at={} status={}",
+            job.post_id,
+            job.at,
+            job.status.as_str()
+        );
     }
     Ok(())
 }
@@ -625,6 +759,127 @@ fn cmd_deny(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Parsed `run` args: `--once` plus a fixed RFC 3339 clock and an
+/// offline fixture for the brief and local go-deeper runs.
+#[derive(Debug)]
+struct RunArgs {
+    once: bool,
+    now: Option<u64>,
+    offline: Option<String>,
+}
+
+/// `run [--once] [--now <rfc3339>] [--offline <fixture>]`, in any order
+/// (`--now=`/`--offline=` forms too). Duplicates and unknown args are
+/// usage errors; an unparseable `--now` is refused (fail closed).
+fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
+    let mut once = false;
+    let mut once_seen = false;
+    let mut now: Option<u64> = None;
+    let mut now_seen = false;
+    let mut offline: Option<String> = None;
+    let mut offline_seen = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--once" {
+            if once_seen {
+                return Err(USAGE.to_string());
+            }
+            once_seen = true;
+            once = true;
+            i += 1;
+        } else if let Some(v) = arg.strip_prefix("--now=") {
+            if now_seen {
+                return Err(USAGE.to_string());
+            }
+            now_seen = true;
+            now = Some(
+                idea_card::parse_rfc3339(v)
+                    .ok_or_else(|| "invalid --now value (want RFC 3339)".to_string())?,
+            );
+            i += 1;
+        } else if arg == "--now" {
+            if now_seen {
+                return Err(USAGE.to_string());
+            }
+            now_seen = true;
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            now = Some(
+                idea_card::parse_rfc3339(v)
+                    .ok_or_else(|| "invalid --now value (want RFC 3339)".to_string())?,
+            );
+            i += 1;
+        } else if let Some(v) = arg.strip_prefix("--offline=") {
+            if offline_seen || v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            offline_seen = true;
+            offline = Some(v.to_string());
+            i += 1;
+        } else if arg == "--offline" {
+            if offline_seen {
+                return Err(USAGE.to_string());
+            }
+            offline_seen = true;
+            i += 1;
+            let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
+            if v.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            offline = Some(v.clone());
+            i += 1;
+        } else {
+            return Err(USAGE.to_string());
+        }
+    }
+    Ok(RunArgs { once, now, offline })
+}
+
+fn cmd_run(args: &[String]) -> Result<(), String> {
+    let parsed = parse_run_args(args)?;
+    if let Some(fixture) = &parsed.offline {
+        if !std::path::Path::new(fixture).exists() {
+            return Err(format!("offline fixture not found: {fixture}"));
+        }
+    }
+    let ctx = daemon::AgentCtx {
+        log_path: brief::decision_log_path()?,
+        cards_path: idea_card::idea_cards_path()?,
+        deeper_dir: deeper::deeper_dir()?,
+        live_store: ingest::store_path()?,
+        fixture: parsed.offline.map(PathBuf::from),
+        now_override: parsed.now,
+    };
+    let config = daemon::DaemonConfig::from_paths(ctx)?;
+    if parsed.once {
+        let report = daemon::run_once(&config);
+        if report.ok() {
+            return Ok(());
+        }
+        let failed: Vec<&str> = report
+            .outcomes
+            .iter()
+            .filter(|o| o.result.is_err() || o.tick_logged.is_err())
+            .map(|o| o.agent.as_str())
+            .collect();
+        return Err(format!(
+            "{} agent(s) failed: {}",
+            failed.len(),
+            failed.join(", ")
+        ));
+    }
+    println!("daemon running; press Ctrl-C to stop");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let reports = daemon::run_loop(&config, &stop);
+    // The loop only returns on the stop flag or DAEMON_MAX_TICKS (tests).
+    if reports.iter().all(|r| r.ok()) {
+        Ok(())
+    } else {
+        Err("daemon tick(s) failed (see daemon.tick entries)".to_string())
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -638,6 +893,7 @@ fn main() {
         Some("hidden-authors") => cmd_hidden_authors(&args[1..]),
         Some("delegate") => cmd_delegate(&args[1..]),
         Some("deeper") => cmd_deeper(&args[1..]),
+        Some("deeper-queue") => cmd_deeper_queue(&args[1..]),
         Some("ideas") => cmd_ideas(&args[1..]),
         Some("triage") => cmd_triage(&args[1..]),
         Some("tried") => cmd_tried(&args[1..]),
@@ -646,6 +902,7 @@ fn main() {
         Some("approvals") => cmd_approvals(&args[1..]),
         Some("approve") => cmd_approve(&args[1..]),
         Some("deny") => cmd_deny(&args[1..]),
+        Some("run") => cmd_run(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {
@@ -814,6 +1071,126 @@ mod tests {
         assert_eq!(one_line_summary("first\nsecond"), "first");
         assert_eq!(one_line_summary("  spaced   out  "), "spaced out");
         assert_eq!(one_line_summary(""), "");
+    }
+
+    #[test]
+    fn deeper_later_forms_parse_and_validate() {
+        let at = idea_card::parse_rfc3339("2030-01-01T00:00:00Z").unwrap();
+        for args in [
+            vec!["--later", "100", "--at", "2030-01-01T00:00:00Z"],
+            vec!["100", "--later", "--at", "2030-01-01T00:00:00Z"],
+            vec!["--later=100", "--at=2030-01-01T00:00:00Z"],
+            vec!["--at", "2030-01-01T00:00:00Z", "--later", "100"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let parsed = parse_deeper_args(&owned).unwrap();
+            assert_eq!(parsed.post_id, "100");
+            assert_eq!(parsed.later_at, Some(at));
+            assert!(parsed.offline.is_none());
+        }
+        // Immediate forms still parse (demo path unchanged).
+        let owned: Vec<String> = ["demo-3001", "--offline", "f.jsonl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_deeper_args(&owned).unwrap();
+        assert_eq!(parsed.post_id, "demo-3001");
+        assert_eq!(parsed.offline.as_deref(), Some("f.jsonl"));
+        assert!(parsed.later_at.is_none());
+        // Bad combinations are refused.
+        for bad in [
+            vec!["--later", "100"],
+            vec!["100", "--at", "2030-01-01T00:00:00Z"],
+            vec![
+                "--later",
+                "100",
+                "--at",
+                "2030-01-01T00:00:00Z",
+                "--offline",
+                "f",
+            ],
+            vec!["--later", "--later", "100", "--at", "2030-01-01T00:00:00Z"],
+            vec!["100", "101", "--later", "--at", "2030-01-01T00:00:00Z"],
+            vec!["--later", "--at", "2030-01-01T00:00:00Z"],
+            vec![
+                "--at",
+                "2030-01-01T00:00:00Z",
+                "--at",
+                "2030-01-02T00:00:00Z",
+                "100",
+            ],
+        ] {
+            let owned: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert!(parse_deeper_args(&owned).is_err(), "{bad:?}");
+        }
+        for bad in [
+            vec!["--later", "100", "--at", "someday"],
+            vec!["--later", "100", "--at="],
+        ] {
+            let owned: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                parse_deeper_args(&owned).unwrap_err(),
+                "invalid --at value (want RFC 3339)",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_args_parse_space_equals_and_any_order() {
+        let at = idea_card::parse_rfc3339("2026-10-27T00:00:00Z").unwrap();
+        let none: Vec<String> = vec![];
+        let parsed = parse_run_args(&none).unwrap();
+        assert!(!parsed.once);
+        assert_eq!(parsed.now, None);
+        assert_eq!(parsed.offline, None);
+        for args in [
+            vec![
+                "--once",
+                "--now",
+                "2026-10-27T00:00:00Z",
+                "--offline",
+                "f.jsonl",
+            ],
+            vec!["--offline=f.jsonl", "--now=2026-10-27T00:00:00Z", "--once"],
+            vec!["--now", "2026-10-27T00:00:00Z"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let parsed = parse_run_args(&owned).unwrap();
+            assert_eq!(parsed.now, Some(at), "{args:?}");
+        }
+        let owned: Vec<String> = ["--once", "--offline", "f.jsonl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_run_args(&owned).unwrap();
+        assert!(parsed.once);
+        assert_eq!(parsed.offline.as_deref(), Some("f.jsonl"));
+        for bad in [
+            vec!["--once", "--once"],
+            vec![
+                "--now",
+                "2026-10-27T00:00:00Z",
+                "--now=2026-10-28T00:00:00Z",
+            ],
+            vec!["--offline", "a", "--offline", "b"],
+            vec!["--offline="],
+            vec!["--now"],
+            vec!["extra"],
+            vec!["--dry-run"],
+        ] {
+            let owned: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert_eq!(parse_run_args(&owned).unwrap_err(), USAGE, "{bad:?}");
+        }
+        assert_eq!(
+            parse_run_args(&["--now".to_string(), "yesterday".to_string()]).unwrap_err(),
+            "invalid --now value (want RFC 3339)"
+        );
+    }
+
+    #[test]
+    fn deeper_queue_rejects_args() {
+        assert_eq!(cmd_deeper_queue(&["extra".to_string()]).unwrap_err(), USAGE);
     }
 
     #[test]
