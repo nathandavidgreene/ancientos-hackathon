@@ -551,8 +551,7 @@ fn try_it_html(b: &Bookmark, text: &str) -> String {
 fn rank_reasons_html(state: &State, bm: &Bookmark) -> Option<String> {
     let log = ancientos_core::log::DecisionLog::open(state.log_path()).ok()?;
     let ranker =
-        bookmarks_agent::ranker::Ranker::train_from_log(&log, &state.all_bookmarks, now_secs())
-            .ok()?;
+        bookmarks_agent::ranker::Ranker::train_from_log(&log, &state.all_bookmarks).ok()?;
     if !ranker.is_active() {
         return None;
     }

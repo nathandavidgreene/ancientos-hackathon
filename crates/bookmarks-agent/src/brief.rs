@@ -762,7 +762,6 @@ fn run_impl(
     let ranker = crate::ranker::Ranker::train_from_log(
         &DecisionLog::open(log_path).map_err(|e| e.to_string())?,
         &merged.rows,
-        now_secs,
     )
     .map_err(|e| e.to_string())?;
     let candidates = if ranker.is_active() {

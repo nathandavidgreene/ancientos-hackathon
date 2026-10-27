@@ -9,18 +9,11 @@
 //!
 //! Model: smoothed naive Bayes over category, normalized author, has_media,
 //! has_link, thread-length bucket, and lowercase word unigrams from sanitized
-//! post text (stopwords dropped, the [`VOCAB_CAP`] most frequent kept),
-//! blended with a zoxide-style frecency affinity per author and category:
-//! approve and tried-yes add, skip subtracts, weighted by recency (the idea
-//! only; written here from scratch).
+//! post text (stopwords dropped, the [`VOCAB_CAP`] most frequent kept).
 //!
 //! Fail closed: with fewer than `min_records` labeled records (env var
 //! [`MIN_RECORDS_ENV_VAR`], default [`MIN_RECORDS_DEFAULT`]) the ranker is
 //! inactive and callers keep today's ordering unchanged.
-//!
-//! Decision-log verdicts carry no timestamps, so log-trained events use a
-//! neutral recency weight; [`LabeledEvent::at`] carries explicit vote times
-//! for time-aware training (the eval harness uses synthetic vote times).
 use crate::fixture::Bookmark;
 use ancientos_core::feedback::{self, FeedbackRecord, Verdict};
 use ancientos_core::log::DecisionLog;
@@ -36,8 +29,6 @@ pub const MIN_RECORDS_ENV_VAR: &str = "ANCIENTOS_RANKER_MIN_RECORDS";
 pub const MIN_RECORDS_DEFAULT: usize = 10;
 /// Cap on word-unigram vocabulary (most frequent win, ties alphabetical).
 pub const VOCAB_CAP: usize = 500;
-/// Weight blending frecency affinity into the naive Bayes log-odds score.
-pub const FRECENCY_BLEND: f64 = 0.25;
 
 /// One labeled training signal: a verdict (or tried-yes) on one post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,17 +47,6 @@ impl Signal {
     pub fn positive(self) -> bool {
         matches!(self, Self::Approve | Self::Delegate | Self::TriedYes)
     }
-
-    /// Signed frecency step: approve and tried-yes boost, skip decays,
-    /// everything else is neutral (delegate still counts as positive for
-    /// naive Bayes; never verdicts hide posts elsewhere).
-    pub fn frecency_delta(self) -> f64 {
-        match self {
-            Self::Approve | Self::TriedYes => 1.0,
-            Self::Skip => -1.0,
-            Self::Delegate | Self::NeverPost | Self::NeverCategory | Self::NeverAuthor => 0.0,
-        }
-    }
 }
 
 /// One labeled post for training.
@@ -74,9 +54,6 @@ impl Signal {
 pub struct LabeledEvent {
     pub bookmark: Bookmark,
     pub signal: Signal,
-    /// Vote time in unix secs when known. `None` (every decision-log
-    /// verdict, which carries no timestamp) trains with neutral recency.
-    pub at: Option<u64>,
 }
 
 /// Score for one post: higher means more likely worth surfacing.
@@ -86,18 +63,6 @@ pub struct RankScore {
     /// The 3 strongest contributing features in plain words. Empty when
     /// the ranker is inactive.
     pub top_reasons: Vec<String>,
-}
-
-/// Recency multiplier for one frecency step: x4 under an hour, x2 under a
-/// day, x0.5 under a week, x0.25 older. Unknown age is neutral (x1).
-pub fn recency_weight(age_secs: Option<u64>) -> f64 {
-    match age_secs {
-        None => 1.0,
-        Some(a) if a < 3600 => 4.0,
-        Some(a) if a < 86_400 => 2.0,
-        Some(a) if a < 7 * 86_400 => 0.5,
-        Some(_) => 0.25,
-    }
 }
 
 /// Common English words dropped from unigrams (lowercase, ASCII).
@@ -276,7 +241,7 @@ fn word_reason(word: &str, contrib: f64) -> String {
     }
 }
 
-/// Personal ranker: smoothed naive Bayes blended with frecency affinity.
+/// Personal ranker: smoothed naive Bayes.
 /// Train with [`Ranker::train`] or [`Ranker::train_from_log`]; inactive
 /// rankers score 0.0 with no reasons so callers keep today's order.
 pub struct Ranker {
@@ -295,15 +260,13 @@ pub struct Ranker {
     total_pos_words: u32,
     total_neg_words: u32,
     vocab: BTreeSet<String>,
-    author_aff: BTreeMap<String, f64>,
-    cat_aff: BTreeMap<String, f64>,
 }
 
 impl Ranker {
-    /// Train on explicit events. Deterministic: same events and clock give
-    /// the same scores. Active only with at least `min_records` events (and
-    /// at least one event no matter what).
-    pub fn train(events: &[LabeledEvent], now_secs: u64, min_records: usize) -> Self {
+    /// Train on explicit events. Deterministic: same events give the same
+    /// scores. Active only with at least `min_records` events (and at least
+    /// one event no matter what).
+    pub fn train(events: &[LabeledEvent], min_records: usize) -> Self {
         let n_labeled = events.len();
         let mut r = Self {
             active: n_labeled >= min_records && n_labeled > 0,
@@ -321,8 +284,6 @@ impl Ranker {
             total_pos_words: 0,
             total_neg_words: 0,
             vocab: BTreeSet::new(),
-            author_aff: BTreeMap::new(),
-            cat_aff: BTreeMap::new(),
         };
         for e in events {
             let f = features_of(&e.bookmark);
@@ -366,13 +327,6 @@ impl Ranker {
                 };
                 *m.entry(w.clone()).or_insert(0) += 1;
             }
-            let delta = e.signal.frecency_delta();
-            if delta != 0.0 {
-                let age = e.at.map(|t| now_secs.saturating_sub(t));
-                let w = delta * recency_weight(age);
-                *r.author_aff.entry(f.author.clone()).or_insert(0.0) += w;
-                *r.cat_aff.entry(f.category.clone()).or_insert(0.0) += w;
-            }
         }
         // Vocabulary: most frequent overall, ties alphabetical.
         let mut totals: BTreeMap<&str, u32> = BTreeMap::new();
@@ -397,13 +351,9 @@ impl Ranker {
     /// against `bookmarks`. Records that resolve to no post (unknown ids,
     /// author-hide verdicts whose id is a username) contribute nothing; the
     /// minimum comes from the environment (see [`min_records_from_env`]).
-    pub fn train_from_log(
-        log: &DecisionLog,
-        bookmarks: &[Bookmark],
-        now_secs: u64,
-    ) -> Result<Self, String> {
+    pub fn train_from_log(log: &DecisionLog, bookmarks: &[Bookmark]) -> Result<Self, String> {
         let events = events_from_log(log, bookmarks)?;
-        Ok(Self::train(&events, now_secs, min_records_from_env()))
+        Ok(Self::train(&events, min_records_from_env()))
     }
 
     /// True when trained on enough labeled records to re-rank.
@@ -487,32 +437,6 @@ impl Ranker {
         if let Some((c, w)) = best_word {
             parts.push((c, word_reason(w, c)));
         }
-        let fa = self.author_aff.get(&f.author).copied().unwrap_or(0.0);
-        if fa != 0.0 {
-            let c = FRECENCY_BLEND * fa;
-            total += c;
-            parts.push((
-                c,
-                if fa > 0.0 {
-                    "you recently approved more by this author".to_string()
-                } else {
-                    "you recently skipped more by this author".to_string()
-                },
-            ));
-        }
-        let fc = self.cat_aff.get(&f.category).copied().unwrap_or(0.0);
-        if fc != 0.0 {
-            let c = FRECENCY_BLEND * fc;
-            total += c;
-            parts.push((
-                c,
-                if fc > 0.0 {
-                    format!("you recently approved more in {}", f.category)
-                } else {
-                    format!("you recently skipped more in {}", f.category)
-                },
-            ));
-        }
         parts.sort_by(|a, b| b.0.total_cmp(&a.0));
         RankScore {
             score: total,
@@ -561,7 +485,6 @@ pub fn events_from_log(
                 out.push(LabeledEvent {
                     bookmark: (*b).clone(),
                     signal: s,
-                    at: None,
                 });
             }
         } else if e.kind == crate::try_it::FOLLOWUP_KIND {
@@ -580,7 +503,6 @@ pub fn events_from_log(
                     out.push(LabeledEvent {
                         bookmark: (*b).clone(),
                         signal: Signal::TriedYes,
-                        at: None,
                     });
                 }
             }
@@ -618,15 +540,6 @@ mod tests {
         LabeledEvent {
             bookmark: b,
             signal,
-            at: None,
-        }
-    }
-
-    fn ev_at(b: Bookmark, signal: Signal, at: u64) -> LabeledEvent {
-        LabeledEvent {
-            bookmark: b,
-            signal,
-            at: Some(at),
         }
     }
 
@@ -672,8 +585,8 @@ mod tests {
     #[test]
     fn scores_are_deterministic() {
         let events = training_set();
-        let a = Ranker::train(&events, 0, 10);
-        let b = Ranker::train(&events, 0, 10);
+        let a = Ranker::train(&events, 10);
+        let b = Ranker::train(&events, 10);
         assert!(a.is_active());
         let probe = bm(
             "probe",
@@ -691,7 +604,7 @@ mod tests {
     #[test]
     fn inactive_under_min_records_scores_zero_without_reasons() {
         let events = training_set();
-        let r = Ranker::train(&events[..9], 0, 10);
+        let r = Ranker::train(&events[..9], 10);
         assert!(!r.is_active());
         assert_eq!(r.n_labeled(), 9);
         let probe = bm(
@@ -708,13 +621,13 @@ mod tests {
             }
         );
         // At the boundary the ranker activates.
-        let r = Ranker::train(&events[..10], 0, 10);
+        let r = Ranker::train(&events[..10], 10);
         assert!(r.is_active());
     }
 
     #[test]
     fn min_records_needs_at_least_one_event() {
-        let r = Ranker::train(&[], 0, 0);
+        let r = Ranker::train(&[], 0);
         assert!(!r.is_active(), "no data means inactive even with min 0");
     }
 
@@ -733,7 +646,7 @@ mod tests {
             "synthetic quarterly earnings post",
         );
         // Trained to like Rust: Rust outranks Markets.
-        let r = Ranker::train(&training_set(), 0, 10);
+        let r = Ranker::train(&training_set(), 10);
         assert!(r.score(&rust).score > r.score(&mkt).score);
         // Trained the other way round: Markets outranks Rust.
         let mut flipped = Vec::new();
@@ -746,16 +659,15 @@ mod tests {
             flipped.push(LabeledEvent {
                 bookmark: e.bookmark,
                 signal,
-                at: e.at,
             });
         }
-        let r2 = Ranker::train(&flipped, 0, 10);
+        let r2 = Ranker::train(&flipped, 10);
         assert!(r2.score(&mkt).score > r2.score(&rust).score);
     }
 
     #[test]
     fn reasons_are_human_readable_plain_words() {
-        let r = Ranker::train(&training_set(), 0, 10);
+        let r = Ranker::train(&training_set(), 10);
         let probe = bm(
             "probe",
             Some("Rust & Systems"),
@@ -782,74 +694,6 @@ mod tests {
             );
             assert!(s.contains(' '), "plain words: {s}");
         }
-    }
-
-    #[test]
-    fn recency_weight_buckets() {
-        assert_eq!(recency_weight(None), 1.0);
-        assert_eq!(recency_weight(Some(0)), 4.0);
-        assert_eq!(recency_weight(Some(3599)), 4.0);
-        assert_eq!(recency_weight(Some(3600)), 2.0);
-        assert_eq!(recency_weight(Some(86_399)), 2.0);
-        assert_eq!(recency_weight(Some(86_400)), 0.5);
-        assert_eq!(recency_weight(Some(7 * 86_400 - 1)), 0.5);
-        assert_eq!(recency_weight(Some(7 * 86_400)), 0.25);
-        assert_eq!(recency_weight(Some(u64::MAX)), 0.25);
-    }
-
-    #[test]
-    fn recent_approve_outranks_old_approve_via_frecency() {
-        let mk = |id: &str, author: &str| {
-            bm(
-                id,
-                Some("Same Topic"),
-                Some(author),
-                "synthetic identical neutral wording here",
-            )
-        };
-        // Same topic and text shape; only the vote age differs.
-        let mut events = Vec::new();
-        for i in 0..5 {
-            events.push(ev_at(
-                mk(&format!("old-{i}"), "syn_old"),
-                Signal::Approve,
-                1000,
-            ));
-            events.push(ev_at(
-                mk(&format!("new-{i}"), "syn_new"),
-                Signal::Approve,
-                200_000,
-            ));
-        }
-        let r = Ranker::train(&events, 200_100, 10);
-        assert!(r.is_active());
-        let old_post = mk("probe-old", "syn_old");
-        let new_post = mk("probe-new", "syn_new");
-        assert!(
-            r.score(&new_post).score > r.score(&old_post).score,
-            "recent author affinity must win: {} vs {}",
-            r.score(&new_post).score,
-            r.score(&old_post).score
-        );
-    }
-
-    #[test]
-    fn skip_decays_frecency_for_author() {
-        let mk = |id: &str, author: &str| {
-            bm(
-                id,
-                Some("Same Topic"),
-                Some(author),
-                "synthetic identical neutral wording here",
-            )
-        };
-        let mut events = Vec::new();
-        for i in 0..5 {
-            events.push(ev(mk(&format!("good-{i}"), "syn_good"), Signal::Approve));
-            events.push(ev(mk(&format!("bad-{i}"), "syn_bad"), Signal::Skip));
-        }
-        let r = Ranker::train(&events, 0, 10);
-        assert!(r.score(&mk("p-good", "syn_good")).score > r.score(&mk("p-bad", "syn_bad")).score);
     }
 
     #[test]
@@ -963,13 +807,12 @@ mod tests {
                 ("p-tried".to_string(), Signal::TriedYes),
             ]
         );
-        assert!(events.iter().all(|e| e.at.is_none()));
         let pos = events.iter().filter(|e| e.signal.positive()).count();
         assert_eq!(pos, 3);
         // Trains end to end with a low minimum.
         let saved = std::env::var(MIN_RECORDS_ENV_VAR).ok();
         std::env::set_var(MIN_RECORDS_ENV_VAR, "6");
-        let r = Ranker::train_from_log(&log, &bookmarks, 0).unwrap();
+        let r = Ranker::train_from_log(&log, &bookmarks).unwrap();
         assert!(r.is_active());
         match saved {
             Some(v) => std::env::set_var(MIN_RECORDS_ENV_VAR, v),

@@ -265,7 +265,7 @@ fn cmd_rank(args: &[String]) -> Result<(), String> {
     if rows.is_empty() {
         return Err("no bookmarks to rank".to_string());
     }
-    let trained = ranker::Ranker::train_from_log(&log, &merged.rows, idea_card::now_secs())?;
+    let trained = ranker::Ranker::train_from_log(&log, &merged.rows)?;
     let candidates = if trained.is_active() {
         let scores = trained.score_all(merged.rows.iter());
         brief::select_candidates_ranked(&rows, &merged.live_ids, &scores)

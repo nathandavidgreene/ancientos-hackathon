@@ -334,9 +334,8 @@ fn precision_at_5(
 /// Compare local-picks P@5 with and without the ranker. Verdicts resolving
 /// to a bookmark split by `voted_at` (ties break by post id): the earlier
 /// two thirds train the ranker (minimum `min_records` labels to activate),
-/// the later third is the scored pool. `now` is the latest vote time, so
-/// the run is deterministic with no wall clock. Offline: no network, no
-/// paid calls.
+/// the later third is the scored pool. Deterministic with no wall clock.
+/// Offline: no network, no paid calls.
 pub fn compare_ranking(
     bookmarks: &[Bookmark],
     labels: &[Label],
@@ -370,16 +369,14 @@ pub fn compare_ranking(
         (resolved.len() / 3).clamp(1, resolved.len() - 1)
     };
     let split = resolved.len() - test_n;
-    let now = resolved.iter().map(|(_, _, t)| *t).max().unwrap_or(0);
     let events: Vec<bookmarks_agent::ranker::LabeledEvent> = resolved[..split]
         .iter()
-        .map(|(b, s, t)| bookmarks_agent::ranker::LabeledEvent {
+        .map(|(b, s, _)| bookmarks_agent::ranker::LabeledEvent {
             bookmark: (*b).clone(),
             signal: *s,
-            at: Some(*t),
         })
         .collect();
-    let ranker = bookmarks_agent::ranker::Ranker::train(&events, now, min_records);
+    let ranker = bookmarks_agent::ranker::Ranker::train(&events, min_records);
     let test_rows: Vec<Bookmark> = resolved[split..]
         .iter()
         .map(|(b, _, _)| (*b).clone())
