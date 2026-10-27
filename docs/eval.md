@@ -21,8 +21,14 @@ Rules were retuned with Muse Code (log #21) on a tune split (odd lines, n=511) a
 | Retuned (#21) | **held-out 511** | **0.590 / 0.396 / 0.474** | - |
 | Retuned (#21) | all 1,022 | 0.770 / 0.629 / 0.693 | 0.907 |
 | Retuned (#21) | synthetic 24 | 1.000 / 0.900 / 0.947 | - |
+| CV retune (#22) | tune 511 | 0.743 / 0.987 / 0.848 | - |
+| CV retune (#22) | **held-out 511** | **0.524 / 0.473 / 0.497** | - |
+| CV retune (#22) | all 1,022 | 0.647 / 0.712 / 0.678 | 0.887 |
+| CV retune (#22) | synthetic 24 | 1.000 / 0.900 / 0.947 | - |
 
 The held-out row is the honest number; the tune split overfits. Muse Spark tags more posts as Try it (170 of 1,022) than the earlier llama labels did, including software setups and runnable prompts, so the earlier gain did not carry over.
+
+Run #22 used 5-fold cross-validation inside the tune half, broader cues, and pruned phrases that matched a single bookmark. Held-out F1 rose only to 0.497: the 5 folds all score 0.80-0.87, but Muse Code studied errors across every fold, so the folds stopped acting as unseen data. Keyword rules look capped near 0.5 on unseen posts; the next step is a learned classifier, or using Muse Spark labels at runtime when paid calls are on.
 
 ## Try it classifier: before / after (2026-10-26)
 

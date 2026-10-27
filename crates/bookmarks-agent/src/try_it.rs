@@ -84,22 +84,29 @@ pub fn classify_text(topic: &str, text: &str) -> Option<TryItTag> {
     classify_with_media(topic, text, false)
 }
 
-/// Deterministic rule set:
+/// Deterministic rule set (broad cues; no single-post phrases):
 /// - strong practice cues (breathing compounds, hold, reps, each side,
-///   mindfulness, ingredients, hands-on practice words) tag on a hands-on
-///   topic, with an explicit "try it", with a second strong cue, or with
-///   numbered steps or an imperative;
+///   mindfulness, ingredients, hands-on practice words including recipe
+///   and exercise vocabulary) tag on a hands-on topic, with an explicit
+///   "try it", with a second strong cue, or with numbered steps or an
+///   imperative;
 /// - weak practice words (practice, exercise, workout, ...) need an explicit
-///   "try it" or numbered steps: bare mentions stay untagged;
-/// - how-to guides ("step by step", "complete guide", "field guide", ...),
-///   paste-this-prompt cues, shell commands, runnable prompts, agent
-///   instructions, and config tweaks tag on their own;
+///   "try it", numbered steps, or an imperative: bare mentions stay untagged;
+/// - how-to guides (normalized step-by-step, complete/setup guides, guide
+///   with link plus free/complete/how-to/step/setup, breakdown, recommend,
+///   shows-you, manually, runnable run/install, everyday routines) tag on
+///   their own; paste-this-prompt cues (broad prompt pointers, copy+paste,
+///   paste with link), shell commands, and runnable prompts tag on their own;
 /// - how-to pointers ("here's how to", "here's the setup", cheatsheets)
 ///   need steps, imperatives, pasted prompts, or commands;
 /// - two imperative sentences with distinct verbs, numbered steps starting
 ///   with an imperative, or two imperative bullets tag;
-/// - setup/download words with numbered steps, dosages with a stack or
-///   steps, teach-a-skill pointers with a link, and tool pointers tag;
+/// - setup words with numbered steps; download words with numbered steps or
+///   an imperative, or with a link plus run/commands/guide/steps/setup
+///   support; dosages with a stack or steps; teach pointers (teach-you,
+///   training video/workshop, tutorial) with a link; agent instructions
+///   (tell/ask the agent) with a link; config files (.md, config) with an
+///   imperative, steps, link, or action verb; and tool pointers tag;
 /// - a video demo (video media, or a short post with a link) tags when it
 ///   carries a strong practice cue or a hands-on action verb.
 ///
@@ -112,7 +119,7 @@ pub fn classify_with_media(topic: &str, text: &str, has_video: bool) -> Option<T
     let tagged = video_demo
         || (strong
             && (hands_on || det.explicit || det.strong >= 2 || det.numbered || det.imperative))
-        || (det.weak && (det.explicit || det.numbered))
+        || (det.weak && (det.explicit || det.numbered || det.imperative))
         || (hands_on && det.numbered && det.step_num_imp >= 1)
         || det.howto_strong
         || (det.howto_ptr
@@ -131,19 +138,18 @@ pub fn classify_with_media(topic: &str, text: &str, has_video: bool) -> Option<T
         || (det.dosage && (det.stack || det.bullets || det.numbered_any))
         || det.day_cycle
         || (det.teach && det.link)
-        || det.in_config
         || (det.cfg_gated && (det.imperative || det.numbered_any || det.bullets || det.link))
-        || det.howto_can
-        || det.tell_agent
+        || det.cfg_action
+        || (det.tell_agent && det.link)
         || (det.send_link && det.link)
         || (det.setup && det.numbered_any)
-        || (det.download && det.numbered_any && det.link)
+        || (det.download && (det.numbered_any || det.imperative))
+        || (det.download && det.link && det.dl_support)
         || (det.all_need && det.link)
         || (det.prac_skill && det.link)
         || (det.affirm && det.link)
         || (det.tools_for && hands_on)
         || (det.hacks_to && hands_on)
-        || (det.things_do && det.numbered_any)
         || (det.here_works && hands_on);
     if !tagged {
         return None;
@@ -178,6 +184,7 @@ struct Det {
     prompt_hdr: bool,
     link: bool,
     short: bool,
+    cfg_action: bool,
     cmd: bool,
     dosage: bool,
     stack: bool,
@@ -185,6 +192,7 @@ struct Det {
     teach: bool,
     setup: bool,
     download: bool,
+    dl_support: bool,
     here_works: bool,
     affirm: bool,
     tell_agent: bool,
@@ -193,10 +201,7 @@ struct Det {
     prac_skill: bool,
     tools_for: bool,
     hacks_to: bool,
-    things_do: bool,
-    in_config: bool,
     cfg_gated: bool,
-    howto_can: bool,
     tight: bool,
 }
 
@@ -226,11 +231,11 @@ const CUE_ALL_NEED: &str = "all you need";
 const CUE_PRAC_SKILL: &str = "practical skills";
 const CUE_TOOLS_FOR: &str = "tools-for";
 const CUE_HACKS_TO: &str = "hacks-to";
-const CUE_THINGS_DO: &str = "things i do";
 const CUE_CONFIG: &str = "config tweak";
-const CUE_PLACE: &str = "place instruction";
 
 /// Specific words naming something you physically do or practise.
+/// Broad recipe/exercise vocabulary (single words and general compounds);
+/// narrow single-post phrases live in broad detectors below, not here.
 const PRACTICE_STRONG: &[&str] = &[
     "mix",
     "whisk",
@@ -243,8 +248,9 @@ const PRACTICE_STRONG: &[&str] = &[
     "drill",
     "drills",
     "technique",
+    "techniques",
     "routine",
-    "with me",
+    "routines",
     "isometric",
     "plank",
     "squat",
@@ -262,6 +268,7 @@ const PRACTICE_STRONG: &[&str] = &[
     "this is how you",
     "follow along",
     "tutorial",
+    "tutorials",
     "pose",
     "asana",
     "warmup",
@@ -270,14 +277,25 @@ const PRACTICE_STRONG: &[&str] = &[
     "cooking",
     "season",
     "marinad",
+    "air fryer",
+    "fryer",
+    "recipe",
+    "recipes",
+    "serves",
+    "servings",
+    "prep",
 ];
 
-/// Generic words that need an explicit "try it" or numbered steps.
+/// Generic words that need an explicit "try it", numbered steps, or an
+/// imperative (bare mentions stay untagged).
 const PRACTICE_WEAK: &[&str] = &[
     "practice",
+    "practices",
     "practise",
     "exercise",
+    "exercises",
     "workout",
+    "workouts",
     "work out",
     "working out",
 ];
@@ -317,29 +335,20 @@ const EXPLICIT_TRY: &[&str] = &[
     "try it yourself",
     "you can try",
     "go try",
-    "you can do right now",
     "do it right now",
     "give this one a try",
 ];
 
-/// Guide phrases that tag on their own.
+/// Guide phrases that tag on their own (kept only when broad: 0 or 2+
+/// matches in the full corpus; single-post phrases use broad detectors).
 const HOWTO_STRONG: &[&str] = &[
-    "step by step",
-    "step-by-step",
     "complete guide",
     "setup guide",
     "setup steps",
-    "prompts i used",
-    "prompt in replies",
-    "here is exactly what",
     "here's how you can",
     "here is how you can",
     "here's the trick",
     "here is the trick",
-    "put a guide together",
-    "field guide",
-    "operator guide",
-    "taught me how to",
     "one line to install",
     "one-line install",
 ];
@@ -347,38 +356,25 @@ const HOWTO_STRONG: &[&str] = &[
 /// Guide pointers that need steps, imperatives, pasted prompts, or commands.
 const HOWTO_PTR: &[&str] = &[
     "here's the setup",
-    "here is the setup",
-    "here's my setup",
     "here is my setup",
     "here's how to",
     "here is how to",
     "here's how you",
     "here is how you",
-    "here's the exact setup",
-    "here is the exact setup",
-    "here's what i have and recommend",
 ];
 
 /// Paste-or-run prompt cues (prompts you can run yourself).
+/// Broad phrases only; single-post variants use [`has_prompt_ptr`],
+/// [`has_copy_paste_both`], and paste-with-link below. Includes Spanish
+/// `pegar` (paste) for multilingual setup posts.
 const PASTE_CUES: &[&str] = &[
     "paste this",
     "paste this prompt",
     "send this prompt",
-    "prompt in replies",
-    "prompts i used",
     "paste into",
-    "paste it",
     "copy paste",
     "copy-paste",
-    "copy and paste",
-];
-
-/// Pointers to a training you can follow along with (need a link).
-const TEACH_CUES: &[&str] = &[
-    "will teach you",
-    "training video",
-    "tutorial video",
-    "walkthrough",
+    "pegar",
 ];
 
 /// "What works" pointers on a hands-on topic.
@@ -388,46 +384,20 @@ const HERE_WORKS: &[&str] = &[
     "what actually works",
 ];
 
-/// Affirmation exercises (need a link).
-const AFFIRM_CUES: &[&str] = &["affirmation", "say to yourself", "repeat to yourself"];
-
-/// Direct instructions to an agent.
-const TELL_AGENT: &[&str] = &[
-    "tell the agent",
-    "ask the agent",
-    "tell your agent",
-    "ask your agent",
-    "tell it to",
-    "ask it to",
-];
-
-/// "You put it here" setup instructions.
-const HOWTO_CAN: &[&str] = &[
-    "you place it",
-    "you put it",
-    "you add it",
-    "you paste it",
-    "you copy it",
-    "you save it",
-    "you drop it",
-    "you run it",
-];
+/// Affirmation exercises (need a link). Single-word category plus the
+/// general "repeat" variant; the single-post "say" variant is covered by
+/// the category word on the same posts.
+const AFFIRM_CUES: &[&str] = &["affirmation", "repeat to yourself"];
 
 /// Supplement-stack context words.
-const STACK_WORDS: &[&str] = &[
-    "stack",
-    "cycling",
-    "upon waking",
-    "before bed",
-    "timing",
-    "days on",
-    "days off",
-];
+const STACK_WORDS: &[&str] = &["stack", "cycling", "upon waking", "before bed", "timing"];
 
 /// Setup words that need numbered steps.
 const SETUP_WORDS: &[&str] = &["setup", "set up", "configure"];
 
-/// Install words that need numbered steps plus a link.
+/// Install words that need numbered steps, a link, or an imperative.
+/// Broadened from numbered-plus-link: install-with-link alone is a
+/// runnable you can do yourself.
 const DOWNLOAD_WORDS: &[&str] = &["download", "install", "installs", "installed"];
 
 /// Installer commands that tag on their own.
@@ -671,33 +641,48 @@ fn detect(text: &str) -> Det {
     let imperative = has_imperative(text);
     let distinct: BTreeSet<&str> = frag_verbs.iter().map(String::as_str).collect();
     let multi_imp = frag_verbs.len() >= 2 && distinct.len() >= 2;
-    let howto_strong = has_any_phrase(&lower, HOWTO_STRONG);
+    let howto_strong = has_any_phrase(&lower, HOWTO_STRONG)
+        || has_step_by_step(&lower)
+        || has_guide_broad(&lower, link)
+        || has_howto_link_broad(&lower, link, numbered_any, imperative);
     let howto_ptr = has_any_phrase(&lower, HOWTO_PTR);
-    let cheat = contains_phrase(&lower, "cheatsheet") || contains_phrase(&lower, "cheat sheet");
-    let paste = has_any_phrase(&lower, PASTE_CUES);
+    let cheat = has_cheat_sheet(&lower);
+    let paste = has_any_phrase(&lower, PASTE_CUES)
+        || has_prompt_ptr(&lower)
+        || has_copy_paste_both(&lower)
+        || ((contains_phrase(&lower, "paste") || contains_phrase(&lower, "pegar")) && link);
     let prompt_hdr = has_prompt_header(&lower);
     let cmd = has_cmd(text, &lower, link);
     let dosage = has_dosage(&lower);
     let stack = has_any_phrase(&lower, STACK_WORDS);
-    let day_cycle = contains_phrase(&lower, "days on") && contains_phrase(&lower, "days off");
-    let teach = has_any_phrase(&lower, TEACH_CUES);
+    let day_cycle = has_day_cycle(&lower);
+    let teach = has_teach_broad(&lower);
     let setup = has_any_phrase(&lower, SETUP_WORDS);
     let download = has_any_phrase(&lower, DOWNLOAD_WORDS);
+    let dl_support = setup
+        || contains_phrase(&lower, "commands")
+        || contains_phrase(&lower, "command")
+        || contains_phrase(&lower, "run")
+        || contains_phrase(&lower, "ran")
+        || contains_phrase(&lower, "guide")
+        || lower.contains("step");
     let here_works = has_any_phrase(&lower, HERE_WORKS);
     let affirm = has_any_phrase(&lower, AFFIRM_CUES);
-    let tell_agent = has_any_phrase(&lower, TELL_AGENT);
-    let send_link = contains_phrase(&lower, "send the link");
+    let tell_agent = has_tell_agent_broad(&lower);
+    let send_link = contains_phrase(&lower, "send") && contains_phrase(&lower, "link");
     let all_need = contains_phrase(&lower, "all you need");
     let prac_skill = contains_phrase(&lower, "practical") && contains_phrase(&lower, "skills");
     let tools_for = contains_phrase(&lower, "tools for");
     let hacks_to = contains_phrase(&lower, "hacks to") || contains_phrase(&lower, "hack to");
-    let things_do = contains_phrase(&lower, "things i do");
-    let in_config =
-        contains_phrase(&lower, "in your config") || contains_phrase(&lower, "to your config");
-    let cfg_gated = contains_phrase(&lower, "add this to your")
-        || (contains_phrase(&lower, "changes to")
-            && (lower.contains(".md") || lower.contains("config")));
-    let howto_can = has_any_phrase(&lower, HOWTO_CAN);
+    let cfg_gated = lower.contains(".md") || contains_phrase(&lower, "config");
+    let cfg_action = cfg_gated
+        && (contains_phrase(&lower, "set")
+            || contains_phrase(&lower, "add")
+            || contains_phrase(&lower, "update")
+            || contains_phrase(&lower, "edit")
+            || contains_phrase(&lower, "change")
+            || contains_phrase(&lower, "put")
+            || contains_phrase(&lower, "place"));
     let mut labels = Vec::new();
     if explicit {
         labels.push(CUE_EXPLICIT);
@@ -804,14 +789,8 @@ fn detect(text: &str) -> Det {
     if hacks_to {
         labels.push(CUE_HACKS_TO);
     }
-    if things_do {
-        labels.push(CUE_THINGS_DO);
-    }
-    if in_config || cfg_gated {
+    if cfg_gated || cfg_action {
         labels.push(CUE_CONFIG);
-    }
-    if howto_can {
-        labels.push(CUE_PLACE);
     }
     Det {
         labels,
@@ -832,6 +811,7 @@ fn detect(text: &str) -> Det {
         prompt_hdr,
         link,
         short,
+        cfg_action,
         cmd,
         dosage,
         stack,
@@ -839,6 +819,7 @@ fn detect(text: &str) -> Det {
         teach,
         setup,
         download,
+        dl_support,
         here_works,
         affirm,
         tell_agent,
@@ -847,10 +828,7 @@ fn detect(text: &str) -> Det {
         prac_skill,
         tools_for,
         hacks_to,
-        things_do,
-        in_config,
         cfg_gated,
-        howto_can,
         tight,
     }
 }
@@ -872,6 +850,179 @@ fn has_prompt_header(lower: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Normalized "step by step" with spaces or hyphens ("step by step",
+/// "step-by-step"): one broad pattern instead of two single-post phrases.
+fn has_step_by_step(lower: &str) -> bool {
+    let h = lower.as_bytes();
+    let mut i = 0;
+    while i + 4 <= h.len() {
+        if &h[i..i + 4] == b"step"
+            && (i == 0 || !h[i - 1].is_ascii_alphanumeric())
+            && (i + 4 == h.len() || !h[i + 4].is_ascii_alphanumeric())
+        {
+            let mut j = i + 4;
+            while j < h.len() && (h[j] == b' ' || h[j] == b'-') {
+                j += 1;
+            }
+            if j + 2 <= h.len() && &h[j..j + 2] == b"by" {
+                let after_by = j + 2;
+                if after_by < h.len() && h[after_by].is_ascii_alphanumeric() {
+                    i += 1;
+                    continue;
+                }
+                let mut k = after_by;
+                while k < h.len() && (h[k] == b' ' || h[k] == b'-') {
+                    k += 1;
+                }
+                if k + 4 <= h.len()
+                    && &h[k..k + 4] == b"step"
+                    && (k + 4 == h.len() || !h[k + 4].is_ascii_alphanumeric())
+                {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Broad guide cue: "guide" with a link plus a free/complete/how-to/step/
+/// setup marker. Replaces single-post guide variants without tagging bare
+/// "guide" link bait.
+fn has_guide_broad(lower: &str, link: bool) -> bool {
+    link && contains_phrase(lower, "guide")
+        && (contains_phrase(lower, "free")
+            || contains_phrase(lower, "complete")
+            || contains_phrase(lower, "how to")
+            || lower.contains("step")
+            || contains_phrase(lower, "setup")
+            || contains_phrase(lower, "set up"))
+}
+
+/// Broad link-gated how-to cues (each requires a link; runnable/install
+/// cues also need install, commands, steps, or an imperative so bare
+/// "how to win" and "you can run" link bait stay untagged).
+fn has_howto_link_broad(lower: &str, link: bool, numbered_any: bool, imperative: bool) -> bool {
+    if !link {
+        return false;
+    }
+    if contains_phrase(lower, "breakdown")
+        || contains_phrase(lower, "recommend")
+        || contains_phrase(lower, "manually")
+        || contains_phrase(lower, "shows you")
+        || contains_phrase(lower, "show you")
+    {
+        return true;
+    }
+    if (contains_phrase(lower, "everyday") || contains_phrase(lower, "every day")) && numbered_any {
+        return true;
+    }
+    let runnable =
+        contains_phrase(lower, "you can run") || contains_phrase(lower, "you can install");
+    if runnable
+        && (contains_phrase(lower, "install")
+            || contains_phrase(lower, "installed")
+            || contains_phrase(lower, "commands")
+            || numbered_any
+            || imperative)
+    {
+        return true;
+    }
+    (contains_phrase(lower, "run") || contains_phrase(lower, "ran"))
+        && contains_phrase(lower, "commands")
+}
+
+/// Normalized cheatsheet ("cheatsheet", "cheat sheet", "cheat-sheet").
+fn has_cheat_sheet(lower: &str) -> bool {
+    if contains_phrase(lower, "cheatsheet") || contains_phrase(lower, "cheat sheet") {
+        return true;
+    }
+    contains_phrase(lower, "cheat-sheet")
+}
+
+/// Broad runnable-prompt pointer: (prompt|prompts) with used/replies/below/
+/// comments. Replaces single-post "prompts i used" and "prompt in replies".
+fn has_prompt_ptr(lower: &str) -> bool {
+    (contains_phrase(lower, "prompt") || contains_phrase(lower, "prompts"))
+        && (contains_phrase(lower, "used")
+            || contains_phrase(lower, "replies")
+            || contains_phrase(lower, "reply")
+            || contains_phrase(lower, "below")
+            || contains_phrase(lower, "comments")
+            || contains_phrase(lower, "comment"))
+}
+
+/// Broad copy+paste: both words anywhere ("copy-paste", "copy and paste").
+fn has_copy_paste_both(lower: &str) -> bool {
+    contains_phrase(lower, "copy") && contains_phrase(lower, "paste")
+}
+
+/// Structural cycling protocol: a number of days on plus a number of days
+/// off ("5 days on, 2 days off"). Broad pattern, not fixed phrases.
+fn has_day_cycle(lower: &str) -> bool {
+    has_days_on_off(lower, "on") && has_days_on_off(lower, "off")
+}
+
+fn has_days_on_off(lower: &str, on_off: &str) -> bool {
+    let h = lower.as_bytes();
+    let mut i = 0;
+    while i < h.len() {
+        if h[i].is_ascii_digit() {
+            let mut j = i;
+            while j < h.len() && h[j].is_ascii_digit() {
+                j += 1;
+            }
+            let mut k = j;
+            while k < h.len() && h[k] == b' ' {
+                k += 1;
+            }
+            if lower[k..].starts_with("days ") || lower[k..].starts_with("day ") {
+                let mut m = k;
+                while m < h.len() && h[m] != b' ' {
+                    m += 1;
+                }
+                while m < h.len() && h[m] == b' ' {
+                    m += 1;
+                }
+                if lower[m..].starts_with(on_off) {
+                    let after = m + on_off.len();
+                    if after == h.len() || !h[after].is_ascii_alphanumeric() {
+                        return true;
+                    }
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Broad teach cue: teach/taught with you/me, training video/workshop,
+/// tutorial, or walkthrough. Gated by link at the call site.
+fn has_teach_broad(lower: &str) -> bool {
+    ((lower.contains("teach") || contains_phrase(lower, "taught"))
+        && (contains_phrase(lower, "you") || contains_phrase(lower, "me")))
+        || (contains_phrase(lower, "training")
+            && (contains_phrase(lower, "video")
+                || contains_phrase(lower, "workshop")
+                || contains_phrase(lower, "course")
+                || contains_phrase(lower, "tutorial")
+                || contains_phrase(lower, "learn")))
+        || contains_phrase(lower, "tutorial")
+        || contains_phrase(lower, "tutorials")
+        || contains_phrase(lower, "walkthrough")
+}
+
+/// Broad agent instruction: tell/ask with agent. Gated by link, imperative,
+/// or steps at the call site.
+fn has_tell_agent_broad(lower: &str) -> bool {
+    (contains_phrase(lower, "tell") || contains_phrase(lower, "ask"))
+        && contains_phrase(lower, "agent")
 }
 
 /// A pasted shell line (`$ cmd`), a piped installer (`| bash`), an installer
@@ -1288,8 +1439,16 @@ pub(crate) fn is_imperative_sentence(sentence: &str) -> bool {
 /// First instruction verb of the fragment, if any: skips empty tokens,
 /// slash commands, shell prompts, mentions and tags (`/fast mode` is not
 /// the verb "fast"), then filler words. "Open source" and "check out"
-/// are not instructions.
+/// are not instructions. Pipe-separated category lists ("SLEEP | EXERCISE")
+/// are headers, not instructions.
 fn first_verb(fragment: &str) -> Option<String> {
+    if fragment.contains('|') {
+        return None;
+    }
+    let letters: Vec<char> = fragment.chars().filter(|c| c.is_alphabetic()).collect();
+    if !letters.is_empty() && letters.iter().all(|c| c.is_uppercase()) {
+        return None;
+    }
     let mut words: Vec<String> = fragment
         .split_whitespace()
         .filter(|w| !matches!(w.chars().next(), Some('/' | '$' | '@' | '#')))
@@ -1311,6 +1470,14 @@ fn first_verb(fragment: &str) -> Option<String> {
         return None;
     }
     if first == "check" && words.get(1).is_some_and(|w| w == "out") {
+        return None;
+    }
+    if first == "follow"
+        && matches!(
+            words.get(1).map(String::as_str),
+            Some("me" | "us" | "for" | "my")
+        )
+    {
         return None;
     }
     if IMPERATIVE_VERBS.contains(&first.as_str()) {
@@ -1920,8 +2087,8 @@ mod tests {
             "[synthetic] Type a city name. Save the draft. Download the poster.",
             // Config tweak.
             "[synthetic] DemoBot pro tip: in your config, set session-timeout to 10m.",
-            // Agent instruction.
-            "[synthetic] Ask your agent to update to beta, then restart the gateway.",
+            // Agent instruction with a link.
+            "[synthetic] Ask your agent to update to beta, then restart the gateway https://example.invalid/beta.",
             // Shell installer.
             "[synthetic] One-line install: curl -fsSL https://example.invalid/i.sh | bash",
             // Dosage plus stack context.
