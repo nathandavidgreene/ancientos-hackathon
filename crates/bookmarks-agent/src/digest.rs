@@ -92,19 +92,6 @@ pub fn due_cards(cards: &[IdeaCard], now: u64) -> Vec<DueCard> {
     out
 }
 
-/// Parked cards whose `park_until` has passed (`<= now`, boundary inclusive),
-/// sorted by `(created_at, id)`. Parked cards without `park_until` are not
-/// listed here (see [`due_cards`).
-pub fn resurfaced_cards(cards: &[IdeaCard], now: u64) -> Vec<IdeaCard> {
-    let mut out: Vec<IdeaCard> = cards
-        .iter()
-        .filter(|c| c.status == Status::Parked && c.park_until.is_some_and(|t| t <= now))
-        .cloned()
-        .collect();
-    out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-    out
-}
-
 /// A pending try-it post old enough to nudge about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TryNudge {
@@ -455,20 +442,6 @@ mod tests {
         let due = due_cards(&cards, NOW);
         assert_eq!(due[0].card.id, "a");
         assert_eq!(due[1].card.id, "b");
-    }
-
-    #[test]
-    fn resurfaced_lists_only_passed_park_until() {
-        let cards = vec![
-            card("exact", Status::Parked, 3, Some(NOW)),
-            card("past", Status::Parked, 1, Some(NOW - 10)),
-            card("future", Status::Parked, 2, Some(NOW + 1)),
-            card("legacy", Status::Parked, 0, None),
-            card("new", Status::New, 4, None),
-        ];
-        let out = resurfaced_cards(&cards, NOW);
-        let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, vec!["past", "exact"]);
     }
 
     #[test]
