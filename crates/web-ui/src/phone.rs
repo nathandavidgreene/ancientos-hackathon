@@ -54,10 +54,17 @@ pub fn token_from(raw: Option<String>) -> Option<String> {
         .filter(|s| s.len() >= MIN_TOKEN_LEN)
 }
 
-/// Constant-time string equality (no early exit on the first mismatch).
+/// Constant-time token equality: both sides are hashed to fixed-length
+/// sha256 hex first, so neither a mismatch position nor a length
+/// difference changes the comparison time.
 fn same(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    use ancientos_core::approvals::canonical_hash;
+    let ha = canonical_hash(&serde_json::Value::String(a.to_string()));
+    let hb = canonical_hash(&serde_json::Value::String(b.to_string()));
+    ha.bytes()
+        .zip(hb.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// True only when a token is configured and `given` matches it.
@@ -281,6 +288,57 @@ mod tests {
     fn status(state: &State, id: &str) -> Status {
         let log = DecisionLog::open(state.log_path()).unwrap();
         approvals::get(&log, id).unwrap().status_at(now_secs())
+    }
+
+    #[test]
+    fn token_compare_is_exact_for_any_length() {
+        assert!(same(TOKEN, TOKEN));
+        assert!(!same(TOKEN, &TOKEN[..TOKEN.len() - 1]));
+        assert!(!same(TOKEN, &format!("{TOKEN}x")));
+        assert!(!same(TOKEN, ""));
+    }
+
+    #[test]
+    fn get_never_changes_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(dir.path());
+        // Missing log: GET must not create it.
+        handle(&Request::get(&format!("/m?k={TOKEN}")), &s);
+        assert!(!s.log_path().exists());
+        let r = pending_request(&s, 1);
+        let before = std::fs::read(s.log_path()).unwrap();
+        // Even GETs carrying decide-looking query params change nothing.
+        let q = format!(
+            "/m?k={TOKEN}&id={}&payload_hash={}&decision=approve",
+            r.id, r.payload_hash
+        );
+        for target in [q.as_str(), "/m", "/m?k=wrong-token-0000000"] {
+            handle(&Request::get(target), &s);
+        }
+        assert_eq!(std::fs::read(s.log_path()).unwrap(), before);
+        assert_eq!(status(&s, &r.id), Status::Pending);
+        // GET on the decide path is not a route.
+        assert_eq!(
+            handle(&Request::get(&q.replace("/m?", "/m/decide?")), &s).status,
+            404
+        );
+        assert_eq!(std::fs::read(s.log_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn decide_checks_hash_against_that_pending_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(dir.path());
+        let a = pending_request(&s, 1);
+        let b = pending_request(&s, 2);
+        // a's id with b's (valid, but different) hash decides nothing.
+        let body = format!(
+            "k={TOKEN}&id={}&payload_hash={}&decision=approve",
+            a.id, b.payload_hash
+        );
+        assert_eq!(handle(&Request::post("/m/decide", &body), &s).status, 400);
+        assert_eq!(status(&s, &a.id), Status::Pending);
+        assert_eq!(status(&s, &b.id), Status::Pending);
     }
 
     #[test]

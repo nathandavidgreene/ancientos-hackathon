@@ -6,6 +6,6 @@ scripts/check_core_boundary.sh
 scripts/check_docs.sh
 scripts/check_pyright.sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --document-private-items --quiet
