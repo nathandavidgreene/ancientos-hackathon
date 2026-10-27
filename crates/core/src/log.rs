@@ -58,7 +58,33 @@ impl DecisionLog {
     }
 
     /// Append one entry. The file is only ever opened in append mode.
+    ///
+    /// The payload is redacted ([`crate::redact::redact_json`]) before hashing
+    /// and writing, so secrets never enter the hash chain or the file. When
+    /// anything was redacted, object payloads gain a `redacted` field listing
+    /// the kinds found; clean payloads are stored byte-identical.
     pub fn append(&mut self, kind: &str, payload: serde_json::Value) -> Result<Entry, LogError> {
+        let (mut payload, hits) = crate::redact::redact_json(&payload);
+        if !hits.is_empty() {
+            if let Some(obj) = payload.as_object_mut() {
+                let kinds: Vec<serde_json::Value> = hits
+                    .iter()
+                    .map(|k| serde_json::Value::String(k.as_str().to_string()))
+                    .collect();
+                match obj.get_mut("redacted") {
+                    Some(serde_json::Value::Array(existing)) => {
+                        for k in kinds {
+                            if !existing.contains(&k) {
+                                existing.push(k);
+                            }
+                        }
+                    }
+                    _ => {
+                        obj.insert("redacted".to_string(), serde_json::Value::Array(kinds));
+                    }
+                }
+            }
+        }
         let hash = digest(self.next_seq, &self.last_hash, kind, &payload);
         let e = Entry {
             seq: self.next_seq,
@@ -136,5 +162,69 @@ mod tests {
             .replacen("\"a\"", "\"x\"", 1);
         std::fs::write(&p, s).unwrap();
         assert!(matches!(DecisionLog::open(&p), Err(LogError::Chain(0))));
+    }
+
+    #[test]
+    fn append_redacts_secrets_before_hashing_and_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&p).unwrap();
+        // Scanner-safe fakes, built at runtime.
+        let token = format!("ghp_{}", "C".repeat(36));
+        let pass = "P".repeat(12);
+        let e = log
+            .append(
+                "note",
+                json!({
+                    "summary": format!("rotate {token} now"),
+                    "db": format!("postgres://syn_user:{pass}@example.invalid/db"),
+                    "access_token": "Z".repeat(24),
+                    "total_tokens": 150,
+                }),
+            )
+            .unwrap();
+        // The returned entry already carries the redacted payload.
+        let mut kinds: Vec<&str> = e.payload["redacted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["github_token", "json_key", "url_password"]);
+        assert_eq!(e.payload["total_tokens"], 150);
+        // Bytes on disk: no secret, tagged markers instead, chain verifies.
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(!raw.contains(&token), "token leaked: {raw}");
+        assert!(!raw.contains(&pass), "password leaked: {raw}");
+        assert!(!raw.contains(&"Z".repeat(24)), "key value leaked: {raw}");
+        assert!(raw.contains("[redacted:github_token]"), "{raw}");
+        assert!(raw.contains("[redacted:url_password]"), "{raw}");
+        assert!(raw.contains("[redacted:json_key]"), "{raw}");
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], e);
+        // Reopening re-verifies the redacted chain.
+        let log2 = DecisionLog::open(&p).unwrap();
+        assert_eq!(log2.verify().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn append_leaves_clean_payloads_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&p).unwrap();
+        let payload = json!({
+            "to": "local",
+            "prompt_tokens": 100,
+            "total_tokens": 150,
+            "model": "mock-muse",
+        });
+        let e = log.append("route", payload.clone()).unwrap();
+        assert_eq!(e.payload, payload);
+        assert!(e.payload.get("redacted").is_none());
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"total_tokens\":150"), "{raw}");
+        assert!(!raw.contains("redacted"), "{raw}");
     }
 }

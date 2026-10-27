@@ -3,4 +3,5 @@ pub mod approvals;
 pub mod feedback;
 pub mod gate;
 pub mod log;
+pub mod redact;
 pub mod scheduler;

@@ -1,8 +1,10 @@
 //! Sanitize bookmark text before it may leave the device.
 //!
-//! Removes URLs, @handles, emails, and phone-like numbers, then collapses
-//! whitespace and truncates to [`MAX_CHARS`] characters. Only sanitized text
-//! is ever sent to a hosted model.
+//! Secret-shaped values are redacted first (see
+//! [`ancientos_core::redact`], `[redacted:<kind>]` markers), then URLs,
+//! @handles, emails, and phone-like numbers are removed, whitespace is
+//! collapsed, and the result is truncated to [`MAX_CHARS`] characters. Only
+//! sanitized text is ever sent to a hosted model.
 pub const MAX_CHARS: usize = 200;
 
 fn is_url_token(token: &str) -> bool {
@@ -144,11 +146,12 @@ fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 /// Sanitize free text for hosted models, without truncating.
-/// Same pipeline as [`sanitize`] (strip URLs, emails, @handles, phone-like
-/// numbers, collapse whitespace) but keeps the full length: for thread
-/// summaries where every post matters.
+/// Same pipeline as [`sanitize`] (redact secrets, strip URLs, emails,
+/// @handles, phone-like numbers, collapse whitespace) but keeps the full
+/// length: for thread summaries where every post matters.
 pub fn sanitize_uncapped(text: &str) -> String {
-    let no_urls = strip_url_and_email_tokens(text);
+    let redacted = ancientos_core::redact::redact_text(text).text;
+    let no_urls = strip_url_and_email_tokens(&redacted);
     let no_handles = strip_handles(&no_urls);
     let no_phones = strip_phones(&no_handles);
     collapse_whitespace(&no_phones)
@@ -279,8 +282,9 @@ fn has_bearer_token(lower: &str) -> bool {
 /// True when text looks like it carries a secret: a private-key marker, a
 /// known high-entropy token prefix, a `key: value` credential assignment, or
 /// a Bearer token. Heuristic and fail-closed on matches only: anything it
-/// flags classifies as Restricted and stays on the device. Note
-/// [`sanitize`] does NOT strip secrets — classification keeps them local.
+/// flags classifies as Restricted and stays on the device. [`sanitize`]
+/// additionally redacts secret-shaped values, so hosted inputs carry
+/// `[redacted:<kind>]` markers even when a shape slips past this heuristic.
 pub fn contains_secret(text: &str) -> bool {
     let lower = text.to_lowercase();
     if lower.contains("private key") {
@@ -461,5 +465,28 @@ mod tests {
             sanitize(&raw),
             out.chars().take(MAX_CHARS).collect::<String>().trim_end()
         );
+    }
+
+    #[test]
+    fn sanitize_redacts_secrets_for_hosted_calls() {
+        // Scanner-safe fakes, built at runtime.
+        let token = format!("ghp_{}", "C".repeat(36));
+        let out = sanitize(&format!("rotate {token} now"));
+        assert!(!out.contains(&token), "{out}");
+        assert!(out.contains("[redacted:github_token]"), "{out}");
+        let secret = "U".repeat(12);
+        let out = sanitize_uncapped(&format!("db password: {secret}"));
+        assert!(!out.contains(&secret), "{out}");
+        assert_eq!(out, "db password: [redacted:credential_assignment]");
+        // Redaction composes with PII stripping: secrets, handles, URLs go.
+        let key = format!("sk-{}", "E".repeat(32));
+        let out = sanitize(&format!("hi @syn_user, key {key} https://t.co/x"));
+        assert!(!out.contains(&key), "{out}");
+        assert!(!out.contains("@syn_user"), "{out}");
+        assert!(!out.contains("https://"), "{out}");
+        assert_eq!(out, "hi , key [redacted:secret_key]");
+        // Placeholders still pass through untouched.
+        assert_eq!(sanitize("API_KEY=<your-key>"), "API_KEY=<your-key>");
+        assert_eq!(sanitize("token=xxxx"), "token=xxxx");
     }
 }

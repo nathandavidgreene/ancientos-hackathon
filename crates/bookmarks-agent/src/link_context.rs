@@ -1762,8 +1762,8 @@ pub fn enrich_at(
     }
     let text = parts.join("\n\n");
     // Content built from several sources takes the highest class: a secret
-    // in fetched text (sanitize strips PII, not secrets) withholds the whole
-    // enrichment from paid models.
+    // in fetched text (classification keeps secrets local) withholds the
+    // whole enrichment from paid models.
     let class = max_of([post_class, crate::translate::class_of(&text)]);
     Enrichment {
         text,

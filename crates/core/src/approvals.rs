@@ -26,13 +26,18 @@
 //!
 //! ## Secrets
 //!
-//! Payloads are [`redact`]ed before hashing and before writing: any object
-//! key whose lowercased alphanumeric form contains `token`, `secret`,
-//! `password`, `apikey` or `credential` (at any depth) has its value replaced
-//! with `"[REDACTED]"`. The stored payload and the `payload_hash` therefore
-//! never contain secret values, and callers may pass the original payload to
+//! Payloads are [`redact`]ed before hashing and before writing: key detection
+//! delegates to [`crate::redact::is_secret_key`] (any object key whose
+//! lowercased alphanumeric form contains `token`, `secret`, `password`,
+//! `apikey`, `credential` or `authorization`, at any depth) and values behind
+//! those keys become `"[REDACTED]"`; every other string is additionally
+//! scrubbed of embedded secrets via [`crate::redact::redact_text`], so the
+//! hashed payload is already a fixed point under the log layer's own
+//! redaction. The stored payload and the `payload_hash` therefore never
+//! contain secret values, and callers may pass the original payload to
 //! [`release`] — it is redacted again before the hash is re-checked. Never put
-//! secrets in `summary` either: summaries are stored and displayed verbatim.
+//! secrets in `summary` either: summaries reach the log verbatim unless they
+//! contain secret-shaped content, which the log layer redacts on write.
 //!
 //! ## Entry schemas
 //!
@@ -207,31 +212,18 @@ impl ReleaseToken {
     }
 }
 
-/// True when an object key looks secret-bearing: its lowercased alphanumeric
-/// form contains `token`, `secret`, `password`, `apikey` or `credential`.
-/// Matches `access_token`, `api_key`, `apiKey`, `client_secret`, `password`,
-/// `credentials`, and nested equivalents.
-fn is_secret_key(key: &str) -> bool {
-    let norm: String = key
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect();
-    ["token", "secret", "password", "apikey", "credential"]
-        .iter()
-        .any(|needle| norm.contains(needle))
-}
-
 /// Deep copy of `value` with secret-bearing keys replaced by `"[REDACTED]"`
-/// (rule: a key whose lowercased alphanumeric form contains `token`, `secret`,
-/// `password`, `apikey` or `credential`, matched at any depth). Arrays are
-/// walked, scalars are kept.
+/// (key rule delegated to [`crate::redact::is_secret_key`], matched at any
+/// depth) and embedded secrets in every other string scrubbed via
+/// [`crate::redact::redact_text`]. Arrays are walked, other scalars are kept.
+/// The result is a fixed point under [`DecisionLog::append`]'s redaction, so
+/// the stored payload always hashes to the precomputed `payload_hash`.
 pub fn redact(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => serde_json::Value::Object(
             map.iter()
                 .map(|(k, v)| {
-                    if is_secret_key(k) {
+                    if crate::redact::is_secret_key(k) {
                         (k.clone(), serde_json::Value::String(REDACTED.to_string()))
                     } else {
                         (k.clone(), redact(v))
@@ -241,6 +233,9 @@ pub fn redact(value: &serde_json::Value) -> serde_json::Value {
         ),
         serde_json::Value::Array(items) => {
             serde_json::Value::Array(items.iter().map(redact).collect())
+        }
+        serde_json::Value::String(s) => {
+            serde_json::Value::String(crate::redact::redact_text(s).text)
         }
         scalar => scalar.clone(),
     }
@@ -1119,6 +1114,40 @@ mod tests {
             assert!(!raw.contains(secret), "secret leaked: {secret}");
         }
         assert!(raw.contains("keep me"));
+    }
+
+    #[test]
+    fn redact_delegates_key_and_text_rules_to_redact_module() {
+        // `authorization` (shared key rule) and embedded vendor patterns
+        // (shared text rule) are both caught; clean strings pass through.
+        let fake = format!("ghp_{}", "C".repeat(36));
+        let v = redact(&json!({
+            "authorization": format!("Bearer {}", "L".repeat(32)),
+            "cmd": format!("use {fake} now"),
+            "draft": "keep me",
+        }));
+        assert_eq!(v["authorization"], REDACTED);
+        assert!(!v["cmd"].as_str().unwrap().contains(&fake));
+        assert!(v["cmd"]
+            .as_str()
+            .unwrap()
+            .contains("[redacted:github_token]"));
+        assert_eq!(v["draft"], "keep me");
+    }
+
+    #[test]
+    fn release_round_trips_payload_with_embedded_secret() {
+        let (_dir, mut log, path) = open_log();
+        let fake = format!("ghp_{}", "C".repeat(36));
+        let original = json!({"draft": "hi", "cmd": format!("use {fake} now")});
+        // The hashed payload is a fixed point under log-layer redaction, so
+        // the original (with the embedded secret) still releases.
+        let r = propose(&mut log, NOW, original.clone());
+        let approval = approve(&mut log, &r.id, &r.payload_hash, "human", NOW + 1).unwrap();
+        release(&mut log, approval, &original).unwrap();
+        assert_eq!(get(&log, &r.id).unwrap().status, Status::Released);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(&fake), "secret leaked");
     }
 
     #[test]
