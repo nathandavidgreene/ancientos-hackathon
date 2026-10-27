@@ -111,7 +111,7 @@ where
     F: Fn(&str) -> Result<String, E>,
     E: std::fmt::Display,
 {
-    /// Test helper: classify.
+    /// Test helper: label text with the wrapped closure, mapping errors to backend errors.
     fn classify(&self, text: &str) -> Result<String, EvalError> {
         (self)(text).map_err(|e| EvalError::Backend(e.to_string()))
     }
@@ -383,12 +383,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// Test helper: approx eq.
+    /// Test helper: report whether two floats agree within 1e-12.
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-12
     }
 
-    /// Test helper: examples.
+    /// Test helper: build labeled examples from (text, label) pairs.
     fn examples(pairs: &[(&str, &str)]) -> Vec<LabeledExample> {
         pairs.iter().copied().map(LabeledExample::from).collect()
     }
@@ -531,7 +531,7 @@ mod tests {
     fn trait_object_path_matches_closure_path() {
         struct Always(String);
         impl ClassifierBackend for Always {
-            /// Test helper: classify.
+            /// Test helper: return the fixed label regardless of input.
             fn classify(&self, text: &str) -> Result<String, EvalError> {
                 let _ = text;
                 Ok(self.0.clone())
@@ -639,7 +639,7 @@ mod tests {
         url
     }
 
-    /// Test helper: localjev classifier.
+    /// Test helper: build a tech/sports classifier against the given mock server.
     fn localjev_classifier(base_url: String, sensitivity: Sensitivity) -> JevClassifier {
         let client = JevClient::new(JevBackend::LocalJev, base_url, "test-localjev", false);
         JevClassifier::new(client, sensitivity).with_labels(&["tech", "sports"])

@@ -1274,7 +1274,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// Test helper: bm.
+    /// Test helper: builds a minimal bookmark with the given id and text.
     fn bm(id: &str, text: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -1406,7 +1406,7 @@ mod tests {
         (url, hits)
     }
 
-    /// Test helper: page route.
+    /// Test helper: builds an HTML test-server response for a path.
     fn page_route(path: &str, body: &str) -> Route {
         Route {
             path: path.to_string(),
@@ -1418,7 +1418,7 @@ mod tests {
         }
     }
 
-    /// Test helper: hits of.
+    /// Test helper: returns the current test-server request count.
     fn hits_of(hits: &Hits) -> usize {
         *hits.lock().expect("hits lock")
     }

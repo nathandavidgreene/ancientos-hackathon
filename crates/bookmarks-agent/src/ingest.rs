@@ -120,7 +120,7 @@ pub fn sync(
 pub struct StubXSource;
 
 impl BookmarkSource for StubXSource {
-    /// Test helper: fetch.
+    /// Test helper: always-unavailable source reporting the X API as unwired.
     fn fetch(&mut self, _t: Option<&str>) -> Result<Page, String> {
         Err("X API source not implemented".into())
     }
@@ -130,7 +130,7 @@ impl BookmarkSource for StubXSource {
 mod tests {
     use super::*;
 
-    /// Test helper: bm.
+    /// Test helper: minimal bookmark with derived URL for the given id.
     fn bm(id: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -149,7 +149,7 @@ mod tests {
 
     struct OnePage(Vec<&'static str>);
     impl BookmarkSource for OnePage {
-        /// Test helper: fetch.
+        /// Test helper: single fixed page built from the canned ids.
         fn fetch(&mut self, _t: Option<&str>) -> Result<Page, String> {
             Ok(Page {
                 items: self.0.iter().map(|i| bm(i)).collect(),

@@ -296,7 +296,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Test helper: sample.
+    /// Test helper: returns an X API payload with photo and video media.
     fn sample() -> serde_json::Value {
         json!({
             "data": [{"id": "1", "attachments": {"media_keys": ["3_a", "7_b", "3_bad"]}}],

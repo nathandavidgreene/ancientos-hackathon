@@ -1241,7 +1241,7 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// Test helper: sample card.
+    /// Test helper: sample idea card for formatting tests.
     fn sample_card() -> idea_card::IdeaCard {
         idea_card::IdeaCard {
             id: "abc123".to_string(),

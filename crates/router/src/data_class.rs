@@ -415,7 +415,7 @@ mod tests {
     }
 
     impl EnvGuard {
-        /// Test helper: set.
+        /// Test helper: sets env vars while saving prior values.
         fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
             let mut saved = Vec::with_capacity(pairs.len());
             for (key, value) in pairs {
@@ -430,7 +430,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
-        /// Test helper: drop.
+        /// Test helper: restores saved env vars on drop.
         fn drop(&mut self) {
             for (key, value) in self.saved.drain(..) {
                 match value {

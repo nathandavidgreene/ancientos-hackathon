@@ -494,7 +494,7 @@ mod tests {
     }
 
     impl EnvGuard {
-        /// Test helper: set.
+        /// Test helper: applies one env var, saving the prior value.
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let saved = std::env::var(key).ok();
             match value {
@@ -506,7 +506,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
-        /// Test helper: drop.
+        /// Test helper: restores the saved environment value.
         fn drop(&mut self) {
             match self.saved.take() {
                 Some(v) => std::env::set_var(self.key, v),

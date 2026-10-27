@@ -2,12 +2,12 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Test helper: script path.
+/// Test helper: muse_run.sh script location.
 fn script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/muse_run.sh")
 }
 
-/// Test helper: fixture path.
+/// Test helper: sample JSONL fixture location.
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/muse_run_sample.jsonl")
 }

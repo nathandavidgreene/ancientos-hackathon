@@ -1168,7 +1168,7 @@ impl Workspace {
 mod tests {
     use super::*;
 
-    /// Test helper: fixture path.
+    /// Test helper: synthetic bookmarks fixture location.
     fn fixture_path() -> PathBuf {
         PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1233,7 +1233,7 @@ mod tests {
         assert!(select(&[], 0, 5).is_empty());
     }
 
-    /// Test helper: second fixture path.
+    /// Test helper: try-it/thread bookmarks fixture location.
     fn second_fixture_path() -> PathBuf {
         PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),

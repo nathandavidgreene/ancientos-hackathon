@@ -1546,7 +1546,7 @@ pub fn run_paid_with_paths(
 mod tests {
     use super::*;
 
-    /// Test helper: post.
+    /// Test helper: builds a minimal thread post with the given id and text.
     fn post(id: &str, text: &str) -> ThreadPost {
         ThreadPost {
             id: id.into(),
@@ -1559,7 +1559,7 @@ mod tests {
         }
     }
 
-    /// Test helper: quoted post.
+    /// Test helper: builds a thread post quoting another post.
     fn quoted_post(id: &str, text: &str, quote_id: &str) -> ThreadPost {
         let mut p = post(id, text);
         p.referenced_tweets.push(ReferencedTweet {
@@ -1569,7 +1569,7 @@ mod tests {
         p
     }
 
-    /// Test helper: fetch.
+    /// Test helper: wraps posts as a successful synthetic thread result.
     fn fetch(posts: Vec<ThreadPost>) -> crate::x_api::ThreadFetch {
         crate::x_api::ThreadFetch {
             root: posts[0].clone(),
@@ -1580,7 +1580,7 @@ mod tests {
         }
     }
 
-    /// Test helper: write fixture.
+    /// Test helper: writes JSON lines to a temp file and returns its path.
     fn write_fixture(dir: &tempfile::TempDir, name: &str, lines: &[serde_json::Value]) -> PathBuf {
         let path = dir.path().join(name);
         let body = lines
@@ -1593,7 +1593,7 @@ mod tests {
         path
     }
 
-    /// Test helper: row.
+    /// Test helper: builds bookmark fixture JSON with merged extra fields.
     fn row(
         id: &str,
         text: &str,
@@ -1618,17 +1618,17 @@ mod tests {
         v
     }
 
-    /// Test helper: no thread fetch.
+    /// Test helper: panics if offline code attempts a network thread fetch.
     fn no_thread_fetch(_: &str) -> Result<crate::x_api::ThreadFetch, String> {
         panic!("network thread fetch used in offline mode")
     }
 
-    /// Test helper: no post fetch.
+    /// Test helper: panics if offline code attempts a network post fetch.
     fn no_post_fetch(_: &str) -> Result<ThreadPost, String> {
         panic!("network post fetch used in offline mode")
     }
 
-    /// Test helper: no call.
+    /// Test helper: panics if local-mode code attempts a model call.
     fn no_call(
         _: &str,
         _: Option<&str>,
@@ -1636,7 +1636,7 @@ mod tests {
         panic!("model call used in local mode")
     }
 
-    /// Test helper: thread fixture.
+    /// Test helper: returns quoted-conversation JSON rows for deeper tests.
     fn thread_fixture() -> Vec<serde_json::Value> {
         vec![
             row(
@@ -2864,13 +2864,13 @@ mod tests {
         );
     }
 
-    /// Test helper: queue log.
+    /// Test helper: opens a fresh decision log for queue tests.
     fn queue_log(dir: &tempfile::TempDir) -> (DecisionLog, PathBuf) {
         let path = dir.path().join("q.jsonl");
         (DecisionLog::open(&path).unwrap(), path)
     }
 
-    /// Test helper: queue entries.
+    /// Test helper: reads back every record stored at a log path.
     fn queue_entries(path: &Path) -> Vec<Entry> {
         DecisionLog::open(path).unwrap().verify_or_empty().unwrap()
     }

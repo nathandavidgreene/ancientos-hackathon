@@ -404,7 +404,7 @@ pub struct Cascade<'a> {
 }
 
 impl<'a> Cascade<'a> {
-    /// Test helper: new.
+    /// Test helper: cascade with default yes threshold over the given backends.
     pub fn new(jev: Option<&'a JevClient>, muse: Option<&'a MuseClient>) -> Self {
         Self {
             jev,
@@ -721,7 +721,7 @@ mod tests {
     }
 
     impl EnvGuard {
-        /// Test helper: set.
+        /// Test helper: apply env overrides, saving prior values for restore.
         fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
             let mut saved = Vec::with_capacity(pairs.len());
             for (key, value) in pairs {
@@ -736,7 +736,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
-        /// Test helper: drop.
+        /// Test helper: restore saved env values on scope exit.
         fn drop(&mut self) {
             for (key, value) in self.saved.drain(..) {
                 match value {
@@ -890,7 +890,7 @@ mod tests {
         .with_reasoning_effort("low")
     }
 
-    /// Test helper: jev noul body.
+    /// Test helper: mock Jev response carrying the given score.
     fn jev_noul_body(noul: f64) -> String {
         format!(
             "{{\"model\":\"m\",\"answers\":{{\"try_it\":{{\"type\":\"noul\",\"noul\":{noul}}}}},\
@@ -898,7 +898,7 @@ mod tests {
         )
     }
 
-    /// Test helper: muse body.
+    /// Test helper: mock Muse chat response with the given content.
     fn muse_body(content: &str) -> String {
         serde_json::json!({
             "model": "muse-spark-1.3",
@@ -921,7 +921,7 @@ mod tests {
         .to_string()
     }
 
-    /// Test helper: zero stats.
+    /// Test helper: blank cascade counters for a single decision.
     fn zero_stats() -> CascadeStats {
         CascadeStats::default()
     }

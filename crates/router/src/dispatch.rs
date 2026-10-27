@@ -223,7 +223,7 @@ mod tests {
         seen: RefCell<Vec<String>>,
     }
     impl Recorder {
-        /// Test helper: new.
+        /// Test helper: fresh prompt recorder for a destination.
         fn new(dest: Destination) -> Self {
             Self {
                 dest,
@@ -232,11 +232,11 @@ mod tests {
         }
     }
     impl ModelClient for Recorder {
-        /// Test helper: destination.
+        /// Test helper: where this recorder claims to send prompts.
         fn destination(&self) -> Destination {
             self.dest
         }
-        /// Test helper: complete.
+        /// Test helper: records the prompt and answers success.
         fn complete(&self, p: &str) -> Result<String, RouterError> {
             self.seen.borrow_mut().push(p.into());
             Ok("ok".into())
@@ -319,7 +319,7 @@ mod tests {
         assert!(spark.seen.borrow().is_empty());
     }
 
-    /// Test helper: jev backends.
+    /// Test helper: backends wired with both JEV slots filled.
     fn jev_backends<'a>(
         local: &'a Recorder,
         spark: &'a Recorder,
@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(d, Destination::MuseSpark);
     }
 
-    /// Test helper: plain backends.
+    /// Test helper: backends with no JEV slots wired.
     fn plain_backends<'a>(
         local: &'a Recorder,
         spark: &'a Recorder,

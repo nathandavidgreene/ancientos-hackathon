@@ -526,7 +526,7 @@ pub fn render_markdown(report: &EvalReport) -> String {
 mod tests {
     use super::*;
 
-    /// Test helper: approx.
+    /// Test helper: report whether two floats agree within 1e-9.
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
     }
@@ -634,12 +634,12 @@ mod tests {
         assert_eq!(negatives.accuracy(), 1.0);
     }
 
-    /// Test helper: fixture path.
+    /// Test helper: resolve a fixture file under fixtures/eval.
     fn fixture_path(name: &str) -> String {
         format!("{}/../../fixtures/eval/{name}", env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// Test helper: load synthetic.
+    /// Test helper: read the synthetic bookmarks and labels fixtures.
     fn load_synthetic() -> (Vec<Bookmark>, Vec<Label>) {
         let bookmarks =
             bookmarks_agent::fixture::load(fixture_path("synthetic_bookmarks.jsonl")).unwrap();
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn non_english_bookmarks_are_sampled_and_scored_on_translation() {
-        /// Test helper: bm.
+        /// Test helper: build a minimal bookmark with the given id, text, and language.
         fn bm(id: &str, text: &str, lang: Option<&str>) -> Bookmark {
             Bookmark {
                 post_id: id.to_string(),

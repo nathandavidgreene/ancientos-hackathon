@@ -924,7 +924,7 @@ mod tests {
 
     const NOW: u64 = 1_791_000_000;
 
-    /// Test helper: bookmark.
+    /// Test helper: synthetic bookmark with standard label and metadata.
     fn bookmark(id: &str, text: &str) -> crate::fixture::Bookmark {
         crate::fixture::Bookmark {
             post_id: id.into(),
@@ -946,7 +946,7 @@ mod tests {
         }
     }
 
-    /// Test helper: write brief fixture.
+    /// Test helper: seed the path with three synthetic bookmark rows.
     fn write_brief_fixture(path: &Path) {
         let rows = [
             bookmark("b1", "synthetic note about local file tooling"),
@@ -960,7 +960,7 @@ mod tests {
         std::fs::write(path, body.join("\n") + "\n").unwrap();
     }
 
-    /// Test helper: test ctx.
+    /// Test helper: agent context rooted at the temp dir, optionally seeded.
     fn test_ctx(dir: &tempfile::TempDir, fixture: bool) -> AgentCtx {
         let fixture_path = dir.path().join("brief.jsonl");
         if fixture {
@@ -976,7 +976,7 @@ mod tests {
         }
     }
 
-    /// Test helper: test config.
+    /// Test helper: default daemon settings over a seeded temp context.
     fn test_config(dir: &tempfile::TempDir) -> DaemonConfig {
         DaemonConfig {
             ctx: test_ctx(dir, true),
@@ -984,12 +984,12 @@ mod tests {
         }
     }
 
-    /// Test helper: entries of.
+    /// Test helper: verified decision log records stored at the path.
     fn entries_of(path: &Path) -> Vec<Entry> {
         DecisionLog::open(path).unwrap().verify_or_empty().unwrap()
     }
 
-    /// Test helper: kinds of.
+    /// Test helper: entry kinds from the decision log at the path.
     fn kinds_of(path: &Path) -> Vec<String> {
         entries_of(path).iter().map(|e| e.kind.clone()).collect()
     }
@@ -1128,7 +1128,7 @@ mod tests {
         assert_eq!(model_call.payload["model"], "local");
     }
 
-    /// Test helper: panicking fetchers.
+    /// Test helper: closures proving the propose path makes no calls.
     #[allow(clippy::type_complexity)]
     fn panicking_fetchers() -> (
         impl Fn(&str) -> Result<crate::x_api::ThreadFetch, String>,
@@ -1156,7 +1156,7 @@ mod tests {
         (ft, fp, call)
     }
 
-    /// Test helper: queue job.
+    /// Test helper: schedule a deeper follow-up for the post at the given time.
     fn queue_job(ctx: &AgentCtx, post_id: &str, at: u64, now: u64) {
         let mut log = DecisionLog::open(&ctx.log_path).unwrap();
         crate::deeper::queue_later(&mut log, post_id, at, now).unwrap();
@@ -1181,7 +1181,7 @@ mod tests {
             .any(|e| e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND));
     }
 
-    /// Test helper: mock thread.
+    /// Test helper: synthetic single-post fetch result for the given id.
     fn mock_thread(id: &str) -> crate::x_api::ThreadFetch {
         let post = crate::unroll::ThreadPost {
             id: id.into(),
@@ -1346,7 +1346,7 @@ mod tests {
             .any(|e| e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND));
     }
 
-    /// Test helper: write thread fixture.
+    /// Test helper: seed the path with a synthetic two-post thread.
     fn write_thread_fixture(path: &Path) {
         let row = |id: &str, text: &str, conv: &str| {
             serde_json::json!({

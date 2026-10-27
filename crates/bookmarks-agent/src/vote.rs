@@ -161,7 +161,7 @@ pub fn list_hidden_authors(log_path: &Path) -> Result<BTreeSet<String>, String> 
 mod tests {
     use super::*;
 
-    /// Test helper: fixture with labeled post.
+    /// Test helper: path to a fixture holding one labeled post.
     fn fixture_with_labeled_post(dir: &Path) -> String {
         let path = dir.join("fix.jsonl");
         std::fs::write(
@@ -244,7 +244,7 @@ mod tests {
         assert!(err.contains("non-empty"), "{err}");
     }
 
-    /// Test helper: fixture with authors.
+    /// Test helper: path to a fixture with three posts and mixed authors.
     fn fixture_with_authors(dir: &Path) -> String {
         let path = dir.join("authors.jsonl");
         std::fs::write(

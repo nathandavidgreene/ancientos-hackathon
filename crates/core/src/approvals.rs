@@ -763,7 +763,7 @@ mod tests {
         g
     }
 
-    /// Test helper: open log.
+    /// Test helper: fresh temporary decision log with its directory and path.
     fn open_log() -> (tempfile::TempDir, DecisionLog, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("decision_log.jsonl");
@@ -771,12 +771,12 @@ mod tests {
         (dir, log, path)
     }
 
-    /// Test helper: len.
+    /// Test helper: number of entries currently in the log.
     fn len(log: &DecisionLog) -> usize {
         log.verify_or_empty().unwrap().len()
     }
 
-    /// Test helper: propose.
+    /// Test helper: synthetic high-risk approval request appended to the log.
     fn propose(log: &mut DecisionLog, now: u64, payload: serde_json::Value) -> ApprovalRequest {
         request(
             log,

@@ -5,12 +5,12 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-/// Test helper: bin.
+/// Test helper: path of the compiled agent binary under test.
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bookmarks-agent"))
 }
 
-/// Test helper: fixture.
+/// Test helper: filesystem path of the named demo data file.
 fn fixture(name: &str) -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/demo")
@@ -26,7 +26,7 @@ struct Setup {
 }
 
 impl Setup {
-    /// Test helper: new.
+    /// Test helper: isolated temp home and path for the decision log.
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -39,7 +39,7 @@ impl Setup {
         }
     }
 
-    /// Test helper: run.
+    /// Test helper: invoke the CLI with clean daemon env and paid switch.
     fn run(&self, args: &[&str], paid: bool) -> Output {
         let mut cmd = Command::new(bin());
         cmd.args(args)
@@ -64,12 +64,12 @@ impl Setup {
         cmd.output().expect("run bookmarks-agent")
     }
 
-    /// Test helper: log text.
+    /// Test helper: current decision log contents, empty when missing.
     fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// Test helper: log kinds.
+    /// Test helper: entry kinds parsed from the current decision log.
     fn log_kinds(&self) -> Vec<String> {
         self.log_text()
             .lines()
@@ -84,12 +84,12 @@ impl Setup {
     }
 }
 
-/// Test helper: stdout.
+/// Test helper: captured standard output decoded as UTF-8.
 fn stdout(out: &Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()
 }
 
-/// Test helper: stderr.
+/// Test helper: captured standard error decoded as UTF-8.
 fn stderr(out: &Output) -> String {
     String::from_utf8(out.stderr.clone()).unwrap()
 }

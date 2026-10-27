@@ -199,7 +199,7 @@ fn load_merged_from(
 mod tests {
     use super::*;
 
-    /// Test helper: bm.
+    /// Test helper: builds a bookmark with the given id and text.
     fn bm(id: &str, text: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -216,7 +216,7 @@ mod tests {
         }
     }
 
-    /// Test helper: labeled.
+    /// Test helper: marks a bookmark with a synthetic topic and confidence.
     fn labeled(
         mut b: Bookmark,
         method: Option<&str>,
@@ -492,7 +492,7 @@ mod tests {
         }
     }
 
-    /// Test helper: env lock.
+    /// Test helper: serializes tests that mutate process environment variables.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
         ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())

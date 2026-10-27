@@ -265,7 +265,7 @@ pub fn record(
 mod tests {
     use super::*;
 
-    /// Test helper: r.
+    /// Test helper: feedback record pairing a category with a verdict.
     fn r(cat: &str, v: Verdict) -> FeedbackRecord {
         FeedbackRecord {
             pick_id: format!("{cat}-{v:?}"),

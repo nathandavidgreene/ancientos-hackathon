@@ -733,35 +733,35 @@ mod tests {
     use serde_json::json;
 
     // Scanner-safe fakes, built at runtime (never literal secrets in source).
-    /// Test helper: aws id.
+    /// Test helper: fake AWS access key ID safe for source scanning.
     fn aws_id() -> String {
         format!("AKIA{}", "A".repeat(16))
     }
-    /// Test helper: aws secret.
+    /// Test helper: fake 40-character AWS secret key.
     fn aws_secret() -> String {
         "B".repeat(40)
     }
-    /// Test helper: ghp.
+    /// Test helper: fake GitHub token with the given prefix.
     fn ghp(prefix: &str) -> String {
         format!("{prefix}{}", "C".repeat(36))
     }
-    /// Test helper: slack.
+    /// Test helper: fake Slack token with the given prefix.
     fn slack(prefix: &str) -> String {
         format!("{prefix}{}", "D".repeat(24))
     }
-    /// Test helper: sk.
+    /// Test helper: fake OpenAI-style secret key.
     fn sk() -> String {
         format!("sk-{}", "E".repeat(32))
     }
-    /// Test helper: google.
+    /// Test helper: fake Google API key.
     fn google() -> String {
         format!("AIza{}", "F".repeat(35))
     }
-    /// Test helper: stripe.
+    /// Test helper: fake Stripe key with the given prefix.
     fn stripe(prefix: &str) -> String {
         format!("{prefix}{}", "G".repeat(24))
     }
-    /// Test helper: jwt.
+    /// Test helper: fake JWT-shaped token.
     fn jwt() -> String {
         format!(
             "eyJ{}.{}.{}",
@@ -770,11 +770,11 @@ mod tests {
             "k".repeat(10)
         )
     }
-    /// Test helper: bearer.
+    /// Test helper: synthetic Authorization header for auth-redaction tests.
     fn bearer() -> String {
         format!("Authorization: Bearer {}", "L".repeat(32))
     }
-    /// Test helper: pem.
+    /// Test helper: fake PEM-encoded RSA private key block.
     fn pem() -> String {
         format!(
             "-----BEGIN RSA PRIVATE KEY-----\n{}\n{}\n-----END RSA PRIVATE KEY-----",
@@ -783,7 +783,7 @@ mod tests {
         )
     }
 
-    /// Test helper: assert redacted.
+    /// Test helper: verifies the secret is replaced by its redaction marker.
     fn assert_redacted(input: &str, kind: Kind, secret_part: &str) {
         let r = redact_text(input);
         assert!(
@@ -799,7 +799,7 @@ mod tests {
         );
     }
 
-    /// Test helper: assert clean.
+    /// Test helper: verifies input passes through redaction unchanged.
     fn assert_clean(input: &str) {
         let r = redact_text(input);
         assert!(r.hits.is_empty(), "false hit on {input:?}: {:?}", r.hits);

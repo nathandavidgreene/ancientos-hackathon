@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-/// Test helper: bin.
+/// Test helper: path of the compiled agent binary under test.
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bookmarks-agent"))
 }
@@ -17,7 +17,7 @@ struct Setup {
 }
 
 impl Setup {
-    /// Test helper: new.
+    /// Test helper: isolated temp home with seeded two-post fixture.
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -40,7 +40,7 @@ impl Setup {
         }
     }
 
-    /// Test helper: run.
+    /// Test helper: invoke the CLI with isolated env and capture output.
     fn run(&self, args: &[&str]) -> Output {
         Command::new(bin())
             .args(args)
@@ -59,17 +59,17 @@ impl Setup {
             .expect("run bookmarks-agent")
     }
 
-    /// Test helper: stdout.
+    /// Test helper: captured standard output decoded as UTF-8.
     fn stdout(out: &Output) -> String {
         String::from_utf8(out.stdout.clone()).expect("stdout utf8")
     }
 
-    /// Test helper: stderr.
+    /// Test helper: captured standard error decoded as UTF-8.
     fn stderr(out: &Output) -> String {
         String::from_utf8(out.stderr.clone()).expect("stderr utf8")
     }
 
-    /// Test helper: log text.
+    /// Test helper: current decision log contents, empty when missing.
     fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }

@@ -391,7 +391,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// Test helper: bm.
+    /// Test helper: builds a bookmark with the given id, text, and language.
     fn bm(id: &str, text: &str, lang: Option<&str>) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -422,7 +422,7 @@ mod tests {
     }
 
     impl Mock {
-        /// Test helper: ok.
+        /// Test helper: builds a mock client returning the given reply.
         fn ok(dest: ancientos_router::Destination, reply: &str) -> Self {
             Self {
                 dest,
@@ -431,7 +431,7 @@ mod tests {
             }
         }
 
-        /// Test helper: err.
+        /// Test helper: builds a mock client that always fails.
         fn err(dest: ancientos_router::Destination) -> Self {
             Self {
                 dest,
@@ -440,19 +440,19 @@ mod tests {
             }
         }
 
-        /// Test helper: calls.
+        /// Test helper: returns how many prompts the mock has seen.
         fn calls(&self) -> usize {
             self.seen.borrow().len()
         }
     }
 
     impl ancientos_router::ModelClient for Mock {
-        /// Test helper: destination.
+        /// Test helper: returns which route the mock client claims.
         fn destination(&self) -> ancientos_router::Destination {
             self.dest
         }
 
-        /// Test helper: complete.
+        /// Test helper: records the prompt and replays the mock reply.
         fn complete(&self, prompt: &str) -> Result<String, ancientos_router::RouterError> {
             self.seen.borrow_mut().push(prompt.to_string());
             match self.reply.as_ref().expect("mock reply") {
@@ -464,12 +464,12 @@ mod tests {
         }
     }
 
-    /// Test helper: muse mock.
+    /// Test helper: builds a mock Muse client returning the given reply.
     fn muse_mock(reply: &str) -> Mock {
         Mock::ok(ancientos_router::Destination::MuseSpark, reply)
     }
 
-    /// Test helper: local mock.
+    /// Test helper: builds a mock local-LLM client returning the given reply.
     fn local_mock(reply: &str) -> Mock {
         Mock::ok(ancientos_router::Destination::LocalLlama, reply)
     }

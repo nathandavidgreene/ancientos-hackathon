@@ -123,7 +123,7 @@ impl MuseClient {
         &self.model
     }
 
-    /// Base URL.
+    /// Configured API host for chat-completions requests.
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -371,7 +371,7 @@ mod tests {
         crate::test_env_lock()
     }
 
-    /// Test helper: test client.
+    /// Test helper: Muse client pointed at an unreachable address.
     fn test_client(allow_paid: bool) -> MuseClient {
         MuseClient::new("test-model", "http://127.0.0.1:9", 16, allow_paid)
     }
@@ -651,7 +651,7 @@ mod tests {
     }
 
     impl EnvGuard {
-        /// Test helper: set.
+        /// Test helper: sets one env var while saving its prior value.
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let saved = std::env::var(key).ok();
             match value {
@@ -663,7 +663,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
-        /// Test helper: drop.
+        /// Test helper: restores the saved env var on drop.
         fn drop(&mut self) {
             match self.saved.take() {
                 Some(v) => std::env::set_var(self.key, v),
@@ -755,7 +755,7 @@ mod tests {
         (url, hits, handle)
     }
 
-    /// Test helper: chat ok body.
+    /// Test helper: minimal successful chat-completions JSON payload.
     fn chat_ok_body() -> String {
         serde_json::json!({
             "model": "muse-spark-1.3",

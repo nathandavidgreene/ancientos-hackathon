@@ -1,4 +1,8 @@
-//! X bookmarks agent: read-only OAuth2 PKCE, incremental ingest, JSONL fixtures.
+//! X bookmarks agent, the first app on the AncientOS core: read-only X
+//! sign-in and incremental sync (never deletes bookmarks), a daily brief of
+//! 3-5 picks, votes and feedback, a personal ranker, the try-it cascade,
+//! go-deeper walkthroughs, idea cards, the wiki, and the scheduler daemon.
+//! Risky actions go through [`app_gate`] and the core approvals queue.
 pub mod author_filter;
 pub mod brief;
 pub mod callback;
@@ -99,7 +103,7 @@ mod tests {
     const AGENT: &str = "bookmarks-agent";
     const NOW: u64 = 1_700_000_000;
 
-    /// Test helper: p.
+    /// Test helper: minimal proposal for the given action.
     fn p(action: &str) -> Proposal {
         Proposal {
             agent: "t".into(),

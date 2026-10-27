@@ -275,7 +275,7 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
-    /// Test helper: card.
+    /// Test helper: synthetic idea card with the given status and dates.
     fn card(id: &str, status: Status, created_at: u64, park_until: Option<u64>) -> IdeaCard {
         IdeaCard {
             id: id.into(),
@@ -289,7 +289,7 @@ mod tests {
         }
     }
 
-    /// Test helper: digest entries.
+    /// Test helper: decision-log entries with digests at the given times.
     fn digest_entries(lasts: &[u64]) -> Vec<Entry> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.jsonl");
@@ -305,7 +305,7 @@ mod tests {
         DecisionLog::open(&path).unwrap().verify().unwrap()
     }
 
-    /// Test helper: shown entries.
+    /// Test helper: log entries for shown posts and resolved followups.
     fn shown_entries(shown: &[(&str, Option<u64>)], resolved: &[&str]) -> Vec<Entry> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.jsonl");
@@ -327,7 +327,7 @@ mod tests {
         DecisionLog::open(&path).unwrap().verify().unwrap()
     }
 
-    /// Test helper: pending of.
+    /// Test helper: pending followups derived from the given entries.
     fn pending_of(entries: &[Entry]) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.jsonl");
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(d.nudges[0].post_id, "p1");
     }
 
-    /// Test helper: stored post.
+    /// Test helper: synthetic stored post with the given text and language.
     fn stored_post(id: &str, text: &str, lang: Option<&str>) -> crate::fixture::Bookmark {
         crate::fixture::Bookmark {
             post_id: id.into(),
@@ -576,14 +576,14 @@ mod tests {
         }
     }
 
-    /// Test helper: sourced card.
+    /// Test helper: idea card linked to the given post id.
     fn sourced_card(id: &str, post_id: &str) -> IdeaCard {
         let mut c = card(id, Status::New, 1, None);
         c.source_url = format!("https://x.com/i/status/{post_id}");
         c
     }
 
-    /// Test helper: authored post.
+    /// Test helper: synthetic English post with the given author.
     fn authored_post(id: &str, author: Option<&str>) -> crate::fixture::Bookmark {
         crate::fixture::Bookmark {
             post_id: id.into(),
@@ -600,7 +600,7 @@ mod tests {
         }
     }
 
-    /// Test helper: feedback entries.
+    /// Test helper: log entries for hide and unhide author feedback.
     fn feedback_entries(hides: &[&str], unhides: &[&str]) -> Vec<Entry> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.jsonl");

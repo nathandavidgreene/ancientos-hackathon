@@ -311,7 +311,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// Test helper: bm.
+    /// Test helper: synthetic bookmark with the given id.
     fn bm(id: &str) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -328,7 +328,7 @@ mod tests {
         }
     }
 
-    /// Test helper: mock lookup.
+    /// Test helper: stub lookup recording batches and serving canned statuses.
     fn mock_lookup(
         map: HashMap<String, PostLiveness>,
         calls: &RefCell<Vec<Vec<String>>>,
@@ -346,7 +346,7 @@ mod tests {
         }
     }
 
-    /// Test helper: cached status.
+    /// Test helper: cached status triple stored for the given id.
     fn cached_status(cache_path: &Path, id: &str) -> Option<(String, Option<String>, u64)> {
         load_cache(cache_path)
             .get(id)

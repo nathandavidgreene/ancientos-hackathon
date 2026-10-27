@@ -191,7 +191,7 @@ impl State {
         self.data_dir.join("backlog.md")
     }
 
-    /// Liveness cache path.
+    /// File holding cached liveness-check results in the data dir.
     pub fn liveness_cache_path(&self) -> PathBuf {
         self.data_dir
             .join(bookmarks_agent::liveness::CACHE_FILE_NAME)
@@ -375,7 +375,7 @@ fn layout(title: &str, body: &str, state: &State) -> String {
     )
 }
 
-/// Error page.
+/// Titled error message wrapped in the site layout.
 fn error_page(title: &str, msg: &str, state: &State) -> String {
     layout(
         title,
@@ -2001,7 +2001,7 @@ pub fn serve(listener: std::net::TcpListener, state: &State, max_connections: Op
 mod tests {
     use super::*;
 
-    /// Test helper: bookmark.
+    /// Test helper: English bookmark row JSON for the given id and text.
     fn bookmark(
         id: &str,
         text: &str,
@@ -2036,12 +2036,12 @@ mod tests {
         )
     }
 
-    /// Test helper: photo.
+    /// Test helper: photo media entry pointing at the given URL.
     fn photo(url: &str) -> serde_json::Value {
         serde_json::json!({"type": "photo", "url": url, "alt_text": "synthetic chart"})
     }
 
-    /// Test helper: video.
+    /// Test helper: video media entry with preview and MP4 URLs.
     fn video(preview: &str, mp4: &str) -> serde_json::Value {
         serde_json::json!({"type": "video", "preview_image_url": preview, "video_url": mp4})
     }
@@ -2076,7 +2076,7 @@ mod tests {
         (dir, state)
     }
 
-    /// Test helper: log entries.
+    /// Test helper: verified decision-log entries for the given state.
     fn log_entries(state: &State) -> Vec<ancientos_core::log::Entry> {
         ancientos_core::log::DecisionLog::open(state.log_path())
             .unwrap()
@@ -2853,7 +2853,7 @@ mod tests {
         assert!(!form.contains_key("flag"));
     }
 
-    /// Test helper: http roundtrip.
+    /// Test helper: raw request sent to the test server, response as text.
     fn http_roundtrip(addr: &std::net::SocketAddr, raw: &str) -> String {
         use std::io::{Read, Write};
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
@@ -3147,7 +3147,7 @@ mod tests {
     }
 
     impl PaidGuard {
-        /// Test helper: capture.
+        /// Test helper: held env lock plus snapshot of paid-related vars.
         fn capture() -> (
             std::sync::MutexGuard<'static, ()>,
             Vec<(&'static str, Option<String>)>,
@@ -3165,7 +3165,7 @@ mod tests {
             (lock, saved)
         }
 
-        /// Test helper: paid on.
+        /// Test helper: guard enabling paid mode with network vars cleared.
         fn paid_on() -> Self {
             let (lock, saved) = Self::capture();
             std::env::set_var("ANCIENTOS_ALLOW_PAID", "1");
@@ -3176,7 +3176,7 @@ mod tests {
             Self { _lock: lock, saved }
         }
 
-        /// Test helper: paid off.
+        /// Test helper: guard disabling paid mode and clearing related vars.
         fn paid_off() -> Self {
             let (lock, saved) = Self::capture();
             std::env::remove_var("ANCIENTOS_ALLOW_PAID");
@@ -3188,7 +3188,7 @@ mod tests {
     }
 
     impl Drop for PaidGuard {
-        /// Test helper: drop.
+        /// Test helper: restores saved environment variables.
         fn drop(&mut self) {
             for (key, value) in self.saved.drain(..) {
                 match value {
@@ -3199,7 +3199,7 @@ mod tests {
         }
     }
 
-    /// Test helper: seed cache.
+    /// Test helper: writes given liveness statuses into the cache file.
     fn seed_cache(dir: &Path, entries: &[(&str, &str, Option<&str>, u64)]) {
         let mut map = serde_json::Map::new();
         for (id, status, reason, checked_at) in entries {

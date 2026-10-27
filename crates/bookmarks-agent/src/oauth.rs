@@ -189,7 +189,7 @@ fn map_ureq_error(e: ureq::Error) -> OAuthError {
 mod tests {
     use super::*;
 
-    /// Test helper: is verifier char.
+    /// Test helper: whether a char is valid in a PKCE verifier.
     fn is_verifier_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~')
     }

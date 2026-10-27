@@ -110,7 +110,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Test helper: client.
+    /// Test helper: Modal client backed by fixed pairs.
     fn client(pairs: &[(&str, &str)]) -> ModalLlamaClient {
         let m: HashMap<String, String> = pairs
             .iter()

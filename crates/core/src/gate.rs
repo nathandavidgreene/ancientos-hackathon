@@ -54,7 +54,7 @@ impl Gate {
 mod tests {
     use super::*;
 
-    /// Test helper: p.
+    /// Test helper: minimal proposal for the given action.
     fn p(action: &str) -> Proposal {
         Proposal {
             agent: "t".into(),

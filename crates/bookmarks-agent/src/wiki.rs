@@ -2405,7 +2405,7 @@ mod tests {
     const DATE: &str = "2026-10-27";
     const NOW: u64 = 1_793_577_600;
 
-    /// Test helper: setup.
+    /// Test helper: creates temp wiki and log paths for ingest tests.
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let wiki = dir.path().join(WIKI_DIR_NAME);
@@ -2413,7 +2413,7 @@ mod tests {
         (dir, wiki, log)
     }
 
-    /// Test helper: public input.
+    /// Test helper: builds synthetic public post content for a post id.
     fn public_input(post_id: &str) -> IngestInput {
         IngestInput {
             post_id: post_id.to_string(),
@@ -2429,7 +2429,7 @@ mod tests {
         }
     }
 
-    /// Test helper: card.
+    /// Test helper: builds an idea card with the given mappings.
     fn card(id: &str, post_id: &str, idea: &str, mapping: &[&str]) -> crate::idea_card::IdeaCard {
         crate::idea_card::IdeaCard {
             id: id.to_string(),
@@ -2443,7 +2443,7 @@ mod tests {
         }
     }
 
-    /// Test helper: ctx.
+    /// Test helper: builds an ingest context over temp wiki and log paths.
     fn ctx<'a>(wiki: &'a Path, log: &'a Path, allow_paid: bool) -> IngestCtx<'a> {
         IngestCtx {
             wiki,
@@ -2930,7 +2930,7 @@ mod tests {
         std::fs::write(pages.join(format!("{slug}.md")), md).unwrap();
     }
 
-    /// Test helper: seed raw.
+    /// Test helper: writes a synthetic raw source entry for an id.
     fn seed_raw(wiki: &Path, id: &str) {
         write_raw(
             wiki,

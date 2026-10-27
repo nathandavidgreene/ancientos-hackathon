@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Test helper: bin.
+/// Test helper: path of the compiled agent binary under test.
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bookmarks-agent"))
 }
@@ -33,17 +33,17 @@ fn run(args: &[&str], log_path: &Path, muse_path: &Path) -> Output {
         .expect("run bookmarks-agent")
 }
 
-/// Test helper: stdout.
+/// Test helper: captured standard output decoded as UTF-8.
 fn stdout(out: &Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()
 }
 
-/// Test helper: stderr.
+/// Test helper: captured standard error decoded as UTF-8.
 fn stderr(out: &Output) -> String {
     String::from_utf8(out.stderr.clone()).unwrap()
 }
 
-/// Test helper: setup.
+/// Test helper: temp dir with decision-log and muse-log paths.
 fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("decision_log.jsonl");

@@ -511,7 +511,7 @@ fn run(args: &Args) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// Test helper: argv.
+    /// Test helper: collect argv words into owned strings.
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
     }
@@ -670,7 +670,7 @@ mod tests {
     }
 
     impl EnvGuard {
-        /// Test helper: set.
+        /// Test helper: set an env var, saving the prior value for restore.
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let saved = std::env::var(key).ok();
             match value {
@@ -682,7 +682,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
-        /// Test helper: drop.
+        /// Test helper: restore the saved env var value on scope exit.
         fn drop(&mut self) {
             match self.saved.take() {
                 Some(v) => std::env::set_var(self.key, v),

@@ -79,7 +79,7 @@ pub struct ModelReply {
 pub trait BriefModel {
     /// Model id reported in the brief footer and decision log.
     fn model_id(&self) -> String;
-    /// Test helper: call.
+    /// Sends the brief prompt under the given data class and returns the model reply.
     fn call(
         &self,
         class: ancientos_router::data_class::DataClass,
@@ -98,12 +98,12 @@ pub type ThreadExpander<'a> =
     dyn Fn(&str) -> Result<Option<Vec<crate::unroll::ThreadPost>>, String> + 'a;
 
 impl BriefModel for MuseClient {
-    /// Test helper: model id.
+    /// Returns the underlying Muse client's model name.
     fn model_id(&self) -> String {
         self.model().to_string()
     }
 
-    /// Test helper: call.
+    /// Sends the brief prompt through Muse and returns the parsed reply.
     fn call(
         &self,
         class: ancientos_router::data_class::DataClass,
@@ -1057,7 +1057,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// Test helper: bm.
+    /// Test helper: builds a bookmark with optional topic label and confidence.
     fn bm(id: &str, created: Option<&str>, topic: Option<&str>, conf: Option<f64>) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -1081,7 +1081,7 @@ mod tests {
         }
     }
 
-    /// Test helper: merged of.
+    /// Test helper: wraps rows and live ids in a merge output.
     fn merged_of(rows: Vec<Bookmark>, live_ids: &[&str]) -> MergeOutput {
         let counts = MergeCounts {
             live: live_ids.len(),
@@ -1105,7 +1105,7 @@ mod tests {
     }
 
     impl FakeModel {
-        /// Test helper: ok.
+        /// Test helper: builds a fake model returning the given content.
         fn ok(content: &str) -> Self {
             Self {
                 content: Some(content.into()),
@@ -1119,7 +1119,7 @@ mod tests {
             }
         }
 
-        /// Test helper: failing.
+        /// Test helper: builds a fake model whose calls always fail.
         fn failing() -> Self {
             Self {
                 content: None,
@@ -1131,12 +1131,12 @@ mod tests {
     }
 
     impl BriefModel for FakeModel {
-        /// Test helper: model id.
+        /// Test helper: returns the fake model's configured name.
         fn model_id(&self) -> String {
             self.model.clone()
         }
 
-        /// Test helper: call.
+        /// Test helper: records the prompt and replays the fake reply.
         fn call(
             &self,
             _class: ancientos_router::data_class::DataClass,
@@ -1447,11 +1447,11 @@ mod tests {
             seen: RefCell<Vec<String>>,
         }
         impl BriefModel for EnforcingModel {
-            /// Test helper: model id.
+            /// Test helper: returns the enforcing model's fixed name.
             fn model_id(&self) -> String {
                 "enforcing".to_string()
             }
-            /// Test helper: call.
+            /// Test helper: enforces egress, records the prompt, returns a fixed pick.
             fn call(&self, class: DataClass, prompt: &str) -> Result<ModelReply, RouterError> {
                 check_egress(class, Route::MuseSpark, "test", None)?;
                 self.seen.borrow_mut().push(prompt.to_string());
@@ -1921,7 +1921,7 @@ mod tests {
         assert_eq!(res.picks[0].full_text, "synthetic HYDRATED-ONLY full text");
     }
 
-    /// Test helper: seed hidden.
+    /// Test helper: records never-post feedback hiding a post id.
     fn seed_hidden(log_path: &Path, post_id: &str) {
         use crate::feedback::{record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict};
         let mut log = DecisionLog::open(log_path).unwrap();
@@ -1969,7 +1969,7 @@ mod tests {
         assert_eq!(cands.payload["count"], 3);
     }
 
-    /// Test helper: seed author hide.
+    /// Test helper: records author hide or unhide feedback for a username.
     fn seed_author_hide(log_path: &Path, username: &str, hide: bool) {
         use crate::feedback::{record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict};
         let mut log = DecisionLog::open(log_path).unwrap();
@@ -1990,7 +1990,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Test helper: bm authored.
+    /// Test helper: builds a bookmark with the given author.
     fn bm_authored(id: &str, author: Option<&str>) -> Bookmark {
         let mut b = bm(id, None, Some("TopicA"), Some(0.9));
         b.author_username = author.map(str::to_string);
@@ -2081,7 +2081,7 @@ mod tests {
         assert!(err.contains("no bookmarks to brief"), "{err}");
     }
 
-    /// Test helper: thread post.
+    /// Test helper: builds a synthetic post in conversation id0.
     fn thread_post(id: &str, text: &str) -> crate::unroll::ThreadPost {
         crate::unroll::ThreadPost {
             id: id.into(),

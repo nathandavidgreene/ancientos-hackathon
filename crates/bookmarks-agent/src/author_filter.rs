@@ -80,7 +80,7 @@ pub fn source_post_is_hidden(
 mod tests {
     use super::*;
 
-    /// Test helper: bm.
+    /// Test helper: synthetic bookmark with the given author.
     fn bm(id: &str, author: Option<&str>) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -97,7 +97,7 @@ mod tests {
         }
     }
 
-    /// Test helper: hidden of.
+    /// Test helper: normalized hidden-author set from the given names.
     fn hidden_of(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|n| normalize(n)).collect()
     }

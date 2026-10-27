@@ -145,7 +145,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Test helper: post.
+    /// Test helper: thread post with reply linkage and optional timestamp.
     fn post(id: &str, author: &str, reply_to: Option<&str>, created: Option<&str>) -> ThreadPost {
         ThreadPost {
             id: id.into(),
@@ -165,7 +165,7 @@ mod tests {
         }
     }
 
-    /// Test helper: ids.
+    /// Test helper: post ids in chain order for compact assertions.
     fn ids(chain: &[ThreadPost]) -> Vec<&str> {
         chain.iter().map(|p| p.id.as_str()).collect()
     }

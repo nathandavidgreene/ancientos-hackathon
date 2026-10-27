@@ -1722,7 +1722,7 @@ mod tests {
     use super::*;
     use crate::fixture::Label;
 
-    /// Test helper: bm.
+    /// Test helper: synthetic bookmark with the given id, text, and topic.
     fn bm(id: &str, text: &str, topic: Option<&str>) -> Bookmark {
         Bookmark {
             post_id: id.into(),
@@ -1746,7 +1746,7 @@ mod tests {
         }
     }
 
-    /// Test helper: demo fixture.
+    /// Test helper: loads the demo try-it bookmarks fixture.
     fn demo_fixture() -> Vec<Bookmark> {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2114,12 +2114,12 @@ mod tests {
     struct FailingModel;
 
     impl crate::brief::BriefModel for FailingModel {
-        /// Test helper: model id.
+        /// Test helper: fixed id for the failing stub model.
         fn model_id(&self) -> String {
             "test-failing".to_string()
         }
 
-        /// Test helper: call.
+        /// Test helper: always fails with paid calls disabled.
         fn call(
             &self,
             _class: ancientos_router::data_class::DataClass,

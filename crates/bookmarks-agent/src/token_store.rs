@@ -178,13 +178,13 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
-    /// Test helper: env lock.
+    /// Test helper: process-wide guard serializing env-mutating tests.
     fn env_lock() -> MutexGuard<'static, ()> {
         static ENV_MUTEX: Mutex<()> = Mutex::new(());
         ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Test helper: sample.
+    /// Test helper: stored tokens with fixed placeholder credentials.
     fn sample() -> StoredTokens {
         StoredTokens::new(
             "access-123".into(),

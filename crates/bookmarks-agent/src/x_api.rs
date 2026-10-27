@@ -854,12 +854,12 @@ impl BookmarkSource for XApiSource {
 mod tests {
     use super::*;
 
-    /// Test helper: env lock.
+    /// Test helper: serializes tests that mutate process env vars.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::lock_env()
     }
 
-    /// Test helper: tokens.
+    /// Test helper: stub OAuth tokens expiring far in the future.
     fn tokens() -> StoredTokens {
         StoredTokens::new(
             "access".into(),

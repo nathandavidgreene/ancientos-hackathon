@@ -200,7 +200,7 @@ fn read_all(stream: &std::net::TcpStream) -> String {
 mod tests {
     use super::*;
 
-    /// Test helper: req.
+    /// Test helper: builds a raw HTTP GET request for a target.
     fn req(target: &str) -> String {
         format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
     }

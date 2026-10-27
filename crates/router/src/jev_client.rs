@@ -176,7 +176,7 @@ impl JevClient {
         self.backend
     }
 
-    /// Base URL.
+    /// Server address requests are sent to.
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -452,7 +452,7 @@ mod tests {
     }
 
     impl EnvGuard {
-        /// Test helper: set.
+        /// Test helper: applies env vars, saving prior values.
         fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
             let mut saved = Vec::with_capacity(pairs.len());
             for (key, value) in pairs {
@@ -467,7 +467,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
-        /// Test helper: drop.
+        /// Test helper: restores saved environment values.
         fn drop(&mut self) {
             for (key, value) in self.saved.drain(..) {
                 match value {
@@ -572,17 +572,17 @@ mod tests {
 
     const OK_BODY: &str = r#"{"model":"jev-1.14.0","answers":{"q":{"type":"noul","noul":0.9}},"usage":{"input_tokens":304,"output_tokens":21}}"#;
 
-    /// Test helper: qs.
+    /// Test helper: minimal noul question payload.
     fn qs() -> serde_json::Value {
         serde_json::json!({"q": {"type": "noul", "instructions": "yes?"}})
     }
 
-    /// Test helper: typesafe client.
+    /// Test helper: TypeSafe client pointed at a mock server.
     fn typesafe_client(base_url: String, allow_paid: bool) -> JevClient {
         JevClient::new(JevBackend::TypeSafe, base_url, "test-jevo", allow_paid)
     }
 
-    /// Test helper: localjev client.
+    /// Test helper: unpaid local client pointed at a mock server.
     fn localjev_client(base_url: String) -> JevClient {
         // allow_paid=false on purpose: localjev must never be paid-gated.
         JevClient::new(JevBackend::LocalJev, base_url, "test-localjev", false)

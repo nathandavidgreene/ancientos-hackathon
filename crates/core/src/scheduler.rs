@@ -52,15 +52,15 @@ mod tests {
 
     struct Counter(u32);
     impl Agent for Counter {
-        /// Test helper: name.
+        /// Test helper: fixed name identifying the counting test agent.
         fn name(&self) -> &str {
             "counter"
         }
-        /// Test helper: interval.
+        /// Test helper: one-minute tick cadence for the test agent.
         fn interval(&self) -> Duration {
             Duration::from_secs(60)
         }
-        /// Test helper: tick.
+        /// Test helper: increments the test counter and reports success.
         fn tick(&mut self) -> Result<(), String> {
             self.0 += 1;
             Ok(())

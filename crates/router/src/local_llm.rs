@@ -136,7 +136,7 @@ impl LocalLlmClient {
 }
 
 impl ModelClient for LocalLlmClient {
-    /// Test helper: destination.
+    /// Routing target identifying the local LLM backend.
     fn destination(&self) -> Destination {
         Destination::LocalLlama
     }
@@ -544,11 +544,11 @@ mod tests {
             seen: RefCell<Vec<String>>,
         }
         impl ModelClient for Recorder {
-            /// Test helper: destination.
+            /// Test helper: backend configured on the recording stub.
             fn destination(&self) -> Destination {
                 self.dest
             }
-            /// Test helper: complete.
+            /// Test helper: records the prompt and replies with canned text.
             fn complete(&self, p: &str) -> Result<String, RouterError> {
                 self.seen.borrow_mut().push(p.into());
                 Ok("muse reply".into())
