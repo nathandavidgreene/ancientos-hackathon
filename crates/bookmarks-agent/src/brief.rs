@@ -1392,6 +1392,7 @@ mod tests {
                 video_url: None,
                 alt_text: Some("synthetic alt".into()),
                 caption_url: None,
+                transcription_url: None,
             }],
             translation: None,
         };
