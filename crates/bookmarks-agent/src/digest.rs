@@ -179,12 +179,12 @@ pub fn weekly_digest(
 /// Hidden authors from the `feedback` entries in `entries`
 /// (malformed payloads are ignored: they prove no hide).
 fn hidden_authors_from_entries(entries: &[Entry]) -> BTreeSet<String> {
-    let records: Vec<ancientos_core::feedback::FeedbackRecord> = entries
+    let records: Vec<crate::feedback::FeedbackRecord> = entries
         .iter()
-        .filter(|e| e.kind == ancientos_core::feedback::FEEDBACK_KIND)
+        .filter(|e| e.kind == crate::feedback::FEEDBACK_KIND)
         .filter_map(|e| serde_json::from_value(e.payload.clone()).ok())
         .collect();
-    ancientos_core::feedback::hidden_authors(&records)
+    crate::feedback::hidden_authors(&records)
 }
 
 /// Assemble the digest like [`weekly_digest`], skipping cards and nudges
@@ -599,7 +599,7 @@ mod tests {
         let mut log = DecisionLog::open(&path).unwrap();
         for name in hides {
             log.append(
-                ancientos_core::feedback::FEEDBACK_KIND,
+                crate::feedback::FEEDBACK_KIND,
                 serde_json::json!({
                     "pick_id": name,
                     "category": "unknown",
@@ -610,7 +610,7 @@ mod tests {
         }
         for name in unhides {
             log.append(
-                ancientos_core::feedback::FEEDBACK_KIND,
+                crate::feedback::FEEDBACK_KIND,
                 serde_json::json!({
                     "pick_id": name,
                     "category": "unknown",
@@ -621,7 +621,7 @@ mod tests {
         }
         // Malformed feedback proves no hide and never breaks the digest.
         log.append(
-            ancientos_core::feedback::FEEDBACK_KIND,
+            crate::feedback::FEEDBACK_KIND,
             serde_json::json!({"pick_id": 42}),
         )
         .unwrap();

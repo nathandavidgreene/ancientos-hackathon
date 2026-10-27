@@ -1975,7 +1975,7 @@ mod tests {
         assert_eq!(input, crate::sanitize::sanitize_uncapped(PRIVATE_TEXT));
         assert!(!input.contains("quokka@example.invalid"), "{input}");
         assert!(!input.contains("MarkerSnippet"), "{input}");
-        let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
+        let paid_prompt = crate::try_it_cascade::muse_prompt(&input);
         assert!(!paid_prompt.contains("MarkerSnippet"), "{paid_prompt}");
         assert!(
             !paid_prompt.contains("quokka@example.invalid"),
@@ -1989,7 +1989,7 @@ mod tests {
         assert!(will_append(&e));
         let input = cascade_input(SANITIZED_TEXT, &e);
         assert!(input.contains("MarkerSnippet"), "{input}");
-        let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
+        let paid_prompt = crate::try_it_cascade::muse_prompt(&input);
         assert!(paid_prompt.contains("MarkerSnippet"), "{paid_prompt}");
     }
 
@@ -2021,7 +2021,7 @@ mod tests {
         assert!(input.contains("MarkerSnippet"), "{input}");
         assert!(input.contains("Linked/Media context:"), "{input}");
         // The hosted prompt carries sanitized text only: no raw URL, no handle.
-        let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
+        let paid_prompt = crate::try_it_cascade::muse_prompt(&input);
         assert!(paid_prompt.contains("MarkerSnippet"), "{paid_prompt}");
         assert!(
             !paid_prompt.contains("https://t.co/abc123"),
@@ -2370,7 +2370,7 @@ mod tests {
         assert!(cache.contains_key(&crate::translate::sha256_hex(&format!("{base}/good"))));
         let input = cascade_input(SANITIZED_TEXT, &e);
         assert!(!input.contains("Cloudflare"), "{input}");
-        let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
+        let paid_prompt = crate::try_it_cascade::muse_prompt(&input);
         assert!(!paid_prompt.contains("Cloudflare"), "{paid_prompt}");
         // 3 direct fetches plus the enrich run's cf and good fetches.
         assert_eq!(hits_of(&hits), 5);

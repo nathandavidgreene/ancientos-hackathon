@@ -5,9 +5,9 @@
 //! most; when paid calls are disabled or the call fails, a deterministic
 //! local fallback picks instead. Every pick passes the approval gate and the
 //! candidate list, model call, and picks are appended to the decision log.
+use crate::feedback;
 use crate::fixture::Bookmark;
 use crate::merge::{MergeCounts, MergeOutput};
-use ancientos_core::feedback;
 use ancientos_core::gate::{Gate, Proposal, Risk, Verdict};
 use ancientos_core::log::DecisionLog;
 use ancientos_router::muse::{MuseClient, MuseUsage};
@@ -1901,9 +1901,7 @@ mod tests {
     }
 
     fn seed_hidden(log_path: &Path, post_id: &str) {
-        use ancientos_core::feedback::{
-            record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict,
-        };
+        use crate::feedback::{record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict};
         let mut log = DecisionLog::open(log_path).unwrap();
         record(
             &mut log,
@@ -1950,9 +1948,7 @@ mod tests {
     }
 
     fn seed_author_hide(log_path: &Path, username: &str, hide: bool) {
-        use ancientos_core::feedback::{
-            record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict,
-        };
+        use crate::feedback::{record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict};
         let mut log = DecisionLog::open(log_path).unwrap();
         record(
             &mut log,

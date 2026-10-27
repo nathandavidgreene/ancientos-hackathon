@@ -573,10 +573,10 @@ fn hidden_authors_of(state: &State) -> BTreeSet<String> {
     let Ok(log) = ancientos_core::log::DecisionLog::open(state.log_path()) else {
         return BTreeSet::new();
     };
-    let Ok(records) = ancientos_core::feedback::records_from_log(&log) else {
+    let Ok(records) = bookmarks_agent::feedback::records_from_log(&log) else {
         return BTreeSet::new();
     };
-    ancientos_core::feedback::hidden_authors(&records)
+    bookmarks_agent::feedback::hidden_authors(&records)
 }
 
 /// Surfaced posts minus hidden authors (silent, in-memory, per request).
@@ -705,7 +705,7 @@ fn do_vote(state: &State, body: &[u8]) -> Response {
     if post_id.trim().is_empty() {
         return Response::status(400, error_page("Bad vote", "Missing post_id.", state));
     }
-    let verdict: ancientos_core::feedback::Verdict = match form
+    let verdict: bookmarks_agent::feedback::Verdict = match form
         .get("verdict")
         .map(String::as_str)
         .unwrap_or("")
@@ -940,14 +940,14 @@ fn page_hidden_authors(state: &State) -> Response {
                 error_page("Hidden authors failed", &e.to_string(), state),
             )
         }
-        Ok(log) => match ancientos_core::feedback::records_from_log(&log) {
+        Ok(log) => match bookmarks_agent::feedback::records_from_log(&log) {
             Err(e) => {
                 return Response::status(
                     500,
                     error_page("Hidden authors failed", &e.to_string(), state),
                 );
             }
-            Ok(records) => ancientos_core::feedback::hidden_authors(&records),
+            Ok(records) => bookmarks_agent::feedback::hidden_authors(&records),
         },
     };
     let mut body = String::from("<h1>Hidden authors</h1>");
@@ -2067,18 +2067,18 @@ mod tests {
         assert!(resp.body.contains("action=\"/vote\""), "{}", resp.body);
     }
 
-    fn seed_feedback(state: &State, votes: &[(&str, &str, ancientos_core::feedback::Verdict)]) {
+    fn seed_feedback(state: &State, votes: &[(&str, &str, bookmarks_agent::feedback::Verdict)]) {
         let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
         for (id, cat, verdict) in votes {
-            ancientos_core::feedback::record(
+            bookmarks_agent::feedback::record(
                 &mut log,
-                ancientos_core::feedback::FeedbackRecord {
+                bookmarks_agent::feedback::FeedbackRecord {
                     pick_id: (*id).to_string(),
                     category: (*cat).to_string(),
                     verdict: *verdict,
                     tags: Vec::new(),
                 },
-                ancientos_core::feedback::ThresholdPolicy::default(),
+                bookmarks_agent::feedback::ThresholdPolicy::default(),
             )
             .unwrap();
         }
@@ -2086,7 +2086,7 @@ mod tests {
 
     #[test]
     fn brief_shows_why_this_is_here_with_reasons_when_ranker_active() {
-        use ancientos_core::feedback::Verdict;
+        use bookmarks_agent::feedback::Verdict;
         let (_dir, state) = test_state();
         // Enough resolving votes to activate whatever the env minimum is.
         let min = bookmarks_agent::ranker::min_records_from_env().max(1);
@@ -3758,8 +3758,8 @@ mod tests {
     /// (one auto-approved category), every approval state, try-it funnel,
     /// cascade stages, daemon ticks and deeper jobs. Returns the seed `now`.
     fn seed_stats_log(state: &State) -> u64 {
-        use ancientos_core::feedback::{FeedbackRecord, ThresholdPolicy, Verdict};
         use ancientos_core::log::DecisionLog;
+        use bookmarks_agent::feedback::{FeedbackRecord, ThresholdPolicy, Verdict};
         let now = now_secs();
         seed_all_approval_states(now, &state.log_path());
         let mut log = DecisionLog::open(state.log_path()).unwrap();
@@ -3769,7 +3769,7 @@ mod tests {
             ("s3", "Synthetic Rust", Verdict::Approve),
             ("s4", "Synthetic Cooking", Verdict::Skip),
         ] {
-            ancientos_core::feedback::record(
+            bookmarks_agent::feedback::record(
                 &mut log,
                 FeedbackRecord {
                     pick_id: id.to_string(),
@@ -3937,12 +3937,12 @@ mod tests {
                 (
                     "p1",
                     "Synthetic Rust",
-                    ancientos_core::feedback::Verdict::Approve,
+                    bookmarks_agent::feedback::Verdict::Approve,
                 ),
                 (
                     "p2",
                     "Synthetic Rust",
-                    ancientos_core::feedback::Verdict::Skip,
+                    bookmarks_agent::feedback::Verdict::Skip,
                 ),
             ],
         );
@@ -3978,7 +3978,7 @@ mod tests {
             &[(
                 "p1",
                 "<script>alert('x')</script>",
-                ancientos_core::feedback::Verdict::Approve,
+                bookmarks_agent::feedback::Verdict::Approve,
             )],
         );
         let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();

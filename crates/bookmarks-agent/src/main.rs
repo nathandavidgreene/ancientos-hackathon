@@ -252,9 +252,9 @@ fn cmd_rank(args: &[String]) -> Result<(), String> {
     }
     let log_path = brief::decision_log_path()?;
     let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
-    let records = ancientos_core::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
-    let hidden_posts = ancientos_core::feedback::hidden_posts(&records);
-    let hidden_authors = ancientos_core::feedback::hidden_authors(&records);
+    let records = bookmarks_agent::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
+    let hidden_posts = bookmarks_agent::feedback::hidden_posts(&records);
+    let hidden_authors = bookmarks_agent::feedback::hidden_authors(&records);
     let rows: Vec<fixture::Bookmark> = merged
         .rows
         .iter()
@@ -358,7 +358,7 @@ fn parse_vote_args(
 
 fn cmd_vote(args: &[String]) -> Result<(), String> {
     let (post_id, verdict_s, tags, fixture) = parse_vote_args(args)?;
-    let verdict: ancientos_core::feedback::Verdict = verdict_s.parse().map_err(|e: String| e)?;
+    let verdict: bookmarks_agent::feedback::Verdict = verdict_s.parse().map_err(|e: String| e)?;
     let log_path = brief::decision_log_path()?;
     let res = vote::run_vote(&post_id, verdict, &tags, fixture.as_deref(), &log_path)?;
     println!(
@@ -719,8 +719,8 @@ fn cmd_try_pending(args: &[String]) -> Result<(), String> {
     let log_path = brief::decision_log_path()?;
     let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
     let pending = try_it::pending_followups(&log);
-    let records = ancientos_core::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
-    let hidden = ancientos_core::feedback::hidden_authors(&records);
+    let records = bookmarks_agent::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
+    let hidden = bookmarks_agent::feedback::hidden_authors(&records);
     let bookmarks = bookmarks_for_filtering();
     // Posts by a hidden author are skipped silently. Pending posts are never
     // hidden for language.

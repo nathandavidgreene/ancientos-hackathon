@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod deeper;
 pub mod delegate;
 pub mod digest;
+pub mod feedback;
 pub mod fixture;
 pub mod idea_card;
 pub mod ingest;
@@ -21,8 +22,10 @@ pub mod stats;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod token_store;
+pub mod topic_filter;
 pub mod translate;
 pub mod try_it;
+pub mod try_it_cascade;
 pub mod unroll;
 pub mod vote;
 pub mod wiki;

@@ -7,7 +7,7 @@
 //! decision-log entry. The bookmark store is never modified.
 //!
 //! The hidden set comes from
-//! [`ancientos_core::feedback::hidden_authors`]; every helper here is pure.
+//! [`crate::feedback::hidden_authors`]; every helper here is pure.
 //! Matching is case-insensitive and `@`-insensitive. Bookmarks with no
 //! `author_username` (or a blank one) are always kept: hiding applies only
 //! on positive evidence of a hidden author (fail closed the other way would
@@ -16,9 +16,9 @@ use crate::fixture::Bookmark;
 use std::collections::BTreeSet;
 
 /// Canonical author key: trimmed, leading `@` stripped, lowercased.
-/// Same normalization as [`ancientos_core::feedback::normalize_author`].
+/// Same normalization as [`crate::feedback::normalize_author`].
 pub fn normalize(username: &str) -> String {
-    ancientos_core::feedback::normalize_author(username)
+    crate::feedback::normalize_author(username)
 }
 
 /// True when the bookmark's author is in the hidden set. Bookmarks with

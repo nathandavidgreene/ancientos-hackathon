@@ -1,7 +1,7 @@
 //! End-to-end `try_it_cascade` runs against 127.0.0.1 mock servers and small
 //! temp files. No real network, no real data: every backend URL points at a
 //! mock or a closed port, and all keys are fake.
-use ancientos_router::try_it_cascade::{
+use bookmarks_agent::try_it_cascade::{
     TRY_IT_MUSE_MAX_COMPLETION_TOKENS, TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS,
 };
 use std::io::{Read, Write};

@@ -7,7 +7,7 @@
 //! `never_author` verdict resolves the post's author from the same store
 //! and records the username (not the post id); unknown posts or posts
 //! with no author fail closed instead of recording.
-use ancientos_core::feedback::{self, FeedbackRecord, ThresholdPolicy, Verdict};
+use crate::feedback::{self, FeedbackRecord, ThresholdPolicy, Verdict};
 use ancientos_core::log::DecisionLog;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -128,7 +128,7 @@ pub fn run_vote(
 /// Returns the normalized username. Empty names fail closed; unhiding an
 /// author that was never hidden is a harmless no-op entry.
 pub fn run_unhide_author(username: &str, log_path: &Path) -> Result<String, String> {
-    let normalized = ancientos_core::feedback::normalize_author(username);
+    let normalized = crate::feedback::normalize_author(username);
     if normalized.is_empty() {
         return Err("username must be non-empty".to_string());
     }

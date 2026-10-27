@@ -2,12 +2,12 @@
 //! brief, record feedback, show the threshold shift and the decision log.
 //! Uses mock model clients only; never makes network or paid calls.
 use ancientos_core::approvals;
-use ancientos_core::feedback::{self, FeedbackRecord, ThresholdPolicy, Verdict};
 use ancientos_core::gate::DEEPER_PAID_ACTION;
 use ancientos_core::log::DecisionLog;
 use ancientos_router::dispatch::{dispatch, Backends};
 use ancientos_router::muse::MuseUsage;
 use ancientos_router::{Destination, MockClient, ModelClient, RouterError, Sensitivity};
+use bookmarks_agent::feedback::{self, FeedbackRecord, ThresholdPolicy, Verdict};
 use bookmarks_agent::fixture::{self, Bookmark};
 use bookmarks_agent::{
     author_filter, brief, daemon, deeper, idea_card, media, translate, try_it, unroll,
@@ -980,21 +980,21 @@ impl Workspace {
         let text2 = "[synthetic] Desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side 3) seated twist 30s each side. Try it now.";
         let topic3 = "Local tooling";
         let text3 = "[synthetic] A quiet note about local file tooling and paper maps.";
-        let excluded = ancientos_router::topic_filter::excluded_topic(text1)
+        let excluded = bookmarks_agent::topic_filter::excluded_topic(text1)
             .ok_or_else(|| "cascade demo: demo-4001 must match an excluded topic".to_string())?;
-        if ancientos_router::topic_filter::excluded_topic(text2).is_some() {
+        if bookmarks_agent::topic_filter::excluded_topic(text2).is_some() {
             return Err("cascade demo: demo-4002 must not be topic-filtered".to_string());
         }
         if !try_it::rules_confident(topic2, text2) {
             return Err("cascade demo: demo-4002 must be rules-confident".to_string());
         }
-        if ancientos_router::topic_filter::excluded_topic(text3).is_some() {
+        if bookmarks_agent::topic_filter::excluded_topic(text3).is_some() {
             return Err("cascade demo: demo-4003 must not be topic-filtered".to_string());
         }
         if try_it::rules_confident(topic3, text3) {
             return Err("cascade demo: demo-4003 must be rules-unsure".to_string());
         }
-        let threshold = ancientos_router::try_it_cascade::TRY_IT_THRESHOLD;
+        let threshold = bookmarks_agent::try_it_cascade::TRY_IT_THRESHOLD;
         let mock_noul = 0.90;
         if mock_noul < threshold {
             return Err("cascade demo: mock Jev noul must clear the threshold".to_string());

@@ -36,12 +36,12 @@
 use ancientos_router::data_class::{max_of, DataClass};
 use ancientos_router::jev_client::JevClient;
 use ancientos_router::muse::MuseClient;
-use ancientos_router::try_it_cascade::{
-    jev_threshold_from_env, Cascade, CascadeStats, RulesVerdict, TRY_IT_MUSE_MAX_COMPLETION_TOKENS,
-};
 use bookmarks_agent::brief::topic_of;
 use bookmarks_agent::fixture::Bookmark;
 use bookmarks_agent::try_it::rules_confident;
+use bookmarks_agent::try_it_cascade::{
+    jev_threshold_from_env, Cascade, CascadeStats, RulesVerdict, TRY_IT_MUSE_MAX_COMPLETION_TOKENS,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn threshold_flag_overrides_env() {
-        use ancientos_router::try_it_cascade::{
+        use bookmarks_agent::try_it_cascade::{
             ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV, TRY_IT_THRESHOLD,
         };
         // The flag wins over whatever the env says.

@@ -12,7 +12,7 @@ use crate::fixture::Bookmark;
 use ancientos_core::log::{DecisionLog, Entry};
 use std::collections::BTreeSet;
 
-pub use ancientos_router::try_it_cascade::{
+pub use crate::try_it_cascade::{
     record_decision as record_decided, CascadeStage, TryItExplanation, DECIDED_KIND,
     RULES_NO_CUES_REASON,
 };
@@ -128,7 +128,7 @@ pub fn explain_text(topic: &str, text: &str) -> TryItExplanation {
 /// Explain one classification with the media cue (see [`explain`]).
 /// Never fails.
 pub fn explain_with_media(topic: &str, text: &str, has_video: bool) -> TryItExplanation {
-    if let Some(topic_id) = ancientos_router::topic_filter::excluded_topic(text) {
+    if let Some(topic_id) = crate::topic_filter::excluded_topic(text) {
         return TryItExplanation::topic_filter(topic_id);
     }
     if let Some(tag) = classify_with_media(topic, text, has_video) {
@@ -165,12 +165,12 @@ pub fn explain_with_media(topic: &str, text: &str, has_video: bool) -> TryItExpl
 ///
 /// Structural cues (lists, durations, lone imperatives) never tag alone.
 ///
-/// Posts about excluded topics (see `ancientos_router::topic_filter`: the
+/// Posts about excluded topics (see `crate::topic_filter`: the
 /// reader has moved past those ecosystems) are never tagged, no matter how
 /// many cues fire. This only withholds the tag; the post still appears in
 /// briefs.
 pub fn classify_with_media(topic: &str, text: &str, has_video: bool) -> Option<TryItTag> {
-    if ancientos_router::topic_filter::excluded_topic(text).is_some() {
+    if crate::topic_filter::excluded_topic(text).is_some() {
         return None;
     }
     let det = detect(text);

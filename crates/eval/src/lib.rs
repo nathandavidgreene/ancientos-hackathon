@@ -685,7 +685,7 @@ mod tests {
         let instructions = q["try_it"]["instructions"].as_str().unwrap();
         assert_eq!(
             instructions,
-            ancientos_router::try_it_cascade::TRY_IT_INSTRUCTIONS
+            bookmarks_agent::try_it_cascade::TRY_IT_INSTRUCTIONS
         );
         assert!(instructions.contains("personal AI OS project (AncientOS)"));
         assert!(instructions.contains("hand off"));

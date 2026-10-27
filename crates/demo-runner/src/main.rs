@@ -1,10 +1,10 @@
 //! `demo-runner --data DIR <cmd>` — offline demo commands on synthetic fixtures.
 //! `route` is the exception: it sends one real prompt to the configured
 //! backend (sensitive -> local LLM, sanitized -> Muse) for live demos.
-use ancientos_core::feedback::{ThresholdPolicy, Verdict};
 use ancientos_core::log::DecisionLog;
 use ancientos_router::dispatch::Backends;
 use ancientos_router::Sensitivity;
+use bookmarks_agent::feedback::{ThresholdPolicy, Verdict};
 use demo_runner::{demo_date, demo_now_secs, routing_demo, Workspace};
 use std::path::Path;
 

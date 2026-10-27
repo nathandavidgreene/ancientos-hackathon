@@ -49,8 +49,8 @@ fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
 /// shown try-it post with a yes follow-up, one cascade decision and one
 /// daemon tick. Returns the seed `now`.
 fn seed(log_path: &Path) -> u64 {
-    use ancientos_core::feedback::{FeedbackRecord, ThresholdPolicy, Verdict};
     use ancientos_core::log::DecisionLog;
+    use bookmarks_agent::feedback::{FeedbackRecord, ThresholdPolicy, Verdict};
     let now = now_secs();
     let mut log = DecisionLog::open(log_path).unwrap();
     ancientos_core::approvals::request(
@@ -64,7 +64,7 @@ fn seed(log_path: &Path) -> u64 {
     )
     .unwrap();
     for (id, verdict) in [("c1", Verdict::Approve), ("c2", Verdict::Skip)] {
-        ancientos_core::feedback::record(
+        bookmarks_agent::feedback::record(
             &mut log,
             FeedbackRecord {
                 pick_id: id.to_string(),

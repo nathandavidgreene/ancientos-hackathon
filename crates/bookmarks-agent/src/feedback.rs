@@ -16,7 +16,7 @@
 //! - `Delegate` is neutral: it counts toward the vote total (like `Skip`)
 //!   but is neither an approval nor a block.
 //! - Unknown or empty categories are never auto-approved.
-use crate::log::{DecisionLog, Entry, LogError};
+use ancientos_core::log::{DecisionLog, Entry, LogError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 

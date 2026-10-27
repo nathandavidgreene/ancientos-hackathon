@@ -7,7 +7,7 @@
 //! Stage 1 (rules) is an INPUT ([`RulesVerdict`]) because the router cannot
 //! depend on bookmarks-agent: `ConfidentYes` answers yes with no API call.
 //! Anything else goes through the paid/privacy gates — both clients present,
-//! both paid-allowed, [`DataClass::Public`](crate::data_class::DataClass) —
+//! both paid-allowed, [`DataClass::Public`](ancientos_router::data_class::DataClass) —
 //! and then:
 //!
 //! - Stage 2 (Jev): one `noul` question with the same try-it wording the eval
@@ -28,12 +28,12 @@
 //! never fails, so one bad item (or a rate limit) never aborts a run;
 //! callers that must stop on HTTP 429 check
 //! [`CascadeDecision::is_rate_limited`].
-use crate::data_class::{check_egress, DataClass, Route};
-use crate::jev_client::JevClient;
-use crate::muse::{MuseChatResponse, MuseClient};
 use crate::topic_filter::excluded_topic;
-use crate::RouterError;
 use ancientos_core::log::DecisionLog;
+use ancientos_router::data_class::{check_egress, DataClass, Route};
+use ancientos_router::jev_client::JevClient;
+use ancientos_router::muse::{MuseChatResponse, MuseClient};
+use ancientos_router::RouterError;
 
 /// Try-it definition shared by the Jev question and the Muse prompt. The eval
 /// crate's `bookmark_questions()` carries the same wording; the router cannot
@@ -702,7 +702,7 @@ fn snippet(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jev_client::JevBackend;
+    use ancientos_router::jev_client::JevBackend;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -710,7 +710,7 @@ mod tests {
 
     /// Process-wide env guard: every env-mutating test in the crate shares it.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env_lock()
+        crate::test_support::lock_env()
     }
 
     /// Set process env vars for a test, restoring previous values on drop.
@@ -1874,7 +1874,7 @@ mod tests {
             .iter()
             .zip(["internal", "confidential", "restricted"])
         {
-            assert_eq!(e.kind, crate::data_class::EGRESS_DENIED_KIND);
+            assert_eq!(e.kind, ancientos_router::data_class::EGRESS_DENIED_KIND);
             assert_eq!(e.payload["class"], class);
             assert_eq!(e.payload["route"], "jev");
             assert_eq!(e.payload["caller"], "cascade");
@@ -1914,7 +1914,10 @@ mod tests {
         assert_eq!(muse_seen.lock().expect("seen lock").len(), 1);
         let entries = log.verify().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, crate::data_class::EGRESS_ALLOWED_KIND);
+        assert_eq!(
+            entries[0].kind,
+            ancientos_router::data_class::EGRESS_ALLOWED_KIND
+        );
         assert_eq!(entries[0].payload["class"], "public");
         assert_eq!(entries[0].payload["route"], "muse_spark");
     }
@@ -1945,7 +1948,10 @@ mod tests {
         assert_eq!(jev_seen.lock().expect("seen lock").len(), 1);
         let entries = log.verify().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, crate::data_class::EGRESS_ALLOWED_KIND);
+        assert_eq!(
+            entries[0].kind,
+            ancientos_router::data_class::EGRESS_ALLOWED_KIND
+        );
         assert_eq!(entries[0].payload["class"], "public");
         assert_eq!(entries[0].payload["route"], "jev");
     }

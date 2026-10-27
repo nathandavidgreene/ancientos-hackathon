@@ -1,7 +1,7 @@
 //! Personal feed ranking learned from verdicts.
 //!
 //! Trains locally and deterministically on the feedback records already in
-//! the decision log ([`ancientos_core::feedback::records_from_log`]) plus
+//! the decision log ([`crate::feedback::records_from_log`]) plus
 //! `tried yes` follow-ups: approve, delegate and tried-yes are positive;
 //! skip, never_post, never_category and never_author are negative; anything
 //! else (unhide_author, tried no/later) is ignored. No network, no paid
@@ -14,8 +14,8 @@
 //! Fail closed: with fewer than `min_records` labeled records (env var
 //! [`MIN_RECORDS_ENV_VAR`], default [`MIN_RECORDS_DEFAULT`]) the ranker is
 //! inactive and callers keep today's ordering unchanged.
+use crate::feedback::{self, FeedbackRecord, Verdict};
 use crate::fixture::Bookmark;
-use ancientos_core::feedback::{self, FeedbackRecord, Verdict};
 use ancientos_core::log::DecisionLog;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -759,7 +759,7 @@ mod tests {
         ] {
             bookmarks.push(bm(id, Some(topic), Some("syn_user"), "synthetic post"));
         }
-        let policy = ancientos_core::feedback::ThresholdPolicy::default();
+        let policy = crate::feedback::ThresholdPolicy::default();
         for (id, cat, verdict) in [
             ("p-approve", "Rust & Systems", Verdict::Approve),
             ("p-delegate", "Rust & Systems", Verdict::Delegate),
@@ -772,7 +772,7 @@ mod tests {
             // Unknown post ids train nothing.
             ("ghost", "Rust & Systems", Verdict::Approve),
         ] {
-            ancientos_core::feedback::record(
+            crate::feedback::record(
                 &mut log,
                 FeedbackRecord {
                     pick_id: id.into(),

@@ -6,7 +6,7 @@
 //! renders the same [`Stats`] as HTML with an inline-SVG chart. No network,
 //! no paid calls: everything is computed from local files only.
 
-use ancientos_core::feedback::{self, FeedbackRecord, ThresholdPolicy};
+use crate::feedback::{self, FeedbackRecord, ThresholdPolicy};
 use ancientos_core::log::{DecisionLog, Entry, LogError};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ pub const MUSE_LOG_DEFAULT_PATH: &str = "docs/muse-code-log.md";
 pub const CASCADE_KIND_SUBSTR: &str = "cascade";
 
 /// Cascade stages in display order (matching
-/// `ancientos_router::try_it_cascade::CascadeStage::as_str`).
+/// `crate::try_it_cascade::CascadeStage::as_str`).
 pub const CASCADE_STAGES: [&str; 5] = ["topic_filter", "rules", "jev", "muse", "fail_closed"];
 
 /// Maximum entry kinds listed in [`Stats::kinds_top`].
