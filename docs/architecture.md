@@ -55,9 +55,12 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 |---|---|---|
 | `gate` | core | Fail-closed approval gate. Unregistered actions are denied. |
 | `log` | core | Append-only, hash-chained JSONL decision log |
-| `feedback` | core | Verdicts and category auto-approval (at least 3 votes, at least 80% approve) |
+| `feedback` | bookmarks-agent | Verdicts and category auto-approval (at least 3 votes, at least 80% approve) |
 | `scheduler` | core | Daily run timing |
+| `approvals` | core | Human approval queue: agents propose risky actions, a person approves or denies; state lives in the decision log |
+| `redact` | core | Secret redaction for hosted-model inputs and the decision log |
 | `router` (lib) | router | Sensitivity → destination routing |
+| `data_class` | router | Data classes with per-route ceilings; a class above the ceiling is refused before any I/O |
 | `dispatch` | router | Sends a routed request to the matching client |
 | `local_llm` | router | Local Llama backend (OpenAI/Ollama compatible) |
 | `muse` | router | Muse Spark client for the Meta Model API, behind the paid switch |
@@ -76,9 +79,18 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `delegate`, `idea_card` | bookmarks-agent | Hand-off to the agent, and idea cards (adopt / park / drop) |
 | `try_it` | bookmarks-agent | Hands-on classifier, tried yes/no/later follow-ups |
 | `deeper` | bookmarks-agent | "Go deeper" walkthroughs |
-| `try_it_cascade` | router | Try-it cascade: confident rules, else Jev `noul >= 0.3` (default; `ANCIENTOS_JEV_TRY_IT_THRESHOLD` or `--jev-threshold` overrides), else Muse Spark; paid-gated, sanitized-only, fail-closed; scored by `crates/eval/src/bin/try_it_cascade.rs` |
+| `try_it_cascade` | bookmarks-agent | Try-it cascade: confident rules, else Jev `noul >= 0.3` (default; `ANCIENTOS_JEV_TRY_IT_THRESHOLD` or `--jev-threshold` overrides), else Muse Spark; paid-gated, sanitized-only, fail-closed; scored by `crates/eval/src/bin/try_it_cascade.rs` |
+| `topic_filter` | bookmarks-agent | Off-topic pre-filter for the try-it classifiers |
+| `link_context` | bookmarks-agent | Linked-page and media enrichment for the try-it classifiers |
+| `liveness` | bookmarks-agent | Confirms a bookmark still exists before it is surfaced; dead posts are filtered in memory only |
+| `ranker` | bookmarks-agent | Personal ranking learned locally from verdicts (naive Bayes), with plain-language reasons |
+| `stats` | bookmarks-agent | Local stats for the `/stats` page and the `stats` command |
+| `wiki` | bookmarks-agent | Idea cards and research bookmarks distilled into concept pages with cited claims |
+| `digest` | bookmarks-agent | Weekly triage digest: due idea cards plus "did you try it?" nudges |
+| `daemon` | bookmarks-agent | Scheduler daemon: small agents ticking on a schedule, risky work via approvals |
 | `jev_client` | router | Jev (TypeSafe / localjev) classifier client, off by default |
-| `demo-runner` | demo-runner | Deterministic 12-shot demo on synthetic data |
+| `web-ui` | web-ui | Loopback-only, server-rendered demo UI (no JS); reuses bookmarks-agent and core, makes no network or paid calls |
+| `demo-runner` | demo-runner | Deterministic 14-shot demo on synthetic data |
 | `eval` | eval (package `ancientos-eval`) | Offline precision/recall harness plus classifier-backend scoring ([eval.md](eval.md)) |
 
 ## Guarantees and the tests that prove them
@@ -100,7 +112,7 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | Bookmarks are never deleted on a partial sync | [`ingest::partial_sync_never_removes`](../crates/bookmarks-agent/src/ingest.rs), [`merge::null_still_bookmarked_never_removes`](../crates/bookmarks-agent/src/merge.rs) |
 | OAuth callback state mismatch fails closed | [`callback::state_mismatch_fails_closed`](../crates/bookmarks-agent/src/callback.rs) |
 | Tokens are redacted in debug output | [`token_store::debug_redacts_token_values`](../crates/bookmarks-agent/src/token_store.rs) |
-| never_post hides one post, not its category | [`feedback::never_post_is_excluded_from_stats_and_blocking`](../crates/core/src/feedback.rs) |
+| never_post hides one post, not its category | [`feedback::never_post_is_excluded_from_stats_and_blocking`](../crates/bookmarks-agent/src/feedback.rs) |
 | Demo contains no private data | [`demo_runs_all_shots_deterministically_without_private_data`](../crates/demo-runner/tests/demo_script.rs) |
 | Eval output contains no ids, urls or text | [`eval` tests](../crates/eval) |
 

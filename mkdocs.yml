@@ -1,0 +1,77 @@
+site_name: AncientOS Hackathon Docs
+site_description: AncientOS hackathon build - Rust core, privacy router, X bookmarks agent
+docs_dir: docs
+site_dir: site
+# Plain .html URLs so the built site also works opened from disk (file://)
+# and so api.md (api.html) does not collide with the rustdoc tree in api/.
+use_directory_urls: false
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Dark mode
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Light mode
+
+plugins:
+  - search
+  - mermaid2
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid_custom
+
+exclude_docs: |
+  _build/
+
+not_in_nav: |
+  /api/**
+
+hooks:
+  - tools/mkdocs_hooks.py
+
+nav:
+  - Overview: index.md
+  - Architecture:
+      - Core and apps: core-and-apps.md
+      - Overview and guarantees: architecture.md
+      - Flows (diagrams): flows.md
+  - Crates:
+      - Crate index: modules.md
+      - ancientos-core: reference/ancientos-core.md
+      - ancientos-router: reference/ancientos-router.md
+      - bookmarks-agent: reference/bookmarks-agent.md
+      - web-ui: reference/web-ui.md
+      - demo-runner: reference/demo-runner.md
+      - ancientos-eval: reference/ancientos-eval.md
+      - Python build tools: reference/python-tools.md
+  - CLI reference: reference/cli.md
+  - API reference: api.md
+  - Evaluation: eval.md
+  - Muse Code log: muse-code-log.md
+  - Project:
+      - Pitch: pitch.md
+      - Demo storyboard: demo-storyboard.md
+      - Backlog: backlog.md
+      - Doc comments: docstrings.md

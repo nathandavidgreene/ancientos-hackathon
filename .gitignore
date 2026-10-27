@@ -13,3 +13,9 @@
 !fixtures/eval/synthetic_bookmarks.jsonl
 !fixtures/eval/synthetic_labels.jsonl
 !fixtures/eval/synthetic_verdicts.jsonl
+
+# Generated docs (tools/build_docs.sh)
+/site/
+/docs/api/
+/docs/reference/
+__pycache__/
