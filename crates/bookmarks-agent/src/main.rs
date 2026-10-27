@@ -1,6 +1,7 @@
 //! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`
 //! | `brief [--fixture PATH] [--out PATH] [--offline] [--demo]`
 //! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
+//! | `unhide-author <username>` | `hidden-authors`
 //! | `delegate <post_id>` | `deeper <post_id> [--offline <fixture.jsonl>]`
 //! | `ideas` | `triage <id> <adopt|park|drop>`
 //! | `tried <post_id> <yes|no|later> [note]` | `try-pending`
@@ -9,7 +10,10 @@
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
 //! merges the live store with a fixture and prints a daily brief. `vote`
-//! records a feedback verdict; `delegate` summarizes one thread with Muse
+//! records a feedback verdict (`never_author` hides every post by that
+//! post's author); `unhide-author` undoes an author hide and
+//! `hidden-authors` lists the currently hidden authors (read-only).
+//! `delegate` summarizes one thread with Muse
 //! Spark into inspiration.md (paid, off by default); `deeper` writes a
 //! step-by-step walkthrough of one thread plus its quoted/linked posts to
 //! deeper/<post_id>.md (one paid call at most, offline fixture supported).
@@ -21,12 +25,12 @@
 //! unless `--dry-run` or `--now` is given.
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, language, merge, oauth,
-    token_store, try_it, vote, x_api,
+    author_filter, brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, language,
+    merge, oauth, token_store, try_it, vote, x_api,
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run]";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run]";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -247,8 +251,32 @@ fn cmd_vote(args: &[String]) -> Result<(), String> {
         res.post_id,
         res.category
     );
+    if let Some(author) = &res.author {
+        println!("hidden author: {author}");
+    }
     if res.queued_delegate {
         println!("delegate queued for {}", res.post_id);
+    }
+    Ok(())
+}
+
+fn cmd_unhide_author(args: &[String]) -> Result<(), String> {
+    if args.len() != 1 || args[0].trim().is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    let unhidden = vote::run_unhide_author(&args[0], &log_path)?;
+    println!("unhidden author: {unhidden}");
+    Ok(())
+}
+
+fn cmd_hidden_authors(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    for author in vote::list_hidden_authors(&log_path)? {
+        println!("{author}");
     }
     Ok(())
 }
@@ -338,9 +366,15 @@ fn cmd_ideas(args: &[String]) -> Result<(), String> {
     let path = idea_card::idea_cards_path()?;
     let cards = idea_card::list_due_for_triage(&path, idea_card::now_secs())?;
     let bookmarks = bookmarks_for_filtering();
+    let hidden = vote::list_hidden_authors(&brief::decision_log_path()?)?;
     for card in &cards {
         // Cards from a known non-English source post are skipped silently.
         if language::source_post_is_english(&card.source_url, &bookmarks) == Some(false) {
+            continue;
+        }
+        // Cards by a hidden author are skipped silently too.
+        if author_filter::source_post_is_hidden(&card.source_url, &bookmarks, &hidden) == Some(true)
+        {
             continue;
         }
         println!("{}", format_idea_line(card));
@@ -425,8 +459,13 @@ fn cmd_try_pending(args: &[String]) -> Result<(), String> {
     let log_path = brief::decision_log_path()?;
     let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
     let pending = try_it::pending_followups(&log);
+    let records = ancientos_core::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
+    let hidden = ancientos_core::feedback::hidden_authors(&records);
+    let bookmarks = bookmarks_for_filtering();
     // Known non-English posts are skipped silently (unknown ids are kept).
-    for id in language::retain_not_known_non_english(&pending, &bookmarks_for_filtering()) {
+    let pending = language::retain_not_known_non_english(&pending, &bookmarks);
+    // Posts by a hidden author are skipped silently too.
+    for id in author_filter::retain_not_hidden(&pending, &bookmarks, &hidden) {
         println!("{id}");
     }
     Ok(())
@@ -516,6 +555,8 @@ fn main() {
         Some("auth-url") if args.len() == 1 => cmd_auth_url(),
         Some("brief") => cmd_brief(&args[1..]),
         Some("vote") => cmd_vote(&args[1..]),
+        Some("unhide-author") => cmd_unhide_author(&args[1..]),
+        Some("hidden-authors") => cmd_hidden_authors(&args[1..]),
         Some("delegate") => cmd_delegate(&args[1..]),
         Some("deeper") => cmd_deeper(&args[1..]),
         Some("ideas") => cmd_ideas(&args[1..]),
@@ -656,6 +697,20 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(parse_digest_args(&equals).unwrap().now, Some(456));
+    }
+
+    #[test]
+    fn author_commands_reject_bad_args() {
+        assert_eq!(cmd_unhide_author(&[]).unwrap_err(), USAGE);
+        assert_eq!(
+            cmd_unhide_author(&["a".to_string(), "b".to_string()]).unwrap_err(),
+            USAGE
+        );
+        assert_eq!(cmd_unhide_author(&["   ".to_string()]).unwrap_err(), USAGE);
+        assert_eq!(
+            cmd_hidden_authors(&["extra".to_string()]).unwrap_err(),
+            USAGE
+        );
     }
 
     #[test]

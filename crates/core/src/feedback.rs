@@ -8,6 +8,11 @@
 //! - Any `NeverCategory` verdict blocks auto-approval for that category.
 //! - `NeverPost` hides one post forever and is excluded from category
 //!   stats entirely (it neither approves nor counts against the category).
+//! - `NeverAuthor` hides every post by one author and is excluded from
+//!   category stats entirely, exactly like `NeverPost`. For these records
+//!   `pick_id` holds the username (resolved by `vote` from the store), not
+//!   a post id. `UnhideAuthor` undoes it: the latest action per author
+//!   wins, and both are excluded from stats. The log stays append-only.
 //! - `Delegate` is neutral: it counts toward the vote total (like `Skip`)
 //!   but is neither an approval nor a block.
 //! - Unknown or empty categories are never auto-approved.
@@ -27,6 +32,8 @@ pub enum Verdict {
     #[serde(alias = "never")]
     NeverCategory,
     Delegate,
+    NeverAuthor,
+    UnhideAuthor,
 }
 
 impl Verdict {
@@ -38,6 +45,8 @@ impl Verdict {
             Self::NeverPost => "never_post",
             Self::NeverCategory => "never_category",
             Self::Delegate => "delegate",
+            Self::NeverAuthor => "never_author",
+            Self::UnhideAuthor => "unhide_author",
         }
     }
 }
@@ -51,6 +60,8 @@ impl std::str::FromStr for Verdict {
             "never_post" => Ok(Self::NeverPost),
             "never_category" | "never" => Ok(Self::NeverCategory),
             "delegate" => Ok(Self::Delegate),
+            "never_author" => Ok(Self::NeverAuthor),
+            "unhide_author" => Ok(Self::UnhideAuthor),
             other => Err(format!("unknown verdict: {other}")),
         }
     }
@@ -101,12 +112,16 @@ fn valid_category(c: &str) -> bool {
 }
 
 /// Tally verdicts per category (BTreeMap for deterministic order).
-/// `NeverPost` verdicts are excluded: they hide one post but say nothing
-/// about the category. `Delegate` verdicts count as neutral.
+/// `NeverPost`, `NeverAuthor` and `UnhideAuthor` verdicts are excluded:
+/// they hide (or unhide) posts but say nothing about the category.
+/// `Delegate` verdicts count as neutral.
 pub fn tally(records: &[FeedbackRecord]) -> BTreeMap<String, CategoryStats> {
     let mut m: BTreeMap<String, CategoryStats> = BTreeMap::new();
     for r in records {
-        if r.verdict == Verdict::NeverPost {
+        if matches!(
+            r.verdict,
+            Verdict::NeverPost | Verdict::NeverAuthor | Verdict::UnhideAuthor
+        ) {
             continue;
         }
         let s = m.entry(r.category.clone()).or_default();
@@ -115,7 +130,7 @@ pub fn tally(records: &[FeedbackRecord]) -> BTreeMap<String, CategoryStats> {
             Verdict::Skip => s.skip += 1,
             Verdict::NeverCategory => s.never_category += 1,
             Verdict::Delegate => s.delegate += 1,
-            Verdict::NeverPost => {}
+            Verdict::NeverPost | Verdict::NeverAuthor | Verdict::UnhideAuthor => {}
         }
     }
     m
@@ -129,6 +144,41 @@ pub fn hidden_posts(records: &[FeedbackRecord]) -> BTreeSet<String> {
         .filter(|r| r.verdict == Verdict::NeverPost)
         .map(|r| r.pick_id.clone())
         .collect()
+}
+
+/// Usernames hidden by a `NeverAuthor` verdict. For these records (and
+/// `UnhideAuthor`) `pick_id` holds the username, not a post id. Names are
+/// normalized (trimmed, leading `@` stripped, lowercased); empty names are
+/// ignored. The latest action per author wins: a later `UnhideAuthor`
+/// removes an earlier hide, and a later `NeverAuthor` re-hides. The log
+/// itself stays append-only; this is a pure view over it.
+pub fn hidden_authors(records: &[FeedbackRecord]) -> BTreeSet<String> {
+    let mut hidden = BTreeSet::new();
+    for r in records {
+        let name = normalize_author(&r.pick_id);
+        if name.is_empty() {
+            continue;
+        }
+        match r.verdict {
+            Verdict::NeverAuthor => {
+                hidden.insert(name);
+            }
+            Verdict::UnhideAuthor => {
+                hidden.remove(&name);
+            }
+            _ => {}
+        }
+    }
+    hidden
+}
+
+/// Canonical author key: trimmed, leading `@` stripped, lowercased.
+pub fn normalize_author(username: &str) -> String {
+    username
+        .trim()
+        .trim_start_matches('@')
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Categories that may be auto-approved under `policy`.
@@ -306,6 +356,146 @@ mod tests {
     }
 
     #[test]
+    fn never_author_is_excluded_from_stats_and_blocking() {
+        // NeverAuthor alone: no votes counted, nothing auto-approved.
+        let recs = vec![
+            FeedbackRecord {
+                pick_id: "syn_user".into(),
+                category: "A".into(),
+                verdict: Verdict::NeverAuthor,
+                tags: Vec::new(),
+            };
+            5
+        ];
+        assert!(auto_approved(&recs, P).is_empty());
+        assert!(!tally(&recs).contains_key("A"));
+        // Alongside approvals: approvals still carry the category.
+        let mut recs = vec![r("A", Verdict::Approve); 3];
+        recs.push(FeedbackRecord {
+            pick_id: "syn_user".into(),
+            category: "A".into(),
+            verdict: Verdict::NeverAuthor,
+            tags: Vec::new(),
+        });
+        assert_eq!(auto_approved(&recs, P), BTreeSet::from(["A".to_string()]));
+        assert_eq!(tally(&recs)["A"].total(), 3);
+        // UnhideAuthor is excluded too.
+        recs.push(FeedbackRecord {
+            pick_id: "syn_user".into(),
+            category: "A".into(),
+            verdict: Verdict::UnhideAuthor,
+            tags: Vec::new(),
+        });
+        assert_eq!(tally(&recs)["A"].total(), 3);
+    }
+
+    #[test]
+    fn hidden_authors_normalizes_case_and_at() {
+        let recs = vec![
+            FeedbackRecord {
+                pick_id: "@Syn_User".into(),
+                category: "A".into(),
+                verdict: Verdict::NeverAuthor,
+                tags: Vec::new(),
+            },
+            FeedbackRecord {
+                pick_id: "  other ".into(),
+                category: "B".into(),
+                verdict: Verdict::NeverAuthor,
+                tags: Vec::new(),
+            },
+            // Other verdicts never contribute, even with author-like ids.
+            r("A", Verdict::Approve),
+            FeedbackRecord {
+                pick_id: "syn_post".into(),
+                category: "A".into(),
+                verdict: Verdict::NeverPost,
+                tags: Vec::new(),
+            },
+            r("A", Verdict::NeverCategory),
+            // Empty names are ignored (fail closed: hide nothing).
+            FeedbackRecord {
+                pick_id: "  @ ".into(),
+                category: "A".into(),
+                verdict: Verdict::NeverAuthor,
+                tags: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            hidden_authors(&recs),
+            BTreeSet::from(["syn_user".to_string(), "other".to_string()])
+        );
+    }
+
+    #[test]
+    fn hidden_authors_latest_action_per_author_wins() {
+        let hide = |id: &str| FeedbackRecord {
+            pick_id: id.into(),
+            category: "A".into(),
+            verdict: Verdict::NeverAuthor,
+            tags: Vec::new(),
+        };
+        let unhide = |id: &str| FeedbackRecord {
+            pick_id: id.into(),
+            category: "unknown".into(),
+            verdict: Verdict::UnhideAuthor,
+            tags: Vec::new(),
+        };
+        // Hide then unhide (different case/@ spelling still matches).
+        let recs = vec![hide("@Syn_A"), unhide("syn_a")];
+        assert!(hidden_authors(&recs).is_empty());
+        // Unhide then re-hide wins the other way.
+        let recs = vec![hide("syn_b"), unhide("syn_b"), hide("SYN_B")];
+        assert_eq!(hidden_authors(&recs), BTreeSet::from(["syn_b".to_string()]));
+        // Unhide without a prior hide is a no-op, other authors unaffected.
+        let recs = vec![hide("syn_c"), unhide("syn_ghost")];
+        assert_eq!(hidden_authors(&recs), BTreeSet::from(["syn_c".to_string()]));
+    }
+
+    #[test]
+    fn author_hide_and_unhide_never_shift_thresholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&p).unwrap();
+        for v in [Verdict::Approve, Verdict::Approve, Verdict::Approve] {
+            record(&mut log, r("Rust", v), P).unwrap();
+        }
+        // Category is auto-approved now; author actions must not shift it.
+        let (_, s) = record(
+            &mut log,
+            FeedbackRecord {
+                pick_id: "syn_user".into(),
+                category: "Rust".into(),
+                verdict: Verdict::NeverAuthor,
+                tags: Vec::new(),
+            },
+            P,
+        )
+        .unwrap();
+        assert!(s.is_empty());
+        let (_, s) = record(
+            &mut log,
+            FeedbackRecord {
+                pick_id: "syn_user".into(),
+                category: "unknown".into(),
+                verdict: Verdict::UnhideAuthor,
+                tags: Vec::new(),
+            },
+            P,
+        )
+        .unwrap();
+        assert!(s.is_empty());
+        let entries = log.verify().unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.kind != THRESHOLD_KIND
+                    || !format!("{:?}", e.payload).contains("syn_user")),
+            "author actions must not write threshold entries"
+        );
+    }
+
+    #[test]
     fn unknown_and_empty_never_auto() {
         let mut recs = vec![r("unknown", Verdict::Approve); 5];
         recs.extend(vec![r("  ", Verdict::Approve); 5]);
@@ -338,10 +528,19 @@ mod tests {
             Verdict::NeverCategory
         );
         assert_eq!("delegate".parse::<Verdict>().unwrap(), Verdict::Delegate);
+        assert_eq!(
+            "never_author".parse::<Verdict>().unwrap(),
+            Verdict::NeverAuthor
+        );
+        assert_eq!(
+            "unhide_author".parse::<Verdict>().unwrap(),
+            Verdict::UnhideAuthor
+        );
         // Backward compat with old log entries / CLI input.
         assert_eq!("never".parse::<Verdict>().unwrap(), Verdict::NeverCategory);
         assert!("maybe".parse::<Verdict>().is_err());
         assert!("Never".parse::<Verdict>().is_err());
+        assert!("Never_Author".parse::<Verdict>().is_err());
     }
 
     #[test]
@@ -352,6 +551,8 @@ mod tests {
             (Verdict::NeverPost, "never_post"),
             (Verdict::NeverCategory, "never_category"),
             (Verdict::Delegate, "delegate"),
+            (Verdict::NeverAuthor, "never_author"),
+            (Verdict::UnhideAuthor, "unhide_author"),
         ] {
             assert_eq!(serde_json::to_value(v).unwrap(), serde_json::json!(s));
             assert_eq!(v.as_str(), s);

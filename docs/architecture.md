@@ -15,7 +15,7 @@ flowchart LR
   local --> brief[brief<br/>3-5 picks, local fallback]
   muse --> brief
   brief --> gate[gate<br/>deny unless registered]
-  gate --> vote[vote / feedback<br/>approve, skip, never_post, never_category, delegate]
+  gate --> vote[vote / feedback<br/>approve, skip, never_post, never_author, never_category, delegate, unhide_author]
   vote --> log[(decision_log<br/>SHA-256 hash chain)]
   vote -- delegate --> idea[idea_card]
   vote --> deeper[deeper<br/>unroll + quoted + steps]
@@ -70,6 +70,7 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `brief` | bookmarks-agent | Candidate selection, one model call, local fallback |
 | `media` | bookmarks-agent | Photos and video under the full text, capped at 1080p |
 | `vote` | bookmarks-agent | Records verdicts |
+| `author_filter` | bookmarks-agent | Hides hidden-author posts in memory only (brief, web-ui, digest); no-author posts kept, store never modified |
 | `unroll` | bookmarks-agent | Rebuilds an author's self-reply thread |
 | `delegate`, `idea_card` | bookmarks-agent | Hand-off to the agent, and idea cards (adopt / park / drop) |
 | `try_it` | bookmarks-agent | Hands-on classifier, tried yes/no/later follow-ups |

@@ -570,15 +570,22 @@ pub fn run_full_with_liveness(
     if merged.rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
-    // Posts hidden by a never_post verdict never become candidates.
-    let hidden = {
+    // Posts hidden by a never_post verdict, and posts by a hidden
+    // author, never become candidates. Silent in-memory filtering (like
+    // liveness/language below): no log entry, store never modified.
+    let (hidden, hidden_authors) = {
         let log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
-        feedback::hidden_posts(&feedback::records_from_log(&log).map_err(|e| e.to_string())?)
+        let records = feedback::records_from_log(&log).map_err(|e| e.to_string())?;
+        (
+            feedback::hidden_posts(&records),
+            feedback::hidden_authors(&records),
+        )
     };
     let rows: Vec<Bookmark> = merged
         .rows
         .iter()
         .filter(|b| !hidden.contains(&b.post_id))
+        .filter(|b| !crate::author_filter::is_hidden(b, &hidden_authors))
         .cloned()
         .collect();
     if rows.is_empty() {
@@ -1446,6 +1453,96 @@ mod tests {
             .find(|e| e.kind == "brief.candidates")
             .unwrap();
         assert_eq!(cands.payload["count"], 3);
+    }
+
+    fn seed_author_hide(log_path: &Path, username: &str, hide: bool) {
+        use ancientos_core::feedback::{
+            record, FeedbackRecord, ThresholdPolicy, Verdict as FbVerdict,
+        };
+        let mut log = DecisionLog::open(log_path).unwrap();
+        record(
+            &mut log,
+            FeedbackRecord {
+                pick_id: username.into(),
+                category: "unknown".into(),
+                verdict: if hide {
+                    FbVerdict::NeverAuthor
+                } else {
+                    FbVerdict::UnhideAuthor
+                },
+                tags: Vec::new(),
+            },
+            ThresholdPolicy::default(),
+        )
+        .unwrap();
+    }
+
+    fn bm_authored(id: &str, author: Option<&str>) -> Bookmark {
+        let mut b = bm(id, None, Some("TopicA"), Some(0.9));
+        b.author_username = author.map(str::to_string);
+        b
+    }
+
+    #[test]
+    fn hidden_author_posts_are_excluded_from_candidates() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
+        let rows = vec![
+            bm_authored("id0", Some("Syn_Bad")),
+            bm_authored("id1", Some("syn_good")),
+            bm_authored("id2", Some("@SYN_BAD")),
+            bm_authored("id3", None),
+        ];
+        let merged = merged_of(rows, &["id0", "id1", "id2", "id3"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        seed_author_hide(&log_path, "syn_bad", true);
+        let res = run_with_hydrator(
+            &merged,
+            &FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#),
+            &log_path,
+            "2026-10-26",
+            None,
+        )
+        .unwrap();
+        let cand_ids: Vec<&str> = res.candidates.iter().map(|c| c.post_id.as_str()).collect();
+        assert_eq!(cand_ids, vec!["id1", "id3"], "case/@ match; no-author kept");
+        assert!(!res.picks.iter().any(|p| p.post_id == "id0"));
+        assert!(!res.picks.iter().any(|p| p.post_id == "id2"));
+        assert!(!res.markdown.contains("status/id0"), "{}", res.markdown);
+        assert!(!res.markdown.contains("status/id2"), "{}", res.markdown);
+        // No log entry for the filtering itself (candidates/model/picks only).
+        let log = DecisionLog::open(&log_path).unwrap();
+        let entries = log.verify().unwrap();
+        assert!(entries
+            .iter()
+            .all(|e| e.kind.starts_with("brief.") || e.kind == "feedback"));
+    }
+
+    #[test]
+    fn unhide_author_restores_posts_in_brief() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
+        let rows = vec![
+            bm_authored("id0", Some("syn_bad")),
+            bm_authored("id1", Some("syn_good")),
+        ];
+        let merged = merged_of(rows, &["id0", "id1"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        seed_author_hide(&log_path, "syn_bad", true);
+        seed_author_hide(&log_path, "@SYN_BAD", false);
+        let res = run_with_hydrator(
+            &merged,
+            &FakeModel::failing(),
+            &log_path,
+            "2026-10-26",
+            None,
+        )
+        .unwrap();
+        let cand_ids: Vec<&str> = res.candidates.iter().map(|c| c.post_id.as_str()).collect();
+        assert_eq!(cand_ids.len(), 2);
+        assert!(cand_ids.contains(&"id0"));
     }
 
     #[test]

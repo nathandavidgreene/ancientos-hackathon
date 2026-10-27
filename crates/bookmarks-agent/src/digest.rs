@@ -189,12 +189,24 @@ pub fn weekly_digest(
     }
 }
 
+/// Hidden authors from the `feedback` entries in `entries`
+/// (malformed payloads are ignored: they prove no hide).
+fn hidden_authors_from_entries(entries: &[Entry]) -> BTreeSet<String> {
+    let records: Vec<ancientos_core::feedback::FeedbackRecord> = entries
+        .iter()
+        .filter(|e| e.kind == ancientos_core::feedback::FEEDBACK_KIND)
+        .filter_map(|e| serde_json::from_value(e.payload.clone()).ok())
+        .collect();
+    ancientos_core::feedback::hidden_authors(&records)
+}
+
 /// Assemble the digest like [`weekly_digest`], skipping cards from a known
 /// non-English source post and nudges for known non-English posts (see
-/// [`crate::language`]). Skipped silently: no message, no placeholder.
-/// Cards and nudges whose source post is unknown (not in `bookmarks`) are
-/// kept: these surfaces show ids and locally generated idea text, never
-/// post text.
+/// [`crate::language`]), plus cards and nudges by a hidden author (see
+/// [`crate::author_filter`]). Skipped silently: no message, no
+/// placeholder. Cards and nudges whose source post is unknown (not in
+/// `bookmarks`) are kept: these surfaces show ids and locally generated
+/// idea text, never post text.
 pub fn weekly_digest_for_bookmarks(
     cards: &[IdeaCard],
     pending: &[String],
@@ -202,14 +214,20 @@ pub fn weekly_digest_for_bookmarks(
     now: u64,
     bookmarks: &[crate::fixture::Bookmark],
 ) -> WeeklyDigest {
+    let hidden = hidden_authors_from_entries(entries);
     let cards: Vec<IdeaCard> = cards
         .iter()
         .filter(|c| {
             crate::language::source_post_is_english(&c.source_url, bookmarks) != Some(false)
         })
+        .filter(|c| {
+            crate::author_filter::source_post_is_hidden(&c.source_url, bookmarks, &hidden)
+                != Some(true)
+        })
         .cloned()
         .collect();
     let pending = crate::language::retain_not_known_non_english(pending, bookmarks);
+    let pending = crate::author_filter::retain_not_hidden(&pending, bookmarks, &hidden);
     weekly_digest(&cards, &pending, entries, now)
 }
 
@@ -587,6 +605,102 @@ mod tests {
         let mut c = card(id, Status::New, 1, None);
         c.source_url = format!("https://x.com/i/status/{post_id}");
         c
+    }
+
+    fn authored_post(id: &str, author: Option<&str>) -> crate::fixture::Bookmark {
+        crate::fixture::Bookmark {
+            post_id: id.into(),
+            url: format!("https://x.com/i/status/{id}"),
+            text: "[synthetic] The government presented an economic plan to support small local businesses.".into(),
+            author_username: author.map(str::to_string),
+            created_at: None,
+            folders: None,
+            label: None,
+            had_note_tweet: false,
+            media: Vec::new(),
+            lang: Some("en".into()),
+        }
+    }
+
+    fn feedback_entries(hides: &[&str], unhides: &[&str]) -> Vec<Entry> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        for name in hides {
+            log.append(
+                ancientos_core::feedback::FEEDBACK_KIND,
+                serde_json::json!({
+                    "pick_id": name,
+                    "category": "unknown",
+                    "verdict": "never_author",
+                }),
+            )
+            .unwrap();
+        }
+        for name in unhides {
+            log.append(
+                ancientos_core::feedback::FEEDBACK_KIND,
+                serde_json::json!({
+                    "pick_id": name,
+                    "category": "unknown",
+                    "verdict": "unhide_author",
+                }),
+            )
+            .unwrap();
+        }
+        // Malformed feedback proves no hide and never breaks the digest.
+        log.append(
+            ancientos_core::feedback::FEEDBACK_KIND,
+            serde_json::json!({"pick_id": 42}),
+        )
+        .unwrap();
+        DecisionLog::open(&path).unwrap().verify().unwrap()
+    }
+
+    #[test]
+    fn digest_for_bookmarks_skips_hidden_authors_and_keeps_unknown() {
+        let bookmarks = vec![
+            authored_post("good1", Some("syn_good")),
+            authored_post("bad1", Some("@Syn_Bad")),
+            authored_post("noauthor", None),
+        ];
+        let cards = vec![
+            sourced_card("card-good", "good1"),
+            sourced_card("card-bad", "bad1"),
+            sourced_card("card-ghost", "ghost"),
+        ];
+        let mut entries = shown_entries(
+            &[
+                ("good1", Some(NOW - NUDGE_SECS - 1)),
+                ("bad1", Some(NOW - NUDGE_SECS - 1)),
+                ("ghost", Some(NOW - NUDGE_SECS - 1)),
+                ("noauthor", Some(NOW - NUDGE_SECS - 1)),
+            ],
+            &[],
+        );
+        entries.extend(feedback_entries(&["syn_bad"], &[]));
+        let pending = pending_of(&entries);
+        assert_eq!(pending.len(), 4);
+        let d = weekly_digest_for_bookmarks(&cards, &pending, &entries, NOW, &bookmarks);
+        let card_ids: Vec<&str> = d.cards.iter().map(|c| c.card.id.as_str()).collect();
+        assert_eq!(card_ids, vec!["card-ghost", "card-good"]);
+        let nudge_ids: Vec<&str> = d.nudges.iter().map(|n| n.post_id.as_str()).collect();
+        assert_eq!(nudge_ids, vec!["ghost", "good1", "noauthor"]);
+        let text = render(&d);
+        assert!(!text.contains("bad1"), "{text}");
+        assert!(!text.contains("card-bad"), "{text}");
+    }
+
+    #[test]
+    fn digest_unhide_author_restores_nudges() {
+        let bookmarks = vec![authored_post("bad1", Some("syn_bad"))];
+        let cards = vec![sourced_card("card-bad", "bad1")];
+        let mut entries = shown_entries(&[("bad1", Some(NOW - NUDGE_SECS - 1))], &[]);
+        entries.extend(feedback_entries(&["syn_bad"], &["@SYN_BAD"]));
+        let pending = pending_of(&entries);
+        let d = weekly_digest_for_bookmarks(&cards, &pending, &entries, NOW, &bookmarks);
+        assert_eq!(d.cards.len(), 1);
+        assert_eq!(d.nudges.len(), 1);
     }
 
     #[test]

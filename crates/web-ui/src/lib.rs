@@ -9,9 +9,12 @@
 //! `--demo`/paid-off skips with no network); dead posts are filtered in
 //! memory only and the store is never modified. Non-English posts are
 //! filtered the same way right after (offline heuristic, no network).
+//! Posts by a hidden author (`never_author` verdict, undone from
+//! `/hidden-authors`) are filtered per request the same silent in-memory
+//! way, so a vote takes effect immediately without a restart.
 
 use bookmarks_agent::fixture::Bookmark;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Bodies larger than this are rejected with 413 (fail closed).
@@ -301,7 +304,8 @@ fn layout(title: &str, body: &str) -> String {
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{}</title><style>{CSS}</style></head><body>\
          <nav><a href=\"/\">Brief</a><a href=\"/ideas\">Ideas</a>\
-         <a href=\"/try\">Try it</a><a href=\"/log\">Log</a></nav><hr>{body}</body></html>",
+         <a href=\"/try\">Try it</a><a href=\"/hidden-authors\">Hidden</a>\
+         <a href=\"/log\">Log</a></nav><hr>{body}</body></html>",
         escape(title),
     )
 }
@@ -431,6 +435,24 @@ fn try_it_html(b: &Bookmark) -> String {
     out
 }
 
+/// Currently hidden authors from this data dir's decision log.
+/// Best-effort like `mark_shown` below: a missing or unreadable log means
+/// no hides (tampering is still surfaced on `/log`).
+fn hidden_authors_of(state: &State) -> BTreeSet<String> {
+    let Ok(log) = ancientos_core::log::DecisionLog::open(state.log_path()) else {
+        return BTreeSet::new();
+    };
+    let Ok(records) = ancientos_core::feedback::records_from_log(&log) else {
+        return BTreeSet::new();
+    };
+    ancientos_core::feedback::hidden_authors(&records)
+}
+
+/// Surfaced posts minus hidden authors (silent, in-memory, per request).
+fn visible_bookmarks(state: &State) -> Vec<Bookmark> {
+    bookmarks_agent::author_filter::filter_visible(&state.bookmarks, &hidden_authors_of(state))
+}
+
 /// Mark a rendered tagged pick as shown (metadata only), once: entries
 /// already in the log are never duplicated.
 fn mark_shown(state: &State, post_id: &str) {
@@ -463,12 +485,19 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
             "<h1>Brief</h1><p>No bookmarks synced into this data dir yet.</p>",
         ));
     }
-    let Some(bm) = state.bookmarks.get(idx) else {
+    let visible = visible_bookmarks(state);
+    if visible.is_empty() {
+        return Response::ok(layout(
+            "Brief",
+            "<h1>Brief</h1><p>Every post is hidden by an author filter. \
+             <a href=\"/hidden-authors\">Manage hidden authors</a>.</p>",
+        ));
+    }
+    let Some(bm) = visible.get(idx) else {
         return Response::status(404, error_page("Not found", "No post at that index."));
     };
     let root = thread_post_of(bm);
-    let candidates: Vec<_> = state
-        .bookmarks
+    let candidates: Vec<_> = visible
         .iter()
         .filter(|b| b.post_id != bm.post_id)
         .map(thread_post_of)
@@ -483,7 +512,7 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
         "<h1>Brief — post {} of {}</h1>\
          <p><strong>{}</strong> {}</p><blockquote>{}</blockquote>",
         idx + 1,
-        state.bookmarks.len(),
+        visible.len(),
         escape(&bm.post_id),
         bm.author_username
             .as_deref()
@@ -501,6 +530,7 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
          <label><input type=\"radio\" name=\"verdict\" value=\"approve\" checked> approve</label> \
          <label><input type=\"radio\" name=\"verdict\" value=\"skip\"> skip</label> \
          <label><input type=\"radio\" name=\"verdict\" value=\"never_post\"> never_post</label> \
+         <label><input type=\"radio\" name=\"verdict\" value=\"never_author\"> never_author</label> \
          <label><input type=\"radio\" name=\"verdict\" value=\"never_category\"> never_category</label> \
          <label><input type=\"radio\" name=\"verdict\" value=\"delegate\"> delegate</label> \
          <button type=\"submit\">Vote</button></form>",
@@ -511,7 +541,7 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
          <button type=\"submit\">Go deeper</button></form>",
         escape(&bm.post_id),
     ));
-    if idx + 1 < state.bookmarks.len() {
+    if idx + 1 < visible.len() {
         body.push_str(&format!("<p><a href=\"/?i={}\">Next post</a></p>", idx + 1));
     }
     Response::ok(layout("Brief", &body))
@@ -545,12 +575,13 @@ fn do_vote(state: &State, body: &[u8]) -> Response {
     {
         return Response::status(500, error_page("Vote failed", &e));
     }
-    let next = if state.bookmarks.is_empty() {
-        0
-    } else {
-        (idx + 1) % state.bookmarks.len()
-    };
-    Response::redirect(format!("/?i={next}"))
+    // Redirect within the still-visible posts (a never_author vote may have
+    // just shrunk the list); when nothing is visible, offer the undo page.
+    let visible = visible_bookmarks(state).len();
+    if visible == 0 {
+        return Response::redirect("/hidden-authors".to_string());
+    }
+    Response::redirect(format!("/?i={}", (idx + 1) % visible))
 }
 
 fn page_ideas(state: &State) -> Response {
@@ -562,11 +593,20 @@ fn page_ideas(state: &State) -> Response {
     };
     // Cards from a known non-English source post get no UI mention (cards
     // whose source is unknown are kept: their idea text is locally generated).
+    // Cards by a hidden author get no UI mention either.
+    let hidden = hidden_authors_of(state);
     let cards: Vec<_> = cards
         .into_iter()
         .filter(|c| {
             bookmarks_agent::language::source_post_is_english(&c.source_url, &state.all_bookmarks)
                 != Some(false)
+        })
+        .filter(|c| {
+            bookmarks_agent::author_filter::source_post_is_hidden(
+                &c.source_url,
+                &state.all_bookmarks,
+                &hidden,
+            ) != Some(true)
         })
         .collect();
     let mut body = String::from("<h1>Ideas due for triage</h1>");
@@ -637,9 +677,10 @@ fn page_try(state: &State) -> Response {
     // `unavailable` liveness-cache entry (read-only reuse, no network).
     // Non-English posts get no UI mention either: skip pending ids whose
     // stored post is known non-English (unknown ids are kept: they show no
-    // post text, only "(not in store)").
+    // post text, only "(not in store)"). Hidden authors the same way.
     let cache = bookmarks_agent::liveness::load_cache(&state.liveness_cache_path());
     let now = bookmarks_agent::liveness::now_secs();
+    let hidden = hidden_authors_of(state);
     let pending: Vec<&String> = pending
         .iter()
         .filter(|id| !bookmarks_agent::liveness::is_fresh_unavailable(&cache, id, now))
@@ -649,6 +690,13 @@ fn page_try(state: &State) -> Response {
                 .iter()
                 .find(|b| &b.post_id == *id)
                 .is_none_or(bookmarks_agent::language::is_english)
+        })
+        .filter(|id| {
+            state
+                .all_bookmarks
+                .iter()
+                .find(|b| &b.post_id == *id)
+                .is_none_or(|b| !bookmarks_agent::author_filter::is_hidden(b, &hidden))
         })
         .collect();
     let mut body = String::from("<h1>Try it — pending check-ins</h1>");
@@ -693,6 +741,60 @@ fn do_try(state: &State, body: &[u8]) -> Response {
         return Response::status(500, error_page("Follow-up failed", &e));
     }
     Response::redirect("/try".to_string())
+}
+
+fn page_hidden_authors(state: &State) -> Response {
+    use ancientos_core::log::{DecisionLog, LogError};
+    let hidden = match DecisionLog::open(state.log_path()) {
+        Err(LogError::Chain(n)) => {
+            return Response::ok(layout(
+                "Hidden authors",
+                &format!(
+                    "<h1>Hidden authors</h1><p><span class=\"badge-bad\">TAMPERED at row {n}</span></p>\
+                     <p>The hash chain failed verification; the list is withheld (fail closed).</p>"
+                ),
+            ));
+        }
+        Err(e) => {
+            return Response::status(500, error_page("Hidden authors failed", &e.to_string()))
+        }
+        Ok(log) => match ancientos_core::feedback::records_from_log(&log) {
+            Err(e) => {
+                return Response::status(500, error_page("Hidden authors failed", &e.to_string()));
+            }
+            Ok(records) => ancientos_core::feedback::hidden_authors(&records),
+        },
+    };
+    let mut body = String::from("<h1>Hidden authors</h1>");
+    if hidden.is_empty() {
+        body.push_str("<p>No hidden authors. Voting never_author on a post hides its author.</p>");
+    } else {
+        body.push_str("<ul>");
+        for author in &hidden {
+            body.push_str(&format!(
+                "<li>{} \
+                 <form method=\"post\" action=\"/unhide-author\" style=\"display:inline\">\
+                 <input type=\"hidden\" name=\"username\" value=\"{}\">\
+                 <button type=\"submit\">Unhide</button></form></li>",
+                escape(author),
+                escape(author),
+            ));
+        }
+        body.push_str("</ul>");
+    }
+    Response::ok(layout("Hidden authors", &body))
+}
+
+fn do_unhide_author(state: &State, body: &[u8]) -> Response {
+    let form = parse_body(body);
+    let username = form.get("username").map(String::as_str).unwrap_or("");
+    if username.trim().is_empty() {
+        return Response::status(400, error_page("Bad unhide", "Missing username."));
+    }
+    if let Err(e) = bookmarks_agent::vote::run_unhide_author(username, &state.log_path()) {
+        return Response::status(500, error_page("Unhide failed", &e));
+    }
+    Response::redirect("/hidden-authors".to_string())
 }
 
 fn tampered_page(row: usize) -> Response {
@@ -888,6 +990,8 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("POST", "/ideas/triage") => do_triage(state, &req.body),
         ("GET", "/try") => page_try(state),
         ("POST", "/try") => do_try(state, &req.body),
+        ("GET", "/hidden-authors") => page_hidden_authors(state),
+        ("POST", "/unhide-author") => do_unhide_author(state, &req.body),
         ("GET", "/log") => page_log(state),
         ("GET", path) if path.starts_with("/deeper/") => {
             page_deeper(state, &path["/deeper/".len()..])
@@ -1172,6 +1276,7 @@ mod tests {
             "approve",
             "skip",
             "never_post",
+            "never_author",
             "never_category",
             "delegate",
         ] {
@@ -1287,6 +1392,178 @@ mod tests {
         assert!(
             !state.log_path().exists(),
             "bad votes must not create a log"
+        );
+    }
+
+    #[test]
+    fn vote_never_author_hides_author_from_brief_immediately() {
+        let (_dir, state) = test_state();
+        let resp = handle(
+            &Request::post("/vote", "post_id=p1&verdict=never_author&i=0"),
+            &state,
+        );
+        assert_eq!(resp.status, 303);
+        let entries = log_entries(&state);
+        assert_eq!(entries[0].payload["verdict"], "never_author");
+        assert_eq!(entries[0].payload["pick_id"], "syn_p1");
+        // Same State, no restart: p1 is gone, others unaffected.
+        let resp = handle(&Request::get("/"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("post 1 of 2"), "{}", resp.body);
+        assert!(!resp.body.contains("Raise arms overhead"), "{}", resp.body);
+        assert!(resp.body.contains("Annotated chart below"), "{}", resp.body);
+        let resp = handle(&Request::get("/?i=1"), &state);
+        assert!(resp.body.contains("Just a plain note"), "{}", resp.body);
+        // The store file is untouched: filtering is in memory only.
+        let store = std::fs::read_to_string(state.store_path()).unwrap();
+        assert!(store.contains("syn_p1"), "store must keep the author");
+    }
+
+    #[test]
+    fn hidden_authors_page_lists_with_unhide_and_restores() {
+        let (_dir, state) = test_state();
+        let resp = handle(&Request::get("/hidden-authors"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("No hidden authors"), "{}", resp.body);
+        assert_eq!(
+            handle(
+                &Request::post("/vote", "post_id=p2&verdict=never_author&i=1"),
+                &state
+            )
+            .status,
+            303
+        );
+        let resp = handle(&Request::get("/hidden-authors"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("syn_p2"), "{}", resp.body);
+        assert!(
+            resp.body.contains("action=\"/unhide-author\""),
+            "{}",
+            resp.body
+        );
+        assert!(resp.body.contains(">Unhide</button>"), "{}", resp.body);
+        // POST unhide (different case/@ spelling) restores the post.
+        let resp = handle(&Request::post("/unhide-author", "username=@SYN_P2"), &state);
+        assert_eq!(resp.status, 303);
+        assert_eq!(resp.location.as_deref(), Some("/hidden-authors"));
+        // The log stays append-only: hide plus unhide, nothing rewritten.
+        // (Checked before the final brief render, which marks try-it shown.)
+        let entries = log_entries(&state);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].payload["verdict"], "unhide_author");
+        let resp = handle(&Request::get("/hidden-authors"), &state);
+        assert!(resp.body.contains("No hidden authors"), "{}", resp.body);
+        let resp = handle(&Request::get("/"), &state);
+        assert!(resp.body.contains("post 1 of 3"), "{}", resp.body);
+    }
+
+    #[test]
+    fn unhide_rejects_bad_input_without_logging() {
+        let (_dir, state) = test_state();
+        assert_eq!(
+            handle(&Request::post("/unhide-author", "username="), &state).status,
+            400
+        );
+        assert_eq!(
+            handle(&Request::post("/unhide-author", "tried=yes"), &state).status,
+            400
+        );
+        assert!(
+            !state.log_path().exists(),
+            "bad unhides must not create a log"
+        );
+    }
+
+    #[test]
+    fn hiding_every_author_points_at_undo_page() {
+        let (_dir, state) = test_state();
+        let mut last = handle(
+            &Request::post("/vote", "post_id=p1&verdict=never_author&i=0"),
+            &state,
+        );
+        for (id, i) in [("p2", 0), ("p3", 0)] {
+            last = handle(
+                &Request::post("/vote", &format!("post_id={id}&verdict=never_author&i={i}")),
+                &state,
+            );
+            assert_eq!(last.status, 303);
+        }
+        assert_eq!(last.location.as_deref(), Some("/hidden-authors"));
+        let resp = handle(&Request::get("/"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("Every post is hidden"), "{}", resp.body);
+        assert!(resp.body.contains("/hidden-authors"), "{}", resp.body);
+    }
+
+    #[test]
+    fn try_page_skips_hidden_author_pending_without_ui_mention() {
+        let (_dir, state) = test_state();
+        assert_eq!(handle(&Request::get("/"), &state).status, 200);
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        // p2 is not try-it tagged, so mark it shown directly.
+        bookmarks_agent::try_it::record_shown(&mut log, "p2", 1_700_000_000).unwrap();
+        drop(log);
+        // Hide p2's author via the real vote handler.
+        assert_eq!(
+            handle(
+                &Request::post("/vote", "post_id=p2&verdict=never_author&i=1"),
+                &state
+            )
+            .status,
+            303
+        );
+        let resp = handle(&Request::get("/try"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("p1"), "{}", resp.body);
+        assert!(!resp.body.contains("p2"), "no UI mention: {}", resp.body);
+    }
+
+    #[test]
+    fn ideas_page_skips_hidden_author_cards_without_ui_mention() {
+        let (_dir, state) = test_state();
+        let card = |id: &str, source: &str| {
+            serde_json::json!({
+                "id": id,
+                "source_url": source,
+                "idea": format!("synthetic idea {id}"),
+                "ancientos_mapping": "gate",
+                "effort": "S",
+                "status": "new",
+                "created_at": 1_700_000_000u64,
+            })
+            .to_string()
+        };
+        std::fs::write(
+            state.cards_path(),
+            [
+                card("card-p1", "https://example.invalid/a/status/p1"),
+                card("card-p2", "https://example.invalid/a/status/p2"),
+                card("card-ghost", "https://example.invalid/a/status/ghost"),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            handle(
+                &Request::post("/vote", "post_id=p1&verdict=never_author&i=0"),
+                &state
+            )
+            .status,
+            303
+        );
+        let resp = handle(&Request::get("/ideas"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("card-p2"), "{}", resp.body);
+        assert!(
+            resp.body.contains("card-ghost"),
+            "unknown kept: {}",
+            resp.body
+        );
+        assert!(
+            !resp.body.contains("card-p1"),
+            "no UI mention: {}",
+            resp.body
         );
     }
 
