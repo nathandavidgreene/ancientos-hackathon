@@ -1,6 +1,6 @@
 //! Score the try-it cascade (rules -> Jev -> Muse Spark) on labeled bookmarks.
 //!
-//! Usage: `try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>]`.
+//! Usage: `try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>] [--jev-threshold <f>]`.
 //! Labels lines carry an id (`post_id`, or `n`) plus a boolean `try_it`;
 //! bookmarks lines are [`Bookmark`] JSON joined by id. Labels without a
 //! bookmark are skipped with a count, as are malformed lines. Non-English
@@ -14,10 +14,15 @@
 //! [`Sensitivity::Sanitized`]. The run stops early on HTTP 429 instead of
 //! continuing. Without `ANCIENTOS_ALLOW_PAID=1` it still runs, rules only,
 //! and says so.
+//!
+//! The Jev yes threshold defaults to 0.3, reads
+//! `ANCIENTOS_JEV_TRY_IT_THRESHOLD` when set (see
+//! [`jev_threshold_from_env`]), and `--jev-threshold <f>` overrides both.
+//! The summary prints the threshold actually used.
 use ancientos_router::jev_client::JevClient;
 use ancientos_router::muse::MuseClient;
 use ancientos_router::try_it_cascade::{
-    Cascade, CascadeStats, RulesVerdict, TRY_IT_MUSE_MAX_COMPLETION_TOKENS,
+    jev_threshold_from_env, Cascade, CascadeStats, RulesVerdict, TRY_IT_MUSE_MAX_COMPLETION_TOKENS,
 };
 use ancientos_router::Sensitivity;
 use bookmarks_agent::brief::topic_of;
@@ -26,7 +31,8 @@ use bookmarks_agent::try_it::rules_confident;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>]";
+const USAGE: &str =
+    "usage: try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>] [--jev-threshold <f>]";
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -50,39 +56,72 @@ struct Args {
     labels: PathBuf,
     bookmarks: PathBuf,
     out: Option<PathBuf>,
+    jev_threshold: Option<f64>,
 }
 
-/// Parse argv. Unknown or repeated flags, missing values, and missing required
-/// flags are all errors (fail closed); paths are never echoed back.
+/// Parse argv. Unknown or repeated flags, missing values, missing required
+/// flags, and invalid `--jev-threshold` values are all errors (fail closed);
+/// paths are never echoed back.
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut labels = None;
     let mut bookmarks = None;
     let mut out = None;
+    let mut jev_threshold = None;
     let mut i = 1;
     while i < argv.len() {
         let flag = argv[i].as_str();
-        if !matches!(flag, "--labels" | "--bookmarks" | "--out") {
+        if !matches!(
+            flag,
+            "--labels" | "--bookmarks" | "--out" | "--jev-threshold"
+        ) {
             return Err(format!("unknown argument: {flag}"));
         }
         let value = argv
             .get(i + 1)
             .ok_or_else(|| format!("missing value for {flag}"))?;
-        let slot = match flag {
-            "--labels" => &mut labels,
-            "--bookmarks" => &mut bookmarks,
-            _ => &mut out,
-        };
-        if slot.is_some() {
-            return Err(format!("repeated argument: {flag}"));
+        if flag == "--jev-threshold" {
+            if jev_threshold.is_some() {
+                return Err(format!("repeated argument: {flag}"));
+            }
+            jev_threshold = Some(parse_jev_threshold(value)?);
+        } else {
+            let slot = match flag {
+                "--labels" => &mut labels,
+                "--bookmarks" => &mut bookmarks,
+                _ => &mut out,
+            };
+            if slot.is_some() {
+                return Err(format!("repeated argument: {flag}"));
+            }
+            *slot = Some(PathBuf::from(value));
         }
-        *slot = Some(PathBuf::from(value));
         i += 2;
     }
     Ok(Args {
         labels: labels.ok_or_else(|| "missing --labels <jsonl>".to_string())?,
         bookmarks: bookmarks.ok_or_else(|| "missing --bookmarks <jsonl>".to_string())?,
         out,
+        jev_threshold,
     })
+}
+
+/// Parse a `--jev-threshold` value: a number in [0,1]. Anything else is an
+/// error (fail closed): an explicit bad flag never silently falls back.
+fn parse_jev_threshold(value: &str) -> Result<f64, String> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| !v.is_nan() && (0.0..=1.0).contains(v))
+        .ok_or_else(|| {
+            format!("invalid value for --jev-threshold: {value:?} (want a number in [0,1])")
+        })
+}
+
+/// Resolve the threshold actually used: the CLI flag wins, else
+/// [`jev_threshold_from_env`] (env var or the 0.3 default).
+fn resolve_jev_threshold(flag: Option<f64>) -> f64 {
+    flag.unwrap_or_else(jev_threshold_from_env)
 }
 
 /// One gold label: bookmark id plus the expected try-it answer.
@@ -217,6 +256,7 @@ fn run(args: &Args) -> Result<(), String> {
     let paid = std::env::var("ANCIENTOS_ALLOW_PAID")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let jev_threshold = resolve_jev_threshold(args.jev_threshold);
     let jev = match JevClient::from_env() {
         Ok(client) => Some(client),
         Err(e) => {
@@ -228,7 +268,7 @@ fn run(args: &Args) -> Result<(), String> {
         .with_model("muse-spark-1.3")
         .with_reasoning_effort("low")
         .with_max_completion_tokens(TRY_IT_MUSE_MAX_COMPLETION_TOKENS);
-    let cascade = Cascade::new(jev.as_ref(), Some(&muse));
+    let cascade = Cascade::new(jev.as_ref(), Some(&muse)).with_jev_threshold(jev_threshold);
 
     // Translations come from $TRANSLATIONS_CACHE_PATH when set, else
     // translations.json next to the bookmarks file, else none. Read-only.
@@ -323,6 +363,7 @@ fn run(args: &Args) -> Result<(), String> {
     } else {
         println!("paid: off (ANCIENTOS_ALLOW_PAID!=1): rules only, no API calls");
     }
+    println!("jev threshold: {jev_threshold:.3}");
     let cascade_prf = prf(&cascade_pairs);
     let rules_prf = prf(&rules_pairs);
     println!(
@@ -378,6 +419,7 @@ mod tests {
         assert_eq!(a.labels, PathBuf::from("l"));
         assert_eq!(a.bookmarks, PathBuf::from("b"));
         assert_eq!(a.out, None);
+        assert_eq!(a.jev_threshold, None);
         let a = parse_args(&argv(&[
             "bin",
             "--labels",
@@ -400,6 +442,20 @@ mod tests {
             "l"
         ]))
         .is_ok());
+        // The threshold flag parses a number in [0,1], endpoints included.
+        for (raw, expected) in [("0", 0.0), ("1", 1.0), ("0.7", 0.7)] {
+            let a = parse_args(&argv(&[
+                "bin",
+                "--labels",
+                "l",
+                "--bookmarks",
+                "b",
+                "--jev-threshold",
+                raw,
+            ]))
+            .unwrap();
+            assert_eq!(a.jev_threshold, Some(expected), "argv {raw:?}");
+        }
         for bad in [
             argv(&["bin"]),
             argv(&["bin", "--labels", "l"]),
@@ -407,9 +463,110 @@ mod tests {
             argv(&["bin", "--labels", "l", "--bookmarks", "b", "--bogus", "x"]),
             argv(&["bin", "--labels", "l", "--labels", "m", "--bookmarks", "b"]),
             argv(&["bin", "l", "b"]),
+            // Threshold flag: missing, repeated, or unparseable values fail.
+            argv(&[
+                "bin",
+                "--labels",
+                "l",
+                "--bookmarks",
+                "b",
+                "--jev-threshold",
+            ]),
+            argv(&[
+                "bin",
+                "--labels",
+                "l",
+                "--bookmarks",
+                "b",
+                "--jev-threshold",
+                "0.5",
+                "--jev-threshold",
+                "0.7",
+            ]),
+            argv(&[
+                "bin",
+                "--labels",
+                "l",
+                "--bookmarks",
+                "b",
+                "--jev-threshold",
+                "bogus",
+            ]),
+            argv(&[
+                "bin",
+                "--labels",
+                "l",
+                "--bookmarks",
+                "b",
+                "--jev-threshold",
+                "NaN",
+            ]),
+            argv(&[
+                "bin",
+                "--labels",
+                "l",
+                "--bookmarks",
+                "b",
+                "--jev-threshold",
+                "-0.1",
+            ]),
+            argv(&[
+                "bin",
+                "--labels",
+                "l",
+                "--bookmarks",
+                "b",
+                "--jev-threshold",
+                "1.5",
+            ]),
         ] {
             assert!(parse_args(&bad).is_err(), "argv {bad:?} must fail");
         }
+    }
+
+    /// Set one process env var for a test, restoring the previous value on drop.
+    /// Only the threshold test below touches env, so no lock is needed.
+    struct EnvGuard {
+        key: &'static str,
+        saved: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let saved = std::env::var(key).ok();
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn threshold_flag_overrides_env() {
+        use ancientos_router::try_it_cascade::{
+            ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV, TRY_IT_THRESHOLD,
+        };
+        // The flag wins over whatever the env says.
+        let _env = EnvGuard::set(ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV, Some("0.9"));
+        assert_eq!(resolve_jev_threshold(Some(0.1)), 0.1);
+        // Without the flag, a valid env value wins over the default.
+        assert_eq!(resolve_jev_threshold(None), 0.9);
+        // Without the flag, a bad env value falls back to the default.
+        let _env = EnvGuard::set(ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV, Some("bogus"));
+        assert_eq!(resolve_jev_threshold(None), TRY_IT_THRESHOLD);
+        let _env = EnvGuard::set(ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV, None);
+        assert_eq!(resolve_jev_threshold(None), TRY_IT_THRESHOLD);
+        assert_eq!(TRY_IT_THRESHOLD, 0.3);
     }
 
     #[test]

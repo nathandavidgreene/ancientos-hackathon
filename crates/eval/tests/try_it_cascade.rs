@@ -209,6 +209,24 @@ fn fixtures() -> (String, String) {
     (labels, bookmarks)
 }
 
+/// One rules-unsure bookmark plus its label, for threshold tests.
+fn single_unsure_fixture() -> (String, String) {
+    let bookmarks = bookmark(
+        "u1",
+        "AI Agents",
+        "A tip. Roll your shoulders and hold for a moment.",
+    ) + "\n";
+    let labels = "{\"post_id\":\"u1\",\"try_it\":true}\n".to_string();
+    (labels, bookmarks)
+}
+
+fn read_out_rows(out_path: &str) -> Vec<serde_json::Value> {
+    let out = std::fs::read_to_string(out_path).expect("read out");
+    out.lines()
+        .map(|l| serde_json::from_str(l).expect("out is jsonl"))
+        .collect()
+}
+
 fn write_fixtures(
     dir: &std::path::Path,
     labels: &str,
@@ -255,7 +273,7 @@ fn full_cascade_through_all_stages() {
             ("META_API_KEY", "test-key"),
             ("ANCIENTOS_ALLOW_PAID", "1"),
         ],
-        &[],
+        &["ANCIENTOS_JEV_TRY_IT_THRESHOLD"],
     );
     assert!(ok, "exit ok, stderr: {stderr}");
     jev_done
@@ -367,7 +385,7 @@ fn excluded_topic_is_filtered_before_any_call() {
             ("META_API_KEY", "test-key"),
             ("ANCIENTOS_ALLOW_PAID", "1"),
         ],
-        &[],
+        &["ANCIENTOS_JEV_TRY_IT_THRESHOLD"],
     );
     assert!(ok, "exit ok, stderr: {stderr}");
     jev_done
@@ -590,7 +608,7 @@ fn stops_on_rate_limit() {
             ("META_API_KEY", "test-key"),
             ("ANCIENTOS_ALLOW_PAID", "1"),
         ],
-        &[],
+        &["ANCIENTOS_JEV_TRY_IT_THRESHOLD"],
     );
     assert!(ok, "exit ok, stderr: {stderr}");
     jev_done
@@ -648,7 +666,7 @@ fn truncation_is_counted_separately_from_ordinary_no() {
             ("META_API_KEY", "test-key"),
             ("ANCIENTOS_ALLOW_PAID", "1"),
         ],
-        &[],
+        &["ANCIENTOS_JEV_TRY_IT_THRESHOLD"],
     );
     assert!(ok, "exit ok, stderr: {stderr}");
     jev_done
@@ -688,4 +706,172 @@ fn truncation_is_counted_separately_from_ordinary_no() {
         let sent: serde_json::Value = serde_json::from_str(body).expect("muse request is json");
         assert_eq!(sent["max_completion_tokens"], 1024);
     }
+}
+
+#[test]
+fn jev_threshold_flag_overrides_env() {
+    let (labels, bookmarks) = single_unsure_fixture();
+
+    // Env 0.9, no flag: noul 0.5 falls through to Muse, and the summary
+    // prints the env threshold.
+    let (jev_url, _, jev_done) = mock_server(vec![(200, jev_noul_body(0.5))]);
+    let (muse_url, _, muse_done) = mock_server(vec![(200, muse_body("{\"try_it\":true}"))]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), &labels, &bookmarks);
+    let (ok, stdout, stderr) = run_bin(
+        &[
+            "--labels",
+            &labels_path,
+            "--bookmarks",
+            &bookmarks_path,
+            "--out",
+            &out_path,
+        ],
+        &[
+            ("JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_BASE_URL", &jev_url),
+            ("TYPESAFE_API_KEY", "test-key"),
+            ("META_API_BASE", &muse_url),
+            ("META_API_KEY", "test-key"),
+            ("ANCIENTOS_ALLOW_PAID", "1"),
+            ("ANCIENTOS_JEV_TRY_IT_THRESHOLD", "0.9"),
+        ],
+        &[],
+    );
+    assert!(ok, "exit ok, stderr: {stderr}");
+    jev_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("jev got exactly 1 call");
+    muse_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("muse got exactly 1 call");
+    assert!(stdout.contains("1 decided"), "{stdout}");
+    assert!(stdout.contains("jev threshold: 0.900"), "{stdout}");
+    let rows = read_out_rows(&out_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["post_id"], "u1");
+    assert_eq!(rows[0]["predicted"], true);
+    assert_eq!(rows[0]["stage"], "muse");
+
+    // Same env plus --jev-threshold 0.1: the flag wins, noul 0.5 answers
+    // yes at Jev, and Muse (a closed port) is never reached.
+    let (jev_url, _, jev_done) = mock_server(vec![(200, jev_noul_body(0.5))]);
+    let muse_closed = closed_url();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), &labels, &bookmarks);
+    let (ok, stdout, stderr) = run_bin(
+        &[
+            "--labels",
+            &labels_path,
+            "--bookmarks",
+            &bookmarks_path,
+            "--out",
+            &out_path,
+            "--jev-threshold",
+            "0.1",
+        ],
+        &[
+            ("JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_BASE_URL", &jev_url),
+            ("TYPESAFE_API_KEY", "test-key"),
+            ("META_API_BASE", &muse_closed),
+            ("META_API_KEY", "test-key"),
+            ("ANCIENTOS_ALLOW_PAID", "1"),
+            ("ANCIENTOS_JEV_TRY_IT_THRESHOLD", "0.9"),
+        ],
+        &[],
+    );
+    assert!(ok, "exit ok, stderr: {stderr}");
+    jev_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("jev got exactly 1 call");
+    assert!(stdout.contains("jev threshold: 0.100"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "calls: jev=1 jev_yes=1 muse=0 muse_yes=0 muse_truncated=0 rules_yes=0 topic_filtered=0 fail_closed=0 errors=0"
+        ),
+        "{stdout}"
+    );
+    let rows = read_out_rows(&out_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["predicted"], true);
+    assert_eq!(rows[0]["stage"], "jev");
+}
+
+#[test]
+fn jev_threshold_invalid_env_falls_back_to_default() {
+    let (labels, bookmarks) = single_unsure_fixture();
+
+    // Bogus env falls back to the 0.3 default: noul 0.35 answers yes at
+    // Jev, and Muse (a closed port) is never reached.
+    let (jev_url, _, jev_done) = mock_server(vec![(200, jev_noul_body(0.35))]);
+    let muse_closed = closed_url();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), &labels, &bookmarks);
+    let (ok, stdout, stderr) = run_bin(
+        &[
+            "--labels",
+            &labels_path,
+            "--bookmarks",
+            &bookmarks_path,
+            "--out",
+            &out_path,
+        ],
+        &[
+            ("JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_BASE_URL", &jev_url),
+            ("TYPESAFE_API_KEY", "test-key"),
+            ("META_API_BASE", &muse_closed),
+            ("META_API_KEY", "test-key"),
+            ("ANCIENTOS_ALLOW_PAID", "1"),
+            ("ANCIENTOS_JEV_TRY_IT_THRESHOLD", "bogus"),
+        ],
+        &[],
+    );
+    assert!(ok, "exit ok, stderr: {stderr}");
+    jev_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("jev got exactly 1 call");
+    assert!(stdout.contains("jev threshold: 0.300"), "{stdout}");
+    let rows = read_out_rows(&out_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["predicted"], true);
+    assert_eq!(rows[0]["stage"], "jev");
+
+    // Unset env means the same default: noul 0.29 falls through to Muse.
+    let (jev_url, _, jev_done) = mock_server(vec![(200, jev_noul_body(0.29))]);
+    let (muse_url, _, muse_done) = mock_server(vec![(200, muse_body("{\"try_it\":false}"))]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), &labels, &bookmarks);
+    let (ok, stdout, stderr) = run_bin(
+        &[
+            "--labels",
+            &labels_path,
+            "--bookmarks",
+            &bookmarks_path,
+            "--out",
+            &out_path,
+        ],
+        &[
+            ("JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_BASE_URL", &jev_url),
+            ("TYPESAFE_API_KEY", "test-key"),
+            ("META_API_BASE", &muse_url),
+            ("META_API_KEY", "test-key"),
+            ("ANCIENTOS_ALLOW_PAID", "1"),
+        ],
+        &["ANCIENTOS_JEV_TRY_IT_THRESHOLD"],
+    );
+    assert!(ok, "exit ok, stderr: {stderr}");
+    jev_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("jev got exactly 1 call");
+    muse_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("muse got exactly 1 call");
+    assert!(stdout.contains("jev threshold: 0.300"), "{stdout}");
+    let rows = read_out_rows(&out_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["predicted"], false);
+    assert_eq!(rows[0]["stage"], "muse");
 }

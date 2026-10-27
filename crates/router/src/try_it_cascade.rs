@@ -10,7 +10,8 @@
 //! both paid-allowed, [`Sensitivity::Sanitized`] — and then:
 //!
 //! - Stage 2 (Jev): one `noul` question with the same try-it wording the eval
-//!   uses ([`TRY_IT_INSTRUCTIONS`]); `noul >= 0.5` answers yes.
+//!   uses ([`TRY_IT_INSTRUCTIONS`]); `noul >=` threshold answers yes
+//!   (default [`TRY_IT_THRESHOLD`], overridable per [`Cascade`]).
 //! - Stage 3 (Muse Spark): strict-JSON `{"try_it":true|false}` prompt with the
 //!   same definition; the reply is parsed leniently (first `{...}`). An
 //!   empty/null content with `finish_reason` "length" still fails closed but
@@ -34,8 +35,27 @@ use crate::{RouterError, Sensitivity};
 /// the two match.
 pub const TRY_IT_INSTRUCTIONS: &str = "This X bookmark is hands-on practice the reader could physically try now with actionable steps (exercise, stretch, breathing, meditation, recipe, concrete routine, a tool walkthrough with steps). Not general advice lists, news, or hype.";
 
-/// Jev `noul` threshold: `>= 0.5` answers yes.
-pub const TRY_IT_THRESHOLD: f64 = 0.5;
+/// Default Jev `noul` threshold: `>= 0.3` answers yes. Tuned against real
+/// labels for recall; override per cascade with
+/// [`Cascade::with_jev_threshold`] or process-wide with
+/// [`ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV`].
+pub const TRY_IT_THRESHOLD: f64 = 0.3;
+
+/// Env var overriding the Jev try-it threshold. Unset, empty, unparseable,
+/// NaN, or outside [0,1] falls back to [`TRY_IT_THRESHOLD`] (see
+/// [`jev_threshold_from_env`]).
+pub const ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV: &str = "ANCIENTOS_JEV_TRY_IT_THRESHOLD";
+
+/// Read [`ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV`]: a number in [0,1] wins;
+/// anything else (unset, empty, unparseable, NaN, out of range) falls back
+/// to [`TRY_IT_THRESHOLD`]. Never panics.
+pub fn jev_threshold_from_env() -> f64 {
+    std::env::var(ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| !v.is_nan() && (0.0..=1.0).contains(v))
+        .unwrap_or(TRY_IT_THRESHOLD)
+}
 
 /// Muse Spark completion-token cap for stage 3 (a classify-style yes/no
 /// call). Single source of truth for the cascade and the eval bin. Muse
@@ -69,7 +89,7 @@ pub enum CascadeStage {
     /// Rules alone (confident yes, or gates off: unpaid, non-sanitized,
     /// or a client missing).
     Rules,
-    /// Jev `noul >= 0.5`.
+    /// Jev `noul >=` threshold (default 0.3).
     Jev,
     /// Muse Spark strict-JSON answer.
     Muse,
@@ -181,11 +201,30 @@ pub struct CascadeStats {
 pub struct Cascade<'a> {
     jev: Option<&'a JevClient>,
     muse: Option<&'a MuseClient>,
+    jev_threshold: f64,
 }
 
 impl<'a> Cascade<'a> {
     pub fn new(jev: Option<&'a JevClient>, muse: Option<&'a MuseClient>) -> Self {
-        Self { jev, muse }
+        Self {
+            jev,
+            muse,
+            jev_threshold: TRY_IT_THRESHOLD,
+        }
+    }
+
+    /// Override the Jev yes threshold (`noul >= threshold` answers yes).
+    /// NaN or outside [0,1] falls back to [`TRY_IT_THRESHOLD`] (fail closed).
+    pub fn with_jev_threshold(mut self, threshold: f64) -> Self {
+        if !threshold.is_nan() && (0.0..=1.0).contains(&threshold) {
+            self.jev_threshold = threshold;
+        }
+        self
+    }
+
+    /// The Jev yes threshold this cascade answers against.
+    pub fn jev_threshold(&self) -> f64 {
+        self.jev_threshold
     }
 
     /// Decide one item, updating `stats`. Never fails: see the module docs.
@@ -235,7 +274,7 @@ impl<'a> Cascade<'a> {
                 stats.jev_input_tokens += reply.input_tokens;
                 stats.jev_output_tokens += reply.output_tokens;
                 match reply.noul("try_it") {
-                    Some(p) if p >= TRY_IT_THRESHOLD => {
+                    Some(p) if p >= self.jev_threshold => {
                         stats.jev_yes += 1;
                         return CascadeDecision {
                             try_it: true,
@@ -686,9 +725,10 @@ mod tests {
     }
 
     #[test]
-    fn jev_threshold_is_precise_at_half() {
-        // Exactly 0.5 answers yes and never reaches muse.
-        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.5));
+    fn jev_threshold_defaults_to_point_three() {
+        assert_eq!(TRY_IT_THRESHOLD, 0.3);
+        // Exactly 0.3 answers yes and never reaches muse.
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.3));
         let jev = jev_client(jev_url, true);
         let muse = muse_client(closed_url(), true);
         let cascade = Cascade::new(Some(&jev), Some(&muse));
@@ -702,6 +742,107 @@ mod tests {
         jev_handle.join().expect("server thread");
         assert_eq!((d.try_it, d.stage), (true, CascadeStage::Jev));
         assert_eq!(stats.muse_calls, 0);
+    }
+
+    #[test]
+    fn just_below_default_falls_through_to_muse() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
+        // 0.29 is below the 0.3 default: Jev says no, Muse decides.
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.29));
+        let (muse_url, _, muse_handle) = mock_server(200, &muse_body("{\"try_it\":false}"));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        assert_eq!(cascade.jev_threshold(), TRY_IT_THRESHOLD);
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "x",
+            Sensitivity::Sanitized,
+            RulesVerdict::Unsure,
+            &mut stats,
+        );
+        jev_handle.join().expect("server thread");
+        muse_handle.join().expect("server thread");
+        assert_eq!((d.try_it, d.stage), (false, CascadeStage::Muse));
+        assert_eq!(stats.jev_calls, 1);
+        assert_eq!(stats.jev_yes, 0);
+        assert_eq!(stats.muse_calls, 1);
+    }
+
+    #[test]
+    fn builder_overrides_threshold() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
+        // Invalid builder values fail closed to the default, never stored.
+        let jev = jev_client(closed_url(), true);
+        let muse = muse_client(closed_url(), true);
+        for bad in [f64::NAN, -0.1, 1.5, f64::INFINITY] {
+            let cascade = Cascade::new(Some(&jev), Some(&muse)).with_jev_threshold(bad);
+            assert_eq!(cascade.jev_threshold(), TRY_IT_THRESHOLD, "input {bad}");
+        }
+        // A high threshold sends 0.5 to Muse instead of answering yes.
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.5));
+        let (muse_url, _, muse_handle) = mock_server(200, &muse_body("{\"try_it\":true}"));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse)).with_jev_threshold(0.9);
+        assert_eq!(cascade.jev_threshold(), 0.9);
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "x",
+            Sensitivity::Sanitized,
+            RulesVerdict::Unsure,
+            &mut stats,
+        );
+        jev_handle.join().expect("server thread");
+        muse_handle.join().expect("server thread");
+        assert_eq!((d.try_it, d.stage), (true, CascadeStage::Muse));
+        assert_eq!(stats.jev_yes, 0);
+        assert_eq!(stats.muse_calls, 1);
+        // A low threshold answers yes at 0.2 without reaching Muse.
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.2));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(closed_url(), true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse)).with_jev_threshold(0.1);
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "x",
+            Sensitivity::Sanitized,
+            RulesVerdict::Unsure,
+            &mut stats,
+        );
+        jev_handle.join().expect("server thread");
+        assert_eq!((d.try_it, d.stage), (true, CascadeStage::Jev));
+        assert_eq!(stats.muse_calls, 0);
+    }
+
+    #[test]
+    fn env_threshold_parsing_matrix() {
+        let _guard = env_lock();
+        // Unset, empty, and blank fall back to the default.
+        for value in [None, Some(""), Some("   ")] {
+            let _env = EnvGuard::set(&[(ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV, value)]);
+            assert_eq!(
+                jev_threshold_from_env(),
+                TRY_IT_THRESHOLD,
+                "input {value:?}"
+            );
+        }
+        // Valid numbers in [0,1] win, endpoints included.
+        for (value, expected) in [("0", 0.0), ("1", 1.0), ("0.3", 0.3), ("0.7", 0.7)] {
+            let _env = EnvGuard::set(&[(ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV, Some(value))]);
+            assert_eq!(jev_threshold_from_env(), expected, "input {value:?}");
+        }
+        // Invalid, NaN, and out-of-range fall back, never panic.
+        for value in ["bogus", "NaN", "nan", "-0.1", "1.5", "inf", "-inf", "0.5.0"] {
+            let _env = EnvGuard::set(&[(ANCIENTOS_JEV_TRY_IT_THRESHOLD_ENV, Some(value))]);
+            assert_eq!(
+                jev_threshold_from_env(),
+                TRY_IT_THRESHOLD,
+                "input {value:?}"
+            );
+        }
     }
 
     #[test]
