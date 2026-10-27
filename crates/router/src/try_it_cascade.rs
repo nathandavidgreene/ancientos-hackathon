@@ -15,9 +15,12 @@
 //!   (default [`TRY_IT_THRESHOLD`], overridable per [`Cascade`]).
 //! - Stage 3 (Muse Spark): strict-JSON `{"try_it":true|false}` prompt with the
 //!   same definition; the reply is parsed leniently (first `{...}`). An
-//!   empty/null content with `finish_reason` "length" still fails closed but
-//!   is flagged as truncated instead of an ordinary Muse "no" (see
-//!   [`CascadeDecision::truncated`] and [`CascadeStats::muse_truncated`]).
+//!   empty/null content with `finish_reason` "length" is retried exactly
+//!   once with the doubled cap [`TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS`]
+//!   (counted in [`CascadeStats::muse_retries`]); only a second truncation
+//!   still fails closed and is flagged as truncated instead of an ordinary
+//!   Muse "no" (see [`CascadeDecision::truncated`] and
+//!   [`CascadeStats::muse_truncated`]).
 //!
 //! Fail-closed everywhere: gates-off items fall back to the rules verdict
 //! with no call and no error, while backend errors and unparseable replies
@@ -27,7 +30,7 @@
 //! [`CascadeDecision::is_rate_limited`].
 use crate::data_class::{check_egress, DataClass, Route};
 use crate::jev_client::JevClient;
-use crate::muse::MuseClient;
+use crate::muse::{MuseChatResponse, MuseClient};
 use crate::topic_filter::excluded_topic;
 use crate::RouterError;
 use ancientos_core::log::DecisionLog;
@@ -63,10 +66,18 @@ pub fn jev_threshold_from_env() -> f64 {
 /// Muse Spark completion-token cap for stage 3 (a classify-style yes/no
 /// call). Single source of truth for the cascade and the eval bin. Muse
 /// Spark's reasoning shares this budget: 200 starved every answer (empty
-/// content, `finish_reason` "length"), while real answers used up to 672
+/// content, `finish_reason` "length"), 1024 still truncated about 1 in 7
+/// answers at reasoning effort low, while real answers used up to 672
 /// completion tokens. The brief (700), deeper, and delegate caps are
 /// separate and unchanged.
-pub const TRY_IT_MUSE_MAX_COMPLETION_TOKENS: u32 = 1024;
+pub const TRY_IT_MUSE_MAX_COMPLETION_TOKENS: u32 = 2048;
+
+/// Doubled cap for stage 3's single length-truncation retry. A first reply
+/// that is empty/unparseable with `finish_reason` "length" is retried
+/// exactly once through the same [`MuseClient::chat_with_class`] path (same
+/// data class, caller, paid gate, and egress checks) with this cap; only a
+/// second truncation counts as truncated.
+pub const TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS: u32 = 4096;
 
 /// Rules verdict for one item, computed by the caller (bookmarks-agent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +193,8 @@ mod status_tests {
 /// token counts record successful Jev replies only. `muse_truncated` counts
 /// the Muse calls that failed closed on a length truncation; those calls
 /// are also counted in `muse_calls`, `fail_closed`, and `errors`.
+/// `muse_retries` counts the single length-truncation retries (at most one
+/// per item); each retry is also counted in `muse_calls`.
 /// `topic_filtered` counts stage-0 answers (never try-it, never a call).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadeStats {
@@ -192,6 +205,7 @@ pub struct CascadeStats {
     pub muse_calls: u64,
     pub muse_yes: u64,
     pub muse_truncated: u64,
+    pub muse_retries: u64,
     pub fail_closed: u64,
     pub errors: u64,
     pub jev_input_tokens: u64,
@@ -315,11 +329,30 @@ impl<'a> Cascade<'a> {
             }
             Err(e) => return fail_closed(rules, stats, e, false),
         }
-        // Stage 3: Muse Spark. Final answer. `chat` (not `complete`) so a
-        // length-truncated reply keeps its finish reason and is flagged as
-        // truncated instead of an ordinary Muse "no".
+        // Stage 3: Muse Spark. Final answer. `chat_with_class` (not
+        // `complete`) so a length-truncated reply keeps its finish reason. A
+        // first reply that is empty/unparseable with `finish_reason` "length"
+        // is retried exactly once with the doubled cap, through the same
+        // `chat_with_class` path (same class, caller, paid gate, and egress
+        // checks); only a second truncation is flagged as truncated instead
+        // of an ordinary Muse "no". Non-length failures never retry.
+        let prompt = muse_prompt(text);
         stats.muse_calls += 1;
-        match muse.chat_with_class(class, "cascade", log.as_deref_mut(), &muse_prompt(text)) {
+        let first = muse.chat_with_class(class, "cascade", log.as_deref_mut(), &prompt);
+        let retry = match &first {
+            Ok(reply) => parse_muse_try_it(&reply.content).is_none() && is_truncated_reply(reply),
+            Err(e) => is_truncation_error(e),
+        };
+        let result = if retry {
+            stats.muse_retries += 1;
+            stats.muse_calls += 1;
+            muse.clone()
+                .with_max_completion_tokens(TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS)
+                .chat_with_class(class, "cascade", log.as_deref_mut(), &prompt)
+        } else {
+            first
+        };
+        match result {
             Ok(reply) => match parse_muse_try_it(&reply.content) {
                 Some(answer) => {
                     if answer {
@@ -333,8 +366,7 @@ impl<'a> Cascade<'a> {
                     }
                 }
                 None => {
-                    let truncated = reply.finish_reason.as_deref() == Some("length")
-                        && reply.content.trim().is_empty();
+                    let truncated = is_truncated_reply(&reply);
                     fail_closed(
                         rules,
                         stats,
@@ -385,6 +417,14 @@ fn fail_closed(
         error: Some(error.to_string()),
         truncated,
     }
+}
+
+/// True when a parsed Muse reply is a length truncation: empty content
+/// with `finish_reason` "length". Callers check unparseability separately:
+/// the retry trigger needs both, while the final fail-closed path only
+/// reaches here after parsing already failed.
+fn is_truncated_reply(reply: &MuseChatResponse) -> bool {
+    reply.finish_reason.as_deref() == Some("length") && reply.content.trim().is_empty()
 }
 
 /// True when a Muse error is a length truncation. [`MuseClient`] reports a
@@ -441,7 +481,7 @@ mod tests {
     use super::*;
     use crate::jev_client::JevBackend;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -495,63 +535,104 @@ mod tests {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("read timeout");
-            let mut content_length = 0usize;
-            let mut line = Vec::new();
-            let mut buf = [0u8; 1];
-            let mut raw_len = 0usize;
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        raw_len += 1;
-                        line.push(buf[0]);
-                        if buf[0] == b'\n' {
-                            let text = String::from_utf8_lossy(&line);
-                            if text.to_lowercase().starts_with("content-length:") {
-                                content_length = text
-                                    .split(':')
-                                    .nth(1)
-                                    .and_then(|v| v.trim().parse().ok())
-                                    .unwrap_or(0);
-                            }
-                            if line == b"\r\n" || line == b"\n" {
-                                break;
-                            }
-                            line.clear();
-                        }
-                        if raw_len > 65536 {
-                            break;
-                        }
-                    }
-                }
-            }
-            let mut rest = vec![0u8; content_length.min(1 << 20)];
-            let mut filled = 0;
-            while filled < rest.len() {
-                match stream.read(&mut rest[filled..]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => filled += n,
-                }
-            }
-            rest.truncate(filled);
             seen_thread
                 .lock()
                 .expect("seen lock")
-                .push(String::from_utf8_lossy(&rest).into_owned());
-            let reason = match status {
-                200 => "OK",
-                429 => "Too Many Requests",
-                500 => "Internal Server Error",
-                _ => "Error",
-            };
+                .push(read_request_body(&mut stream));
+            let reason = reason(status);
             let resp = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(resp.as_bytes());
+        });
+        (url, seen, handle)
+    }
+
+    /// Read one request: headers until the blank line, then Content-Length bytes.
+    fn read_request_body(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut content_length = 0usize;
+        let mut line = Vec::new();
+        let mut buf = [0u8; 1];
+        let mut raw_len = 0usize;
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    raw_len += 1;
+                    line.push(buf[0]);
+                    if buf[0] == b'\n' {
+                        let text = String::from_utf8_lossy(&line);
+                        if text.to_lowercase().starts_with("content-length:") {
+                            content_length = text
+                                .split(':')
+                                .nth(1)
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                        }
+                        if line == b"\r\n" || line == b"\n" {
+                            break;
+                        }
+                        line.clear();
+                    }
+                    if raw_len > 65536 {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut rest = vec![0u8; content_length.min(1 << 20)];
+        let mut filled = 0;
+        while filled < rest.len() {
+            match stream.read(&mut rest[filled..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => filled += n,
+            }
+        }
+        rest.truncate(filled);
+        String::from_utf8_lossy(&rest).into_owned()
+    }
+
+    /// Reason phrase for the statuses the mock servers script.
+    fn reason(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "Error",
+        }
+    }
+
+    /// Multi-shot mock HTTP server on 127.0.0.1: serves the scripted
+    /// `(status, body)` replies in order on one listener, captures request
+    /// bodies, then exits. For the Muse retry tests (first try and retry hit
+    /// the same base URL). No external network.
+    fn mock_server_seq(
+        replies: Vec<(u16, String)>,
+    ) -> (String, SeenBodies, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let url = format!("http://{}", listener.local_addr().expect("mock addr"));
+        let seen: SeenBodies = Arc::new(Mutex::new(Vec::new()));
+        let seen_thread = Arc::clone(&seen);
+        let handle = std::thread::spawn(move || {
+            for (status, body) in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                seen_thread
+                    .lock()
+                    .expect("seen lock")
+                    .push(read_request_body(&mut stream));
+                let reason = reason(status);
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
         });
         (url, seen, handle)
     }
@@ -891,7 +972,8 @@ mod tests {
     fn jev_no_falls_through_to_muse_yes_and_no() {
         let _guard = env_lock();
         let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
-        assert_eq!(TRY_IT_MUSE_MAX_COMPLETION_TOKENS, 1024);
+        assert_eq!(TRY_IT_MUSE_MAX_COMPLETION_TOKENS, 2048);
+        assert_eq!(TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS, 4096);
         for (muse_content, expected) in [("{\"try_it\":true}", true), ("{\"try_it\":false}", false)]
         {
             let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
@@ -920,6 +1002,7 @@ mod tests {
             assert_eq!(stats.muse_calls, 1);
             assert_eq!(stats.muse_yes, u64::from(expected));
             assert_eq!(stats.muse_truncated, 0);
+            assert_eq!(stats.muse_retries, 0);
             // Stage-3 settings from the spec reach the wire.
             let seen = muse_seen.lock().expect("seen lock");
             assert_eq!(seen.len(), 1);
@@ -1016,6 +1099,7 @@ mod tests {
         assert_eq!(stats.muse_calls, 1);
         assert_eq!(stats.muse_yes, 0);
         assert_eq!(stats.muse_truncated, 0);
+        assert_eq!(stats.muse_retries, 0);
         assert_eq!(stats.fail_closed, 1);
         assert_eq!(stats.errors, 1);
     }
@@ -1046,6 +1130,7 @@ mod tests {
         assert!(!d.truncated);
         assert_eq!(stats.muse_calls, 1);
         assert_eq!(stats.muse_truncated, 0);
+        assert_eq!(stats.muse_retries, 0);
         assert_eq!(stats.fail_closed, 1);
     }
 
@@ -1054,8 +1139,11 @@ mod tests {
         let _guard = env_lock();
         let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
         let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+        // Truncated twice (first try + the one retry): only the second
+        // truncation counts as truncated.
         let empty_length = muse_body_full(serde_json::json!(""), "length");
-        let (muse_url, _, muse_handle) = mock_server(200, &empty_length);
+        let (muse_url, _, muse_handle) =
+            mock_server_seq(vec![(200, empty_length.clone()), (200, empty_length)]);
         let jev = jev_client(jev_url, true);
         let muse = muse_client(muse_url, true);
         let cascade = Cascade::new(Some(&jev), Some(&muse));
@@ -1076,7 +1164,8 @@ mod tests {
         assert!(!d.is_rate_limited());
         // ...but reported as truncated, distinct from an ordinary Muse "no".
         assert!(d.truncated);
-        assert_eq!(stats.muse_calls, 1);
+        assert_eq!(stats.muse_calls, 2);
+        assert_eq!(stats.muse_retries, 1);
         assert_eq!(stats.muse_yes, 0);
         assert_eq!(stats.muse_truncated, 1);
         assert_eq!(stats.fail_closed, 1);
@@ -1088,11 +1177,17 @@ mod tests {
         let _guard = env_lock();
         let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
         // A null content surfaces as a BadResponse naming the finish reason;
-        // only "length" means the completion budget ran out.
+        // only "length" means the completion budget ran out. The length case
+        // retries once (two truncated replies); "stop" never retries.
         for (reason, expected) in [("length", true), ("stop", false)] {
             let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
             let null_body = muse_body_full(serde_json::Value::Null, reason);
-            let (muse_url, _, muse_handle) = mock_server(200, &null_body);
+            let replies = if expected {
+                vec![(200, null_body.clone()), (200, null_body)]
+            } else {
+                vec![(200, null_body)]
+            };
+            let (muse_url, _, muse_handle) = mock_server_seq(replies);
             let jev = jev_client(jev_url, true);
             let muse = muse_client(muse_url, true);
             let cascade = Cascade::new(Some(&jev), Some(&muse));
@@ -1109,10 +1204,187 @@ mod tests {
             assert!(!d.try_it, "reason {reason}");
             assert_eq!(d.stage, CascadeStage::FailClosed);
             assert_eq!(d.truncated, expected, "reason {reason}");
-            assert_eq!(stats.muse_calls, 1);
+            assert_eq!(stats.muse_calls, 1 + u64::from(expected), "reason {reason}");
+            assert_eq!(stats.muse_retries, u64::from(expected), "reason {reason}");
             assert_eq!(stats.muse_truncated, u64::from(expected), "reason {reason}");
             assert_eq!(stats.fail_closed, 1);
         }
+    }
+
+    #[test]
+    fn muse_truncation_retries_once_with_doubled_cap_then_answers() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+        // First Muse reply is truncated (empty content + length); the retry
+        // answers, so nothing fails closed and nothing counts as truncated.
+        let (muse_url, muse_seen, muse_handle) = mock_server_seq(vec![
+            (200, muse_body_full(serde_json::json!(""), "length")),
+            (200, muse_body("{\"try_it\":true}")),
+        ]);
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "x",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        assert!(d.try_it);
+        assert_eq!(d.stage, CascadeStage::Muse);
+        assert_eq!(d.error, None);
+        assert!(!d.truncated);
+        assert!(!d.is_rate_limited());
+        assert_eq!(stats.muse_calls, 2);
+        assert_eq!(stats.muse_retries, 1);
+        assert_eq!(stats.muse_yes, 1);
+        assert_eq!(stats.muse_truncated, 0);
+        assert_eq!(stats.fail_closed, 0);
+        assert_eq!(stats.errors, 0);
+        // First request carries 2048, the retry 4096; same model and effort.
+        let seen = muse_seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(&seen[0]).expect("request is json");
+        let second: serde_json::Value = serde_json::from_str(&seen[1]).expect("request is json");
+        assert_eq!(
+            first["max_completion_tokens"],
+            TRY_IT_MUSE_MAX_COMPLETION_TOKENS
+        );
+        assert_eq!(first["max_completion_tokens"], 2048);
+        assert_eq!(
+            second["max_completion_tokens"],
+            TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS
+        );
+        assert_eq!(second["max_completion_tokens"], 4096);
+        assert_eq!(second["model"], "muse-spark-1.3");
+        assert_eq!(second["reasoning_effort"], "low");
+        jev_handle.join().expect("server thread");
+        muse_handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn muse_double_truncation_retries_once_then_fails_closed_as_truncated() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+        // Null content + length (a truncation error) first, empty + length
+        // on the retry: both truncation shapes, still exactly one retry.
+        let (muse_url, muse_seen, muse_handle) = mock_server_seq(vec![
+            (200, muse_body_full(serde_json::Value::Null, "length")),
+            (200, muse_body_full(serde_json::json!(""), "length")),
+        ]);
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "x",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        assert!(!d.try_it);
+        assert_eq!(d.stage, CascadeStage::FailClosed);
+        assert!(d.error.is_some());
+        assert!(!d.is_rate_limited());
+        assert!(d.truncated);
+        assert_eq!(stats.muse_calls, 2);
+        assert_eq!(stats.muse_retries, 1);
+        assert_eq!(stats.muse_yes, 0);
+        assert_eq!(stats.muse_truncated, 1);
+        assert_eq!(stats.fail_closed, 1);
+        assert_eq!(stats.errors, 1);
+        // First request carries 2048, the retry 4096.
+        let seen = muse_seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(&seen[0]).expect("request is json");
+        let second: serde_json::Value = serde_json::from_str(&seen[1]).expect("request is json");
+        assert_eq!(first["max_completion_tokens"], 2048);
+        assert_eq!(second["max_completion_tokens"], 4096);
+        jev_handle.join().expect("server thread");
+        muse_handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn muse_non_length_failures_are_never_retried() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
+        // Garbage with "stop", null content with "stop", HTTP 500, HTTP 429:
+        // none is a length truncation, so none retries (429 stays flagged).
+        let cases: Vec<(u16, String, bool)> = vec![
+            (200, muse_body("Sure, looks hands-on!"), false),
+            (200, muse_body_full(serde_json::Value::Null, "stop"), false),
+            (500, r#"{"error":"boom"}"#.to_string(), false),
+            (429, r#"{"error":"slow down"}"#.to_string(), true),
+        ];
+        for (status, body, rate_limited) in cases {
+            let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+            let (muse_url, muse_seen, muse_handle) = mock_server(status, &body);
+            let jev = jev_client(jev_url, true);
+            let muse = muse_client(muse_url, true);
+            let cascade = Cascade::new(Some(&jev), Some(&muse));
+            let mut stats = zero_stats();
+            let d = cascade.decide(
+                "x",
+                DataClass::Public,
+                RulesVerdict::Unsure,
+                &mut stats,
+                None,
+            );
+            assert!(!d.try_it, "status {status}");
+            assert_eq!(d.stage, CascadeStage::FailClosed, "status {status}");
+            assert_eq!(d.is_rate_limited(), rate_limited, "status {status}");
+            assert!(!d.truncated, "status {status}");
+            assert_eq!(stats.muse_calls, 1, "status {status}");
+            assert_eq!(stats.muse_retries, 0, "status {status}");
+            assert_eq!(stats.muse_truncated, 0, "status {status}");
+            assert_eq!(
+                muse_seen.lock().expect("seen lock").len(),
+                1,
+                "status {status}"
+            );
+            jev_handle.join().expect("server thread");
+            muse_handle.join().expect("server thread");
+        }
+    }
+
+    #[test]
+    fn refused_class_makes_zero_muse_calls_including_no_retry() {
+        // Refused classes never reach the hosted stages at all: zero calls
+        // and zero retries. Live mocks (one scripting a truncation first)
+        // prove no request arrived.
+        let (jev_url, jev_seen, _jev_handle) = mock_server(200, &jev_noul_body(0.1));
+        let (muse_url, muse_seen, _muse_handle) = mock_server_seq(vec![
+            (200, muse_body_full(serde_json::json!(""), "length")),
+            (200, muse_body("{\"try_it\":true}")),
+        ]);
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        for class in [
+            DataClass::Internal,
+            DataClass::Confidential,
+            DataClass::Restricted,
+        ] {
+            let mut stats = zero_stats();
+            let d = cascade.decide("private", class, RulesVerdict::Unsure, &mut stats, None);
+            assert!(!d.try_it, "class {class:?}");
+            assert_eq!(d.stage, CascadeStage::Rules, "class {class:?}");
+            assert_eq!(d.error, None, "class {class:?}");
+            assert_eq!(stats, zero_stats(), "class {class:?}");
+        }
+        assert!(
+            jev_seen.lock().expect("seen lock").is_empty(),
+            "jev must see no request"
+        );
+        assert!(
+            muse_seen.lock().expect("seen lock").is_empty(),
+            "muse must see no request"
+        );
     }
 
     #[test]
@@ -1169,6 +1441,7 @@ mod tests {
         assert!(d.is_rate_limited());
         assert!(!d.truncated);
         assert_eq!(stats.muse_truncated, 0);
+        assert_eq!(stats.muse_retries, 0);
     }
 
     #[test]

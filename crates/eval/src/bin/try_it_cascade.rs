@@ -9,7 +9,10 @@
 //!
 //! Items run through the cascade sequentially from env
 //! ([`JevClient::from_env`] with `JEV_BACKEND`, [`MuseClient::from_env`]
-//! pinned to muse-spark-1.3 / low reasoning / 1024 completion tokens).
+//! pinned to muse-spark-1.3 / low reasoning / `TRY_IT_MUSE_MAX_COMPLETION_TOKENS`
+//! (2048) completion tokens, with one length-truncation retry at
+//! `TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS` (4096)). The summary reports the
+//! retry count as `muse_retries`.
 //! Every item is classified ([`class_of`](bookmarks_agent::translate::class_of)):
 //! Public items (URL/@handle-only differences included) run the paid stages
 //! on sanitized text; anything else falls back to the rules verdict. The run
@@ -465,12 +468,13 @@ fn run(args: &Args) -> Result<(), String> {
         rules_prf.tn,
     );
     println!(
-        "calls: jev={} jev_yes={} muse={} muse_yes={} muse_truncated={} rules_yes={} topic_filtered={} fail_closed={} errors={}",
+        "calls: jev={} jev_yes={} muse={} muse_yes={} muse_truncated={} muse_retries={} rules_yes={} topic_filtered={} fail_closed={} errors={}",
         stats.jev_calls,
         stats.jev_yes,
         stats.muse_calls,
         stats.muse_yes,
         stats.muse_truncated,
+        stats.muse_retries,
         stats.rules_yes,
         stats.topic_filtered,
         stats.fail_closed,

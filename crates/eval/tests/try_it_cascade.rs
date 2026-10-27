@@ -1,6 +1,9 @@
 //! End-to-end `try_it_cascade` runs against 127.0.0.1 mock servers and small
 //! temp files. No real network, no real data: every backend URL points at a
 //! mock or a closed port, and all keys are fake.
+use ancientos_router::try_it_cascade::{
+    TRY_IT_MUSE_MAX_COMPLETION_TOKENS, TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS,
+};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -377,7 +380,7 @@ fn full_cascade_through_all_stages() {
     );
     assert!(
         stdout.contains(
-            "calls: jev=2 jev_yes=0 muse=2 muse_yes=1 muse_truncated=0 rules_yes=1 topic_filtered=0 fail_closed=0 errors=0"
+            "calls: jev=2 jev_yes=0 muse=2 muse_yes=1 muse_truncated=0 muse_retries=0 rules_yes=1 topic_filtered=0 fail_closed=0 errors=0"
         ),
         "{stdout}"
     );
@@ -415,7 +418,11 @@ fn full_cascade_through_all_stages() {
     for body in muse_seen.iter() {
         let sent: serde_json::Value = serde_json::from_str(body).expect("muse request is json");
         assert_eq!(sent["model"], "muse-spark-1.3");
-        assert_eq!(sent["max_completion_tokens"], 1024);
+        assert_eq!(
+            sent["max_completion_tokens"],
+            TRY_IT_MUSE_MAX_COMPLETION_TOKENS
+        );
+        assert_eq!(sent["max_completion_tokens"], 2048);
         assert_eq!(sent["reasoning_effort"], "low");
     }
 }
@@ -477,7 +484,7 @@ fn excluded_topic_is_filtered_before_any_call() {
     assert!(stdout.contains("2 decided"), "{stdout}");
     assert!(
         stdout.contains(
-            "calls: jev=1 jev_yes=0 muse=1 muse_yes=1 muse_truncated=0 rules_yes=0 topic_filtered=1 fail_closed=0 errors=0"
+            "calls: jev=1 jev_yes=0 muse=1 muse_yes=1 muse_truncated=0 muse_retries=0 rules_yes=0 topic_filtered=1 fail_closed=0 errors=0"
         ),
         "{stdout}"
     );
@@ -556,7 +563,7 @@ fn paid_off_runs_rules_only_with_zero_calls() {
     assert!(stdout.contains("rules only"), "{stdout}");
     assert!(
         stdout.contains(
-            "calls: jev=0 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 rules_yes=1 topic_filtered=0 fail_closed=0 errors=0"
+            "calls: jev=0 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 muse_retries=0 rules_yes=1 topic_filtered=0 fail_closed=0 errors=0"
         ),
         "{stdout}"
     );
@@ -700,7 +707,7 @@ fn stops_on_rate_limit() {
     );
     assert!(
         stdout.contains(
-            "calls: jev=1 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 rules_yes=0 topic_filtered=0 fail_closed=1 errors=1"
+            "calls: jev=1 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 muse_retries=0 rules_yes=0 topic_filtered=0 fail_closed=1 errors=1"
         ),
         "{stdout}"
     );
@@ -717,11 +724,16 @@ fn stops_on_rate_limit() {
 
 #[test]
 fn truncation_is_counted_separately_from_ordinary_no() {
+    assert_eq!(TRY_IT_MUSE_MAX_COMPLETION_TOKENS, 2048);
+    assert_eq!(TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS, 4096);
     let (jev_url, _, jev_done) =
         mock_server(vec![(200, jev_noul_body(0.2)), (200, jev_noul_body(0.1))]);
-    // c2: empty content + finish_reason "length" (truncated); c3: normal no.
+    // c2: empty content + finish_reason "length" twice (first try + the one
+    // retry): still truncated. c3: normal no.
+    let truncated = muse_body_full(serde_json::json!(""), "length");
     let (muse_url, muse_seen, muse_done) = mock_server(vec![
-        (200, muse_body_full(serde_json::json!(""), "length")),
+        (200, truncated.clone()),
+        (200, truncated),
         (200, muse_body("{\"try_it\":false}")),
     ]);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -753,13 +765,14 @@ fn truncation_is_counted_separately_from_ordinary_no() {
         .expect("jev got exactly 2 calls");
     muse_done
         .recv_timeout(Duration::from_secs(15))
-        .expect("muse got exactly 2 calls");
+        .expect("muse got exactly 3 calls (c2 first try + retry, c3)");
 
-    // The truncation still fails closed (fail_closed/errors) but is also
-    // counted separately, not as an ordinary Muse "no".
+    // The double truncation still fails closed (fail_closed/errors) but is
+    // also counted separately, not as an ordinary Muse "no"; the retry is
+    // counted too.
     assert!(
         stdout.contains(
-            "calls: jev=2 jev_yes=0 muse=2 muse_yes=0 muse_truncated=1 rules_yes=1 topic_filtered=0 fail_closed=1 errors=1"
+            "calls: jev=2 jev_yes=0 muse=3 muse_yes=0 muse_truncated=1 muse_retries=1 rules_yes=1 topic_filtered=0 fail_closed=1 errors=1"
         ),
         "{stdout}"
     );
@@ -778,13 +791,28 @@ fn truncation_is_counted_separately_from_ordinary_no() {
     assert_eq!(rows[2]["stage"], "muse");
     assert_eq!(rows[2]["truncated"], false);
 
-    // Both calls carry the shared 1024-token classify cap.
+    // First tries carry the shared 2048-token classify cap; the c2 retry
+    // carries the doubled 4096 cap.
     let muse_seen = muse_seen.lock().expect("seen lock");
-    assert_eq!(muse_seen.len(), 2);
-    for body in muse_seen.iter() {
-        let sent: serde_json::Value = serde_json::from_str(body).expect("muse request is json");
-        assert_eq!(sent["max_completion_tokens"], 1024);
-    }
+    assert_eq!(muse_seen.len(), 3);
+    let caps: Vec<u64> = muse_seen
+        .iter()
+        .map(|body| {
+            serde_json::from_str::<serde_json::Value>(body).expect("muse request is json")
+                ["max_completion_tokens"]
+                .as_u64()
+                .expect("cap is a number")
+        })
+        .collect();
+    assert_eq!(
+        caps,
+        [
+            TRY_IT_MUSE_MAX_COMPLETION_TOKENS as u64,
+            TRY_IT_MUSE_RETRY_MAX_COMPLETION_TOKENS as u64,
+            TRY_IT_MUSE_MAX_COMPLETION_TOKENS as u64,
+        ]
+    );
+    assert_eq!(caps, [2048, 4096, 2048]);
 }
 
 #[test]
@@ -867,7 +895,7 @@ fn jev_threshold_flag_overrides_env() {
     assert!(stdout.contains("jev threshold: 0.100"), "{stdout}");
     assert!(
         stdout.contains(
-            "calls: jev=1 jev_yes=1 muse=0 muse_yes=0 muse_truncated=0 rules_yes=0 topic_filtered=0 fail_closed=0 errors=0"
+            "calls: jev=1 jev_yes=1 muse=0 muse_yes=0 muse_truncated=0 muse_retries=0 rules_yes=0 topic_filtered=0 fail_closed=0 errors=0"
         ),
         "{stdout}"
     );
