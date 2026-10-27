@@ -30,15 +30,6 @@ impl EnvHold {
             crate::link_context::FETCH_ENV_VAR,
             crate::link_context::CACHE_ENV_VAR,
             crate::link_context::ALLOW_PRIVATE_ENV_VAR,
-            crate::link_context::WHISPER_CMD_ENV_VAR,
-            crate::link_context::WHISPER_MODEL_ENV_VAR,
-            crate::link_context::YTDLP_TIMEOUT_ENV_VAR,
-            crate::link_context::FFMPEG_TIMEOUT_ENV_VAR,
-            crate::link_context::WHISPER_TIMEOUT_ENV_VAR,
-            crate::link_context::VIDEO_BASE_ENV_VAR,
-            "FAKE_YTDLP_LOG",
-            "FAKE_FFMPEG_LOG",
-            "FAKE_WHISPER_LOG",
             // Captured for restore only; never cleared by the setups below.
             "PATH",
             "TMPDIR",
@@ -53,15 +44,6 @@ impl EnvHold {
         std::env::remove_var(crate::link_context::FETCH_ENV_VAR);
         std::env::remove_var(crate::link_context::CACHE_ENV_VAR);
         std::env::remove_var(crate::link_context::ALLOW_PRIVATE_ENV_VAR);
-        std::env::remove_var(crate::link_context::WHISPER_CMD_ENV_VAR);
-        std::env::remove_var(crate::link_context::WHISPER_MODEL_ENV_VAR);
-        std::env::remove_var(crate::link_context::YTDLP_TIMEOUT_ENV_VAR);
-        std::env::remove_var(crate::link_context::FFMPEG_TIMEOUT_ENV_VAR);
-        std::env::remove_var(crate::link_context::WHISPER_TIMEOUT_ENV_VAR);
-        std::env::remove_var(crate::link_context::VIDEO_BASE_ENV_VAR);
-        std::env::remove_var("FAKE_YTDLP_LOG");
-        std::env::remove_var("FAKE_FFMPEG_LOG");
-        std::env::remove_var("FAKE_WHISPER_LOG");
     }
 
     /// Paid switch on, offline/cache/link-fetch overrides cleared.

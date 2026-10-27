@@ -1,10 +1,9 @@
 //! Linked-page and media enrichment for the try-it classifiers.
 //!
-//! Often the thing to try is in the linked page or the video, not the post
-//! text. [`enrich`] builds a text block from a stored bookmark's expanded
-//! link URLs plus its media alt text, video captions, YouTube subtitles, and
-//! local video transcripts, so the classifiers can decide on the post text
-//! plus that context (see [`cascade_input`]).
+//! Often the thing to try is in the linked page, not the post text.
+//! [`enrich`] builds a text block from a stored bookmark's expanded link
+//! URLs plus its media alt text and video captions, so the classifiers can
+//! decide on the post text plus that context (see [`cascade_input`]).
 //!
 //! Linked pages: plain HTTP GET with the repo's existing client (`ureq`),
 //! timeout [`TIMEOUT_SECS`], at most [`MAX_LINKS_PER_POST`] links per post,
@@ -24,20 +23,9 @@
 //! a paid API call and are skipped unless `ANCIENTOS_ALLOW_PAID=1`. This
 //! module makes no X API calls at all, and never writes anything.
 //!
-//! YouTube links (`youtube.com` / `youtu.be`) are not fetched as pages:
-//! instead [`fetch_subtitles`] runs `yt-dlp` (when on `PATH`) as a local
-//! subprocess with `--skip-download --write-subs --write-auto-subs
-//! --sub-langs en.* --sub-format vtt`, parses the VTT to plain text with
-//! rolling-caption dedupe ([`vtt_text_deduped`]), and caps at
-//! [`MAX_SUBTITLE_CHARS`] chars.
-//!
-//! X videos without captions are transcribed locally: [`fetch_transcript`]
-//! downloads the smallest stored mp4 (`video.twimg.com` https only, at most
-//! [`MAX_VIDEO_BYTES`]) to a temp file, extracts 16 kHz mono audio with
-//! `ffmpeg` (when on `PATH`), and runs the local `whisper.cpp` binary named
-//! by `ANCIENTOS_WHISPER_CMD` with the model file named by
-//! `ANCIENTOS_WHISPER_MODEL`. Fully local and free; temp files are deleted.
-//! Both subtitles and transcripts still require `ANCIENTOS_FETCH_LINKS=1`.
+//! YouTube links (`youtube.com` / `youtu.be`) are never fetched as pages:
+//! the watch page is a script shell that reads as antibot or empty. They are
+//! skipped with reason `youtube (no page fetch)` and a recorded note.
 //!
 //! Gates: network fetches need the opt-in `ANCIENTOS_FETCH_LINKS=1`
 //! (default off means no network and empty enrichment). Everything fetched
@@ -51,10 +39,8 @@
 //! so hosted stages never see raw URLs, handles, emails, or phone numbers.
 //!
 //! Cache: fetched text lives on disk as JSON keyed by SHA-256 of the
-//! normalized URL (pages), `youtube-subs:{normalized URL}` (subtitles), or
-//! `video-transcript:{video URL}` (transcripts) — same file, same TTL
-//! [`CACHE_TTL_SECS`], file mode 0600. A cache hit makes no network call and
-//! runs no subprocess.
+//! normalized URL (pages) or the caption track URL — same file, same TTL
+//! [`CACHE_TTL_SECS`], file mode 0600. A cache hit makes no network call.
 //!
 //! Fail closed everywhere: any fetch or parse error skips that source with
 //! a recorded reason in [`Enrichment::notes`]. [`enrich`] never panics and
@@ -80,43 +66,17 @@ pub const MAX_LINKS_PER_POST: usize = 3;
 pub const MAX_LINK_CHARS: usize = 2000;
 /// Max caption chars kept per video (after sanitizing).
 pub const MAX_CAPTION_CHARS: usize = 2000;
-/// Max subtitle chars kept per YouTube link (after sanitizing).
-pub const MAX_SUBTITLE_CHARS: usize = 4000;
-/// Max transcript chars kept per video (after sanitizing).
-pub const MAX_TRANSCRIPT_CHARS: usize = 4000;
 /// Max body bytes read per fetch.
 pub const MAX_BODY_BYTES: usize = 512 * 1024;
-/// Max video bytes downloaded for local transcription (50 MiB).
-pub const MAX_VIDEO_BYTES: usize = 50 * 1024 * 1024;
 /// Whole-request timeout, in seconds.
 pub const TIMEOUT_SECS: u64 = 8;
-/// `yt-dlp` subprocess timeout, in seconds.
-pub const YTDLP_TIMEOUT_SECS: u64 = 30;
-/// `ffmpeg` audio-extraction timeout, in seconds.
-pub const FFMPEG_TIMEOUT_SECS: u64 = 60;
-/// `whisper.cpp` transcription timeout, in seconds.
-pub const WHISPER_TIMEOUT_SECS: u64 = 120;
 /// Max redirects followed per fetch.
 pub const MAX_REDIRECTS: u32 = 3;
 /// Header separating post text from enrichment in cascade input.
 pub const CONTEXT_HEADER: &str = "Linked/Media context:";
-/// Local `whisper.cpp` binary for X video transcription (explicit path).
-pub const WHISPER_CMD_ENV_VAR: &str = "ANCIENTOS_WHISPER_CMD";
-/// Local `whisper.cpp` model file for X video transcription (explicit path).
-pub const WHISPER_MODEL_ENV_VAR: &str = "ANCIENTOS_WHISPER_MODEL";
 /// Test-only bypass for the non-public-host refusal: must equal `"1"` to
 /// allow `127.0.0.1` mock servers. Default off (fail closed).
 pub const ALLOW_PRIVATE_ENV_VAR: &str = "LINK_CONTEXT_ALLOW_PRIVATE_HOSTS";
-/// Test-only override for the `yt-dlp` timeout, in seconds (float).
-pub const YTDLP_TIMEOUT_ENV_VAR: &str = "LINK_CONTEXT_YTDLP_TIMEOUT_SECS";
-/// Test-only override for the `ffmpeg` timeout, in seconds (float).
-pub const FFMPEG_TIMEOUT_ENV_VAR: &str = "LINK_CONTEXT_FFMPEG_TIMEOUT_SECS";
-/// Test-only override for the `whisper.cpp` timeout, in seconds (float).
-pub const WHISPER_TIMEOUT_ENV_VAR: &str = "LINK_CONTEXT_WHISPER_TIMEOUT_SECS";
-/// Test-only override for video downloads: when set, the
-/// `https://video.twimg.com` prefix is replaced with this base URL (a mock
-/// server) after the allowlist check passes on the original URL.
-pub const VIDEO_BASE_ENV_VAR: &str = "LINK_CONTEXT_VIDEO_BASE_URL";
 
 /// One cached fetch: sanitized, capped text plus when it was fetched.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1168,401 +1128,6 @@ fn cue_texts(raw: &str) -> Vec<String> {
     cues
 }
 
-/// Reduce a WebVTT/SRT track to plain text, deduping rolling captions:
-/// YouTube auto-subs repeat a sliding window of words across cues
-/// (`hello` / `hello world` / `hello world again`), so each cue appends only
-/// the words after its longest overlap with the accumulated tail. Exact
-/// duplicate cues append nothing. Garbage in means empty out.
-pub fn vtt_text_deduped(raw: &str) -> String {
-    let mut words: Vec<String> = Vec::new();
-    for cue in cue_texts(raw) {
-        let fresh: Vec<&str> = cue.split_whitespace().collect();
-        if fresh.is_empty() {
-            continue;
-        }
-        let mut overlap = 0;
-        let max = fresh.len().min(words.len());
-        let mut k = max;
-        while k > 0 {
-            if words[words.len() - k..]
-                .iter()
-                .zip(fresh.iter())
-                .all(|(a, b)| a == b)
-            {
-                overlap = k;
-                break;
-            }
-            k -= 1;
-        }
-        words.extend(fresh[overlap..].iter().map(|w| w.to_string()));
-    }
-    words.join(" ")
-}
-
-/// Find an executable `name` on `PATH` (split on the platform separator).
-/// Returns the first entry that exists and is a file. `None` when `PATH` is
-/// unset, empty, or holds no such file (fail closed: the caller skips with a
-/// recorded reason). Never panics.
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    if name.is_empty() || name.contains(['/', '\\']) {
-        return None;
-    }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// Read a subprocess timeout from `var` (seconds, float, `0..=3600`).
-/// Unset, empty, unparseable, or out-of-range values fall back to
-/// `default_secs`. Never panics.
-fn timeout_from_env(var: &str, default_secs: u64) -> Duration {
-    std::env::var(var)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && (0.0..=3600.0).contains(v))
-        .map(Duration::from_secs_f64)
-        .unwrap_or_else(|| Duration::from_secs(default_secs))
-}
-
-/// Effective `yt-dlp` timeout: [`YTDLP_TIMEOUT_ENV_VAR`] overrides
-/// [`YTDLP_TIMEOUT_SECS`].
-fn ytdlp_timeout() -> Duration {
-    timeout_from_env(YTDLP_TIMEOUT_ENV_VAR, YTDLP_TIMEOUT_SECS)
-}
-
-/// Effective `ffmpeg` timeout: [`FFMPEG_TIMEOUT_ENV_VAR`] overrides
-/// [`FFMPEG_TIMEOUT_SECS`].
-fn ffmpeg_timeout() -> Duration {
-    timeout_from_env(FFMPEG_TIMEOUT_ENV_VAR, FFMPEG_TIMEOUT_SECS)
-}
-
-/// Effective `whisper.cpp` timeout: [`WHISPER_TIMEOUT_ENV_VAR`] overrides
-/// [`WHISPER_TIMEOUT_SECS`].
-fn whisper_timeout() -> Duration {
-    timeout_from_env(WHISPER_TIMEOUT_ENV_VAR, WHISPER_TIMEOUT_SECS)
-}
-
-/// Run `cmd` to completion with `timeout`, capturing output. Stdin is null;
-/// stdout/stderr are piped. On expiry the child is killed and reaped, and
-/// `Err("timeout")` is returned. Spawn failures are `Err("failed to start")`;
-/// a non-zero exit keeps the output for the caller to inspect. Never panics.
-fn run_with_timeout(
-    cmd: &mut std::process::Command,
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    use std::process::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| "failed to start".to_string())?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("failed to start".to_string());
-            }
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|_| "failed to start".to_string());
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("timeout".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-}
-
-/// Fetch English subtitles for a YouTube URL via a local `yt-dlp`
-/// subprocess (`--skip-download --write-subs --write-auto-subs --sub-langs
-/// en.* --sub-format vtt`) run inside a fresh temp dir with `timeout`
-/// ([`enrich`] passes the [`YTDLP_TIMEOUT_SECS`] default). The longest
-/// resulting `.vtt` track is parsed with
-/// [`vtt_text_deduped`], sanitized, and capped at [`MAX_SUBTITLE_CHARS`].
-/// The temp dir is deleted. Any failure (missing `yt-dlp`, timeout, exit
-/// status, no tracks, no readable text) is a skip reason, never a panic.
-/// Free and local; the caller gates on `ANCIENTOS_FETCH_LINKS=1`.
-pub fn fetch_subtitles(youtube_url: &str, timeout: Duration) -> Result<String, String> {
-    if !is_youtube_url(youtube_url) {
-        return Err("not a youtube url".to_string());
-    }
-    let normalized = normalize_public_url(youtube_url)?;
-    let ytdlp = find_on_path("yt-dlp").ok_or_else(|| "yt-dlp not found".to_string())?;
-    let workdir = tempfile::TempDir::new().map_err(|_| "temp dir failed".to_string())?;
-    let mut cmd = std::process::Command::new(ytdlp);
-    cmd.arg("--skip-download")
-        .arg("--write-subs")
-        .arg("--write-auto-subs")
-        .arg("--sub-langs")
-        .arg("en.*")
-        .arg("--sub-format")
-        .arg("vtt")
-        .arg("-o")
-        .arg("subs.%(ext)s")
-        .arg(&normalized)
-        .current_dir(workdir.path());
-    let output = run_with_timeout(&mut cmd, timeout)?;
-    if !output.status.success() {
-        return Err("yt-dlp failed".to_string());
-    }
-    let mut best = String::new();
-    let entries = std::fs::read_dir(workdir.path()).map_err(|_| "no subtitles".to_string())?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_vtt = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("vtt"));
-        if !is_vtt || !path.is_file() {
-            continue;
-        }
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
-        let text = vtt_text_deduped(&raw);
-        if text.chars().count() > best.chars().count() {
-            best = text;
-        }
-    }
-    if best.trim().is_empty() {
-        return Err("no subtitles".to_string());
-    }
-    let clean = truncate_chars(
-        &crate::sanitize::sanitize_uncapped(&best),
-        MAX_SUBTITLE_CHARS,
-    );
-    if clean.trim().is_empty() {
-        return Err("no readable text".to_string());
-    }
-    Ok(clean)
-}
-
-/// True when `raw` is a video URL eligible for local transcription:
-/// an allowlisted `https://video.twimg.com` URL (same shape rules as
-/// [`crate::media::safe_media_url`], host restricted to `video.twimg.com`).
-fn is_transcribable_video_url(raw: &str) -> bool {
-    let Some(valid) = crate::media::safe_media_url(raw) else {
-        return false;
-    };
-    let Some(rest) = valid.strip_prefix("https://") else {
-        return false;
-    };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    rest[..end].eq_ignore_ascii_case("video.twimg.com")
-}
-
-/// Fetch URL for a video download: the allowlisted original, except when
-/// [`VIDEO_BASE_ENV_VAR`] (test-only) redirects the `video.twimg.com` prefix
-/// to a mock server. The caller validates the original first; garbage here
-/// falls back to the original (fail closed: the fetch then fails normally).
-fn video_fetch_url(allowlisted: &str) -> String {
-    let Ok(base) = std::env::var(VIDEO_BASE_ENV_VAR) else {
-        return allowlisted.to_string();
-    };
-    let base = base.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return allowlisted.to_string();
-    }
-    if !allowlisted
-        .to_ascii_lowercase()
-        .starts_with("https://video.twimg.com")
-    {
-        return allowlisted.to_string();
-    }
-    let prefix_len = "https://video.twimg.com".len();
-    if !base.starts_with("http://") && !base.starts_with("https://") {
-        return allowlisted.to_string();
-    }
-    format!("{base}{}", &allowlisted[prefix_len..])
-}
-
-/// Download an allowlisted mp4 to `dir/video.mp4` (0600 on unix), reading at
-/// most [`MAX_VIDEO_BYTES`]. Overlarge videos, empty bodies, and fetch errors
-/// are skip reasons. Never panics.
-fn download_video_to_temp(url: &str, dir: &Path, timeout: Duration) -> Result<PathBuf, String> {
-    if !is_transcribable_video_url(url) {
-        return Err("video url not allowlisted".to_string());
-    }
-    let fetch_url = video_fetch_url(url.trim());
-    let agent = ureq::AgentBuilder::new()
-        .timeout(timeout)
-        .redirects(MAX_REDIRECTS)
-        .build();
-    let resp = agent.get(&fetch_url).call().map_err(map_fetch_error)?;
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take((MAX_VIDEO_BYTES as u64).saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(|_| "unreadable body".to_string())?;
-    if buf.len() > MAX_VIDEO_BYTES {
-        return Err("video too large".to_string());
-    }
-    if buf.is_empty() {
-        return Err("empty video".to_string());
-    }
-    let dest = dir.join("video.mp4");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&dest)
-            .map_err(|_| "temp file failed".to_string())?;
-        use std::io::Write;
-        file.write_all(&buf)
-            .map_err(|_| "temp file failed".to_string())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&dest, &buf).map_err(|_| "temp file failed".to_string())?;
-    }
-    Ok(dest)
-}
-
-/// Extract 16 kHz mono PCM audio from `video_path` to `wav_path` with a local
-/// `ffmpeg` subprocess. Missing `ffmpeg`, timeouts, and exit statuses are
-/// skip reasons. Never panics.
-fn extract_audio_with_ffmpeg(
-    video_path: &Path,
-    wav_path: &Path,
-    timeout: Duration,
-) -> Result<(), String> {
-    let ffmpeg = find_on_path("ffmpeg").ok_or_else(|| "ffmpeg not found".to_string())?;
-    let mut cmd = std::process::Command::new(ffmpeg);
-    cmd.arg("-y")
-        .arg("-i")
-        .arg(video_path)
-        .arg("-vn")
-        .arg("-ac")
-        .arg("1")
-        .arg("-ar")
-        .arg("16000")
-        .arg("-acodec")
-        .arg("pcm_s16le")
-        .arg(wav_path);
-    let output = run_with_timeout(&mut cmd, timeout)?;
-    if !output.status.success() {
-        return Err("ffmpeg failed".to_string());
-    }
-    if !wav_path.is_file() {
-        return Err("ffmpeg failed".to_string());
-    }
-    Ok(())
-}
-
-/// Reduce `whisper.cpp` stdout to spoken text: drops timestamp lines and
-/// leading `[00:00:00.000 --> 00:00:02.000]` prefixes, collapses whitespace.
-/// Plain-text output (as from minimal builds) passes through. Garbage in
-/// means empty out.
-pub fn clean_whisper_output(raw: &str) -> String {
-    let mut parts = Vec::new();
-    for line in raw.lines() {
-        let mut line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            if let Some(end) = line.find(']') {
-                line = line[end + 1..].trim();
-            }
-        }
-        if line.is_empty() || line.contains("-->") {
-            continue;
-        }
-        let clean = collapse_whitespace(line);
-        if !clean.is_empty() {
-            parts.push(clean);
-        }
-    }
-    parts.join(" ")
-}
-
-/// Run the local `whisper.cpp` binary ([`WHISPER_CMD_ENV_VAR`]) with the
-/// model file ([`WHISPER_MODEL_ENV_VAR`]) over `wav_path`, capturing stdout
-/// as the transcript (see [`clean_whisper_output`]), sanitized and capped at
-/// [`MAX_TRANSCRIPT_CHARS`]. Missing configuration, timeouts, and failures
-/// are skip reasons naming the tool only, never paths. Never panics.
-fn run_whisper(wav_path: &Path, timeout: Duration) -> Result<String, String> {
-    let cmd_raw = std::env::var(WHISPER_CMD_ENV_VAR).unwrap_or_default();
-    let model_raw = std::env::var(WHISPER_MODEL_ENV_VAR).unwrap_or_default();
-    if cmd_raw.trim().is_empty() || model_raw.trim().is_empty() {
-        return Err("whisper not configured".to_string());
-    }
-    if !Path::new(cmd_raw.trim()).is_file() {
-        return Err("whisper binary missing".to_string());
-    }
-    if !Path::new(model_raw.trim()).is_file() {
-        return Err("whisper model missing".to_string());
-    }
-    let mut cmd = std::process::Command::new(cmd_raw.trim());
-    cmd.arg("-m").arg(model_raw.trim()).arg("-f").arg(wav_path);
-    let output = run_with_timeout(&mut cmd, timeout)?;
-    if !output.status.success() {
-        return Err("whisper failed".to_string());
-    }
-    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
-    let clean = truncate_chars(
-        &crate::sanitize::sanitize_uncapped(&clean_whisper_output(&raw)),
-        MAX_TRANSCRIPT_CHARS,
-    );
-    if clean.trim().is_empty() {
-        return Err("no readable text".to_string());
-    }
-    Ok(clean)
-}
-
-/// Transcribe one X video URL locally: download the mp4 (allowlisted
-/// `video.twimg.com` https only, at most [`MAX_VIDEO_BYTES`], `http_timeout`)
-/// to a temp dir, extract audio with `ffmpeg`, and run local `whisper.cpp`.
-/// Temp files are deleted. Missing tools are checked before any download so
-/// unconfigured runs make no network calls. Any failure is a skip reason.
-/// Free and local; the caller gates on `ANCIENTOS_FETCH_LINKS=1`.
-pub fn fetch_transcript(video_url: &str, http_timeout: Duration) -> Result<String, String> {
-    if !is_transcribable_video_url(video_url) {
-        return Err("video url not allowlisted".to_string());
-    }
-    // Fail fast on missing tools: no download, no temp files, no network.
-    // Whisper configuration is checked before ffmpeg so unconfigured runs
-    // report one deterministic reason regardless of what is on PATH.
-    let cmd_raw = std::env::var(WHISPER_CMD_ENV_VAR).unwrap_or_default();
-    let model_raw = std::env::var(WHISPER_MODEL_ENV_VAR).unwrap_or_default();
-    if cmd_raw.trim().is_empty() || model_raw.trim().is_empty() {
-        return Err("whisper not configured".to_string());
-    }
-    if !Path::new(cmd_raw.trim()).is_file() {
-        return Err("whisper binary missing".to_string());
-    }
-    if !Path::new(model_raw.trim()).is_file() {
-        return Err("whisper model missing".to_string());
-    }
-    if find_on_path("ffmpeg").is_none() {
-        return Err("ffmpeg not found".to_string());
-    }
-    let workdir = tempfile::TempDir::new().map_err(|_| "temp dir failed".to_string())?;
-    let video_path = download_video_to_temp(video_url.trim(), workdir.path(), http_timeout)?;
-    let wav_path = workdir.path().join("audio.wav");
-    extract_audio_with_ffmpeg(&video_path, &wav_path, ffmpeg_timeout())?;
-    run_whisper(&wav_path, whisper_timeout())
-}
-
 /// Build the enrichment for one bookmark, consulting `cache` first (a hit
 /// makes no network call) and inserting successful fetches (the caller
 /// saves). See the module docs for gates, caps, and fail-closed rules.
@@ -1592,38 +1157,11 @@ pub fn enrich_at(
     }
     let mut notes = Vec::new();
     let mut parts = Vec::new();
-    let mut subtitles = Vec::new();
     for (i, url) in link_urls(b).iter().enumerate() {
-        // YouTube links yield subtitles via yt-dlp, never a page fetch: the
-        // watch page is a script shell that reads as antibot or empty.
+        // YouTube links are never fetched as pages: the watch page is a
+        // script shell that reads as antibot or empty.
         if is_youtube_url(url) {
-            let key = crate::translate::sha256_hex(&format!("youtube-subs:{url}"));
-            if let Some(entry) = cache.get(&key) {
-                if is_fresh(entry, now)
-                    && !entry.text.trim().is_empty()
-                    && !subtitles.contains(&entry.text)
-                {
-                    subtitles.push(entry.text.clone());
-                    continue;
-                }
-            }
-            match fetch_subtitles(url, ytdlp_timeout()) {
-                Ok(text) => {
-                    cache.insert(
-                        key,
-                        CacheEntry {
-                            text: text.clone(),
-                            fetched_at: now,
-                        },
-                    );
-                    if !subtitles.contains(&text) {
-                        subtitles.push(text);
-                    }
-                }
-                Err(reason) => {
-                    notes.push(format!("link {} subtitles skipped: {reason}", i + 1));
-                }
-            }
+            notes.push(format!("link {} skipped: youtube (no page fetch)", i + 1));
             continue;
         }
         let key = crate::translate::sha256_hex(url);
@@ -1647,9 +1185,6 @@ pub fn enrich_at(
             Err(reason) => notes.push(format!("link {} skipped: {reason}", i + 1)),
         }
     }
-    if !subtitles.is_empty() {
-        parts.push(format!("Subtitles: {}", subtitles.join(" ")));
-    }
     let mut alts = Vec::new();
     for m in &b.media {
         if let Some(alt) = m.alt_text.as_deref() {
@@ -1663,9 +1198,8 @@ pub fn enrich_at(
         parts.push(format!("Media alt text: {}", alts.join("; ")));
     }
     let mut captions = Vec::new();
-    let mut captioned: Vec<bool> = vec![false; b.media.len()];
     let paid = crate::translate::is_paid_allowed();
-    for (mi, m) in b.media.iter().enumerate() {
+    for m in b.media.iter() {
         let Some(raw) = m.caption_url.as_deref() else {
             continue;
         };
@@ -1681,7 +1215,6 @@ pub fn enrich_at(
                 && !captions.contains(&entry.text)
             {
                 captions.push(entry.text.clone());
-                captioned[mi] = true;
                 continue;
             }
         }
@@ -1697,7 +1230,6 @@ pub fn enrich_at(
                 if !captions.contains(&text) {
                     captions.push(text);
                 }
-                captioned[mi] = true;
             }
             Err(reason) => notes.push(format!("captions skipped: {reason}")),
         }
@@ -1705,59 +1237,11 @@ pub fn enrich_at(
     if !captions.is_empty() {
         parts.push(format!("Video captions: {}", captions.join(" ")));
     }
-    // Local transcription is the fallback for videos without captions: the
-    // smallest stored mp4 (transcription_url, else video_url), re-validated
-    // at use time. Cached like everything else; a hit runs no subprocess.
-    let mut transcripts = Vec::new();
-    for (mi, m) in b.media.iter().enumerate() {
-        if m.kind != "video" && m.kind != "animated_gif" {
-            continue;
-        }
-        if captioned[mi] {
-            continue;
-        }
-        let Some(video_url) = m
-            .transcription_url
-            .as_deref()
-            .or(m.video_url.as_deref())
-            .and_then(crate::media::safe_media_url)
-        else {
-            continue;
-        };
-        let key = crate::translate::sha256_hex(&format!("video-transcript:{video_url}"));
-        if let Some(entry) = cache.get(&key) {
-            if is_fresh(entry, now)
-                && !entry.text.trim().is_empty()
-                && !transcripts.contains(&entry.text)
-            {
-                transcripts.push(entry.text.clone());
-                continue;
-            }
-        }
-        match fetch_transcript(&video_url, timeout) {
-            Ok(text) => {
-                cache.insert(
-                    key,
-                    CacheEntry {
-                        text: text.clone(),
-                        fetched_at: now,
-                    },
-                );
-                if !transcripts.contains(&text) {
-                    transcripts.push(text);
-                }
-            }
-            Err(reason) => notes.push(format!("transcript skipped: {reason}")),
-        }
-    }
-    if !transcripts.is_empty() {
-        parts.push(format!("Video transcript: {}", transcripts.join(" ")));
-    }
     let has_video = b
         .media
         .iter()
         .any(|m| m.kind == "video" || m.kind == "animated_gif");
-    if has_video && captions.is_empty() && transcripts.is_empty() {
+    if has_video && captions.is_empty() {
         notes.push("captions unavailable".to_string());
     }
     let text = parts.join("\n\n");
@@ -2405,15 +1889,8 @@ mod tests {
         let mut cache = HashMap::new();
         let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
         assert_eq!(e.text, "");
-        // Transcription is attempted (and skipped: whisper is unconfigured in
-        // this test), then the video still has no text at all.
-        assert_eq!(
-            e.notes,
-            vec![
-                "transcript skipped: whisper not configured".to_string(),
-                "captions unavailable".to_string(),
-            ]
-        );
+        // The video has no caption track and no other text source.
+        assert_eq!(e.notes, vec!["captions unavailable".to_string()]);
         // Photos never need captions: no note.
         let mut b = bm("e5", SANITIZED_TEXT);
         b.media = vec![crate::media::Media {
@@ -2916,38 +2393,6 @@ mod tests {
     }
 
     #[test]
-    fn vtt_dedupe_collapses_rolling_captions() {
-        let rolling = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nRoll your shoulders\n\n00:00:02.000 --> 00:00:04.000\nRoll your shoulders and breathe\n\n00:00:04.000 --> 00:00:06.000\nshoulders and breathe slowly now\n";
-        assert_eq!(
-            vtt_text_deduped(rolling),
-            "Roll your shoulders and breathe slowly now"
-        );
-        let dupes = "WEBVTT\nSTYLE\n::cue { color: white }\n\nNOTE a comment\n\n00:00:00.000 --> 00:00:01.000\n<v Speaker>Hello</v>\n\n00:00:01.000 --> 00:00:02.000\nHello\n";
-        assert_eq!(vtt_text_deduped(dupes), "Hello");
-        let plain = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nBend &amp; hold\n\n00:00:01.000 --> 00:00:02.000\nthen release\n";
-        assert_eq!(vtt_text_deduped(plain), "Bend & hold then release");
-        assert_eq!(vtt_text_deduped(""), "");
-        assert_eq!(vtt_text_deduped("WEBVTT\n"), "");
-        let srt = "1\n00:00:00,000 --> 00:00:02,000\nFirst cue\n\n2\n00:00:02,000 --> 00:00:04,000\nSecond cue\n";
-        assert_eq!(vtt_text_deduped(srt), "First cue Second cue");
-    }
-
-    #[test]
-    fn whisper_output_cleaning_strips_timestamps() {
-        assert_eq!(
-            clean_whisper_output(
-                "[00:00:00.000 --> 00:00:02.000]  hello world\n[00:00:02.000 --> 00:00:04.000]  again\n"
-            ),
-            "hello world again"
-        );
-        assert_eq!(
-            clean_whisper_output("plain transcript line"),
-            "plain transcript line"
-        );
-        assert_eq!(clean_whisper_output(""), "");
-    }
-
-    #[test]
     fn youtube_url_detection() {
         for url in [
             "https://www.youtube.com/watch?v=synthetic",
@@ -2969,456 +2414,27 @@ mod tests {
         ] {
             assert!(!is_youtube_url(url), "{url}");
         }
-        // YouTube links are kept by link selection (the subtitles path
-        // handles them); watch params such as t survive normalization.
+        // YouTube links are kept by link selection (enrich skips them with
+        // a note, never a page fetch); watch params such as t survive
+        // normalization.
         let mut b = bm("yt0", SANITIZED_TEXT);
         b.urls = vec!["https://www.youtube.com/watch?v=synthetic&t=10".into()];
         assert_eq!(
             link_urls(&b),
             vec!["https://www.youtube.com/watch?v=synthetic&t=10".to_string()]
         );
-    }
-
-    /// Write an executable fake tool script `name` with `body` into `dir`.
-    fn write_fake_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, body).expect("write fake script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake script");
-        }
-        path
-    }
-
-    /// Prepend `dir` to `PATH`. The caller must hold `EnvHold` (restored on
-    /// drop).
-    fn prepend_path(dir: &std::path::Path) {
-        let mut parts = vec![dir.to_path_buf()];
-        if let Some(old) = std::env::var_os("PATH") {
-            parts.extend(std::env::split_paths(&old));
-        }
-        std::env::set_var("PATH", std::env::join_paths(parts).expect("join PATH"));
-    }
-
-    /// Restrict `PATH` to `dir`, hiding every real tool. Caller holds `EnvHold`.
-    fn restrict_path(dir: &std::path::Path) {
-        std::env::set_var("PATH", dir.as_os_str());
-    }
-
-    fn video_media(video_url: &str, transcription_url: Option<&str>) -> crate::media::Media {
-        crate::media::Media {
-            kind: "video".into(),
-            url: None,
-            preview_url: Some("https://pbs.twimg.com/thumb/synthetic.jpg".into()),
-            video_url: Some(video_url.into()),
-            alt_text: None,
-            caption_url: None,
-            transcription_url: transcription_url.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn youtube_subtitles_missing_tool_skipped_cleanly() {
+        // Enrich skips them with a note: no page fetch, nothing cached.
+        // No mock server: the skip happens before any network.
         let _env = crate::test_support::EnvHold::fetch_on();
-        let empty_bin = tempfile::tempdir().unwrap();
-        restrict_path(empty_bin.path());
-        let url = "https://www.youtube.com/watch?v=syntheticDemo1";
-        assert_eq!(
-            fetch_subtitles(url, Duration::from_secs(5)),
-            Err("yt-dlp not found".to_string())
-        );
-        assert_eq!(
-            fetch_subtitles("https://example.com/video", Duration::from_secs(5)),
-            Err("not a youtube url".to_string())
-        );
-        let mut b = bm("yt1", SANITIZED_TEXT);
-        b.urls = vec![url.to_string()];
+        let mut b = bm("yt0b", SANITIZED_TEXT);
+        b.urls = vec!["https://www.youtube.com/watch?v=synthetic".into()];
         let mut cache = HashMap::new();
         let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
         assert_eq!(e.text, "");
         assert_eq!(
             e.notes,
-            vec!["link 1 subtitles skipped: yt-dlp not found".to_string()]
+            vec!["link 1 skipped: youtube (no page fetch)".to_string()]
         );
         assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn youtube_subtitles_via_fake_ytdlp_cached_and_no_subprocess_on_hit() {
-        let _env = crate::test_support::EnvHold::fetch_on();
-        let work = tempfile::tempdir().unwrap();
-        let bin = work.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let log = work.path().join("ytdlp.log");
-        std::env::set_var("FAKE_YTDLP_LOG", &log);
-        write_fake_script(
-            &bin,
-            "yt-dlp",
-            r#"#!/bin/sh
-echo "called $*" >> "$FAKE_YTDLP_LOG"
-cat > ./subs.en.vtt <<'EOF'
-WEBVTT
-
-00:00:00.000 --> 00:00:02.000
-Roll your shoulders
-
-00:00:02.000 --> 00:00:04.000
-Roll your shoulders and breathe slowly
-EOF
-exit 0
-"#,
-        );
-        prepend_path(&bin);
-        let url = "https://www.youtube.com/watch?v=syntheticDemo2";
-        let mut b = bm("yt2", SANITIZED_TEXT);
-        b.urls = vec![url.to_string()];
-        let mut cache = HashMap::new();
-        let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
-        assert!(e.notes.is_empty(), "{:?}", e.notes);
-        assert!(
-            e.text
-                .contains("Subtitles: Roll your shoulders and breathe slowly"),
-            "{}",
-            e.text
-        );
-        let calls = std::fs::read_to_string(&log).expect("ytdlp log");
-        assert_eq!(calls.lines().count(), 1, "{calls}");
-        for flag in [
-            "--skip-download",
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            "en.*",
-            "--sub-format",
-            "vtt",
-            "watch?v=syntheticDemo2",
-        ] {
-            assert!(calls.contains(flag), "{flag} missing from {calls}");
-        }
-        let key = crate::translate::sha256_hex(&format!("youtube-subs:{url}"));
-        assert!(cache.contains_key(&key));
-        let e2 = enrich_at(&b, &mut cache, 5_000_100, Duration::from_secs(5));
-        assert_eq!(e2.text, e.text);
-        assert!(e2.notes.is_empty(), "{:?}", e2.notes);
-        let calls = std::fs::read_to_string(&log).expect("ytdlp log");
-        assert_eq!(calls.lines().count(), 1, "cache hit must run no subprocess");
-    }
-
-    #[test]
-    fn youtube_timeout_and_errors_are_skip_reasons() {
-        let _env = crate::test_support::EnvHold::fetch_on();
-        let work = tempfile::tempdir().unwrap();
-        let bin = work.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        prepend_path(&bin);
-        let url = "https://youtu.be/syntheticDemo3";
-        write_fake_script(&bin, "yt-dlp", "#!/bin/sh\nexec sleep 10\n");
-        std::env::set_var(YTDLP_TIMEOUT_ENV_VAR, "0.05");
-        assert_eq!(
-            fetch_subtitles(url, ytdlp_timeout()),
-            Err("timeout".to_string())
-        );
-        let mut b = bm("yt3", SANITIZED_TEXT);
-        b.urls = vec![url.to_string()];
-        let mut cache = HashMap::new();
-        let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
-        assert_eq!(
-            e.notes,
-            vec!["link 1 subtitles skipped: timeout".to_string()]
-        );
-        assert!(cache.is_empty());
-        std::env::remove_var(YTDLP_TIMEOUT_ENV_VAR);
-        write_fake_script(&bin, "yt-dlp", "#!/bin/sh\nexit 1\n");
-        assert_eq!(
-            fetch_subtitles(url, Duration::from_secs(5)),
-            Err("yt-dlp failed".to_string())
-        );
-        write_fake_script(&bin, "yt-dlp", "#!/bin/sh\nexit 0\n");
-        assert_eq!(
-            fetch_subtitles(url, Duration::from_secs(5)),
-            Err("no subtitles".to_string())
-        );
-    }
-
-    #[test]
-    fn transcript_missing_tools_skipped_cleanly_with_no_network() {
-        let _env = crate::test_support::EnvHold::fetch_on();
-        // Point video downloads at a closed port: any attempted download
-        // fails fast, proving the tool checks run first (no live network).
-        std::env::set_var(VIDEO_BASE_ENV_VAR, closed_url());
-        let url = "https://video.twimg.com/synthetic.mp4";
-        assert_eq!(
-            fetch_transcript(url, Duration::from_secs(5)),
-            Err("whisper not configured".to_string())
-        );
-        let work = tempfile::tempdir().unwrap();
-        let model = work.path().join("model.bin");
-        std::fs::write(&model, b"fake model").unwrap();
-        std::env::set_var(WHISPER_CMD_ENV_VAR, work.path().join("no-such-binary"));
-        std::env::set_var(WHISPER_MODEL_ENV_VAR, &model);
-        assert_eq!(
-            fetch_transcript(url, Duration::from_secs(5)),
-            Err("whisper binary missing".to_string())
-        );
-        let fake_bin = write_fake_script(work.path(), "whisper-fake", "#!/bin/sh\nexit 0\n");
-        std::env::set_var(WHISPER_CMD_ENV_VAR, &fake_bin);
-        std::env::set_var(WHISPER_MODEL_ENV_VAR, work.path().join("no-such-model"));
-        assert_eq!(
-            fetch_transcript(url, Duration::from_secs(5)),
-            Err("whisper model missing".to_string())
-        );
-        std::env::set_var(WHISPER_MODEL_ENV_VAR, &model);
-        let empty_bin = work.path().join("empty");
-        std::fs::create_dir(&empty_bin).unwrap();
-        restrict_path(&empty_bin);
-        assert_eq!(
-            fetch_transcript(url, Duration::from_secs(5)),
-            Err("ffmpeg not found".to_string())
-        );
-        assert_eq!(
-            fetch_transcript("https://evil.example/v.mp4", Duration::from_secs(5)),
-            Err("video url not allowlisted".to_string())
-        );
-        assert_eq!(
-            fetch_transcript("https://pbs.twimg.com/media/a.jpg", Duration::from_secs(5)),
-            Err("video url not allowlisted".to_string())
-        );
-    }
-
-    #[test]
-    fn transcript_pipeline_via_fake_tools_cached_and_temp_cleaned() {
-        let _env = crate::test_support::EnvHold::fetch_on();
-        let work = tempfile::tempdir().unwrap();
-        let bin = work.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let ffmpeg_log = work.path().join("ffmpeg.log");
-        std::env::set_var("FAKE_FFMPEG_LOG", &ffmpeg_log);
-        write_fake_script(
-            &bin,
-            "ffmpeg",
-            r#"#!/bin/sh
-echo "ffmpeg $*" >> "$FAKE_FFMPEG_LOG"
-out=""
-for a in "$@"; do out="$a"; done
-printf 'fake-audio' > "$out"
-exit 0
-"#,
-        );
-        let whisper_log = work.path().join("whisper.log");
-        std::env::set_var("FAKE_WHISPER_LOG", &whisper_log);
-        write_fake_script(
-            &bin,
-            "whisper-fake",
-            r#"#!/bin/sh
-echo "whisper $*" >> "$FAKE_WHISPER_LOG"
-printf '[00:00:00.000 --> 00:00:02.000] Hi @syn_handle, roll your shoulders '
-i=0
-while [ "$i" -lt 2000 ]; do printf 'word '; i=$((i + 1)); done
-printf '\n'
-exit 0
-"#,
-        );
-        prepend_path(&bin);
-        let model = work.path().join("model.bin");
-        std::fs::write(&model, b"fake model").unwrap();
-        std::env::set_var(WHISPER_CMD_ENV_VAR, bin.join("whisper-fake"));
-        std::env::set_var(WHISPER_MODEL_ENV_VAR, &model);
-        let (base, hits) = mock_server(
-            vec![Route {
-                path: "/low.mp4".to_string(),
-                status: 200,
-                content_type: Some("video/mp4".to_string()),
-                extra_headers: Vec::new(),
-                body: b"fake-mp4-bytes".to_vec(),
-                delay: Duration::ZERO,
-            }],
-            5,
-        );
-        std::env::set_var(VIDEO_BASE_ENV_VAR, &base);
-        // The stored best URL is tampered (non-allowlisted): the run must use
-        // the low-bitrate transcription URL instead.
-        let mut b = bm("tr1", SANITIZED_TEXT);
-        b.media = vec![video_media(
-            "https://evil.example/high.mp4",
-            Some("https://video.twimg.com/low.mp4"),
-        )];
-        // Isolate temp files: everything created below must be gone after.
-        let scratch = tempfile::tempdir().unwrap();
-        std::env::set_var("TMPDIR", scratch.path());
-        let mut cache = HashMap::new();
-        let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
-        assert!(e.notes.is_empty(), "{:?}", e.notes);
-        assert!(e.text.contains("Video transcript: "), "{}", e.text);
-        assert!(e.text.contains("Hi , roll your shoulders"), "{}", e.text);
-        assert!(!e.text.contains("@syn_handle"), "{}", e.text);
-        assert!(!e.text.contains("-->"), "{}", e.text);
-        let transcript = e.text.split("Video transcript: ").nth(1).unwrap();
-        assert!(transcript.chars().count() <= MAX_TRANSCRIPT_CHARS);
-        assert_eq!(MAX_TRANSCRIPT_CHARS, 4000);
-        assert_eq!(hits_of(&hits), 1);
-        assert_eq!(
-            std::fs::read_to_string(&ffmpeg_log)
-                .unwrap()
-                .lines()
-                .count(),
-            1
-        );
-        assert_eq!(
-            std::fs::read_to_string(&whisper_log)
-                .unwrap()
-                .lines()
-                .count(),
-            1
-        );
-        let key = crate::translate::sha256_hex("video-transcript:https://video.twimg.com/low.mp4");
-        assert!(cache.contains_key(&key));
-        let e2 = enrich_at(&b, &mut cache, 5_000_100, Duration::from_secs(5));
-        assert_eq!(e2.text, e.text);
-        assert_eq!(hits_of(&hits), 1);
-        assert_eq!(
-            std::fs::read_to_string(&ffmpeg_log)
-                .unwrap()
-                .lines()
-                .count(),
-            1
-        );
-        assert_eq!(
-            std::fs::read_to_string(&whisper_log)
-                .unwrap()
-                .lines()
-                .count(),
-            1
-        );
-        let leftovers: Vec<_> = std::fs::read_dir(scratch.path()).unwrap().collect();
-        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
-    }
-
-    #[test]
-    fn transcript_timeout_is_a_skip_reason() {
-        let _env = crate::test_support::EnvHold::fetch_on();
-        let work = tempfile::tempdir().unwrap();
-        let bin = work.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        write_fake_script(&bin, "ffmpeg", "#!/bin/sh\nexec sleep 10\n");
-        prepend_path(&bin);
-        let fake_whisper = write_fake_script(&bin, "whisper-fake", "#!/bin/sh\nexit 0\n");
-        let model = work.path().join("model.bin");
-        std::fs::write(&model, b"fake model").unwrap();
-        std::env::set_var(WHISPER_CMD_ENV_VAR, &fake_whisper);
-        std::env::set_var(WHISPER_MODEL_ENV_VAR, &model);
-        std::env::set_var(FFMPEG_TIMEOUT_ENV_VAR, "0.05");
-        let (base, hits) = mock_server(
-            vec![Route {
-                path: "/v.mp4".to_string(),
-                status: 200,
-                content_type: Some("video/mp4".to_string()),
-                extra_headers: Vec::new(),
-                body: b"fake-mp4".to_vec(),
-                delay: Duration::ZERO,
-            }],
-            5,
-        );
-        std::env::set_var(VIDEO_BASE_ENV_VAR, &base);
-        let mut b = bm("tr2", SANITIZED_TEXT);
-        b.media = vec![video_media("https://video.twimg.com/v.mp4", None)];
-        let mut cache = HashMap::new();
-        let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
-        assert_eq!(hits_of(&hits), 1);
-        assert!(e.text.is_empty(), "{}", e.text);
-        assert!(
-            e.notes.contains(&"transcript skipped: timeout".to_string()),
-            "{:?}",
-            e.notes
-        );
-        assert!(
-            e.notes.contains(&"captions unavailable".to_string()),
-            "{:?}",
-            e.notes
-        );
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn private_subtitles_and_transcripts_never_reach_paid_prompts() {
-        let _env = crate::test_support::EnvHold::fetch_on();
-        let work = tempfile::tempdir().unwrap();
-        let bin = work.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        write_fake_script(
-            &bin,
-            "yt-dlp",
-            r#"#!/bin/sh
-cat > ./subs.en.vtt <<'EOF'
-WEBVTT
-
-00:00:00.000 --> 00:00:02.000
-QuokkaMarkerSubtitles syndicated
-EOF
-exit 0
-"#,
-        );
-        write_fake_script(
-            &bin,
-            "ffmpeg",
-            r#"#!/bin/sh
-out=""
-for a in "$@"; do out="$a"; done
-printf 'fake-audio' > "$out"
-exit 0
-"#,
-        );
-        write_fake_script(
-            &bin,
-            "whisper-fake",
-            "#!/bin/sh\necho QuokkaMarkerTranscriptContent\nexit 0\n",
-        );
-        prepend_path(&bin);
-        let model = work.path().join("model.bin");
-        std::fs::write(&model, b"fake model").unwrap();
-        std::env::set_var(WHISPER_CMD_ENV_VAR, bin.join("whisper-fake"));
-        std::env::set_var(WHISPER_MODEL_ENV_VAR, &model);
-        let (base, _) = mock_server(
-            vec![Route {
-                path: "/v.mp4".to_string(),
-                status: 200,
-                content_type: Some("video/mp4".to_string()),
-                extra_headers: Vec::new(),
-                body: b"fake-mp4".to_vec(),
-                delay: Duration::ZERO,
-            }],
-            5,
-        );
-        std::env::set_var(VIDEO_BASE_ENV_VAR, &base);
-        let mut b = bm("priv2", PRIVATE_TEXT);
-        b.urls = vec!["https://www.youtube.com/watch?v=syntheticPriv".to_string()];
-        b.media = vec![video_media("https://video.twimg.com/v.mp4", None)];
-        let mut cache = HashMap::new();
-        let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
-        assert!(e.local_only);
-        assert!(e.text.contains("QuokkaMarkerSubtitles"), "{}", e.text);
-        assert!(
-            e.text.contains("QuokkaMarkerTranscriptContent"),
-            "{}",
-            e.text
-        );
-        assert!(!will_append(&e));
-        let input = cascade_input(PRIVATE_TEXT, &e);
-        assert_eq!(input, crate::sanitize::sanitize_uncapped(PRIVATE_TEXT));
-        assert!(!input.contains("quokka@example.invalid"), "{input}");
-        let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
-        assert!(
-            !paid_prompt.contains("quokka@example.invalid"),
-            "{paid_prompt}"
-        );
-        assert!(
-            !paid_prompt.contains("QuokkaMarkerSubtitles"),
-            "{paid_prompt}"
-        );
-        assert!(
-            !paid_prompt.contains("QuokkaMarkerTranscriptContent"),
-            "{paid_prompt}"
-        );
     }
 }
