@@ -562,6 +562,8 @@ mod tests {
     /// Test helper: synthetic stored post with the given text and language.
     fn stored_post(id: &str, text: &str, lang: Option<&str>) -> crate::fixture::Bookmark {
         crate::fixture::Bookmark {
+            quoted_text: None,
+            x_bookmark_present: None,
             post_id: id.into(),
             url: format!("https://x.com/i/status/{id}"),
             text: text.into(),
@@ -586,6 +588,8 @@ mod tests {
     /// Test helper: synthetic English post with the given author.
     fn authored_post(id: &str, author: Option<&str>) -> crate::fixture::Bookmark {
         crate::fixture::Bookmark {
+            quoted_text: None,
+            x_bookmark_present: None,
             post_id: id.into(),
             url: format!("https://x.com/i/status/{id}"),
             text: "[synthetic] The government presented an economic plan to support small local businesses.".into(),

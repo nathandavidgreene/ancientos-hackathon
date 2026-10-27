@@ -525,6 +525,8 @@ mod tests {
     /// Test helper: a bookmark with the given id, optional topic and author, and text.
     fn bm(id: &str, topic: Option<&str>, author: Option<&str>, text: &str) -> Bookmark {
         Bookmark {
+            quoted_text: None,
+            x_bookmark_present: None,
             post_id: id.into(),
             url: format!("https://x.com/i/status/{id}"),
             text: text.into(),

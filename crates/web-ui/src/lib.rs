@@ -156,9 +156,17 @@ impl State {
                 .map_err(|e| format!("store parse failed: {e}"))?,
         };
         bookmarks.sort_by(|a, b| a.post_id.cmp(&b.post_id));
+        // Muted and removed-on-X bookmarks never surface in the UI. Reads
+        // stay side-effect free, so no log entry is written here.
+        let cache = bookmarks_agent::link_context::load_cache(
+            &dir.join(bookmarks_agent::link_context::CACHE_FILE_NAME),
+        );
+        let mute = bookmarks_agent::topic_mute::MuteList::from_env()?;
+        let (visible, _skips) =
+            bookmarks_agent::topic_mute::filter_surfaced(&bookmarks, &mute, &cache);
         let state = Self {
             data_dir: dir.clone(),
-            bookmarks: bookmarks.clone(),
+            bookmarks: visible,
             all_bookmarks: bookmarks,
             muse_log_path: bookmarks_agent::stats::muse_log_path_from_env(),
             phone_token: None,
@@ -4180,6 +4188,20 @@ mod tests {
         );
         assert!(!resp.body.contains("<script>"), "{}", resp.body);
         assert!(!resp.body.contains("<b>bad</b>"), "{}", resp.body);
+    }
+
+    #[test]
+    fn removed_on_x_never_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            r#"{"post_id":"r1","url":"","text":"[synthetic] kept"}"#,
+            r#"{"post_id":"r2","url":"","text":"[synthetic] gone","x_bookmark_present":false}"#,
+            r#"{"post_id":"r3","url":"","text":"[synthetic] present","x_bookmark_present":true}"#,
+        ];
+        std::fs::write(dir.path().join("store.jsonl"), rows.join("\n") + "\n").unwrap();
+        let state = State::open(dir.path()).unwrap();
+        let ids: Vec<&str> = state.bookmarks.iter().map(|b| b.post_id.as_str()).collect();
+        assert_eq!(ids, vec!["r1", "r3"]);
     }
 
     #[test]

@@ -749,6 +749,9 @@ fn run_impl(
         .filter(|b| !crate::author_filter::is_hidden(b, &hidden_authors))
         .cloned()
         .collect();
+    // Topic mute + removed-on-X: these never surface. Skips are logged
+    // below as counts only (no text, ids, or terms).
+    let (rows, mute_skips) = crate::topic_mute::filter_for_log(&rows, log_path)?;
     if rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
@@ -965,6 +968,13 @@ fn run_impl(
         }
     }
     let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    if !mute_skips.is_empty() {
+        log.append(
+            "topic_mute.skipped",
+            crate::topic_mute::skip_payload(&mute_skips),
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let ids: Vec<&str> = candidates.iter().map(|c| c.post_id.as_str()).collect();
     log.append(
         "brief.candidates",
@@ -1065,6 +1075,8 @@ mod tests {
     /// Test helper: builds a bookmark with optional topic label and confidence.
     fn bm(id: &str, created: Option<&str>, topic: Option<&str>, conf: Option<f64>) -> Bookmark {
         Bookmark {
+            quoted_text: None,
+            x_bookmark_present: None,
             post_id: id.into(),
             url: format!("https://x.com/i/status/{id}"),
             text: format!("synthetic text for {id}"),

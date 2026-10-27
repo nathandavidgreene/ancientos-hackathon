@@ -1317,6 +1317,8 @@ pub fn run_with(
     // Probe the hands-on classifier with the full context text. Steps use
     // thread text only so quoted/linked posts never become steps.
     let probe = Bookmark {
+        quoted_text: None,
+        x_bookmark_present: None,
         post_id: post_id.to_string(),
         url: crate::delegate::post_url(post_id, username.as_deref()),
         text: full_joined,

@@ -1052,6 +1052,8 @@ impl Workspace {
         let english_expected = "[synthetic] The government presented an economic plan to support small local businesses. Details at the demo plan page or at the demo mailbox."
             .to_string();
         let b = Bookmark {
+            quoted_text: None,
+            x_bookmark_present: None,
             post_id: post_id.to_string(),
             url: format!("https://example.invalid/demo_translator/status/{post_id}"),
             text: original.clone(),

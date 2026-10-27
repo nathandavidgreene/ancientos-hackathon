@@ -44,6 +44,13 @@ pub struct Bookmark {
     /// [`crate::link_context`] to fetch linked-page text; never written back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub urls: Vec<String>,
+    /// Text of the quoted post, when the bookmark quotes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_text: Option<String>,
+    /// Whether X still lists this as bookmarked. `Some(false)` means
+    /// removed (never surfaced); `None` means still bookmarked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_bookmark_present: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]

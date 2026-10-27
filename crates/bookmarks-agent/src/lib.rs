@@ -28,6 +28,7 @@ pub mod stats;
 pub(crate) mod test_support;
 pub mod token_store;
 pub mod topic_filter;
+pub mod topic_mute;
 pub mod translate;
 pub mod try_it;
 pub mod try_it_cascade;

@@ -314,6 +314,8 @@ mod tests {
     /// Test helper: synthetic bookmark with the given id.
     fn bm(id: &str) -> Bookmark {
         Bookmark {
+            quoted_text: None,
+            x_bookmark_present: None,
             post_id: id.into(),
             url: format!("https://x.com/i/status/{id}"),
             text: format!("synthetic text for {id}"),

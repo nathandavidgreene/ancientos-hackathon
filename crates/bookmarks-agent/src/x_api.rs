@@ -369,6 +369,8 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
                 None => format!("https://x.com/i/status/{id}"),
             };
             items.push(Bookmark {
+                quoted_text: None,
+                x_bookmark_present: None,
                 post_id: id.to_string(),
                 url,
                 text: full_text_of(t),

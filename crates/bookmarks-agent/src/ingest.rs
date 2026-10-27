@@ -133,6 +133,8 @@ mod tests {
     /// Test helper: minimal bookmark with derived URL for the given id.
     fn bm(id: &str) -> Bookmark {
         Bookmark {
+            quoted_text: None,
+            x_bookmark_present: None,
             post_id: id.into(),
             url: format!("https://x.com/i/status/{id}"),
             text: String::new(),

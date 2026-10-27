@@ -394,6 +394,8 @@ mod tests {
     /// Test helper: builds a bookmark with the given id, text, and language.
     fn bm(id: &str, text: &str, lang: Option<&str>) -> Bookmark {
         Bookmark {
+            quoted_text: None,
+            x_bookmark_present: None,
             post_id: id.into(),
             url: format!("https://x.com/i/status/{id}"),
             text: text.into(),
