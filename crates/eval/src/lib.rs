@@ -319,10 +319,10 @@ mod tests {
         assert_eq!(
             report.try_it,
             Confusion {
-                tp: 8,
-                fp: 1,
-                r#fn: 2,
-                tn: 13,
+                tp: 9,
+                fp: 0,
+                r#fn: 1,
+                tn: 14,
             }
         );
         assert!(approx(report.ranking.precision_at_5, 0.6));

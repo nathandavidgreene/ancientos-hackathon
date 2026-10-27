@@ -68,25 +68,156 @@ pub fn is_try_it(b: &Bookmark) -> bool {
 }
 
 /// Classify a bookmark, returning the tag with its reason, or `None`.
+/// A video/GIF attachment counts as a demo cue (see [`classify_with_media`]).
 pub fn classify(b: &Bookmark) -> Option<TryItTag> {
-    classify_text(&crate::brief::topic_of(b), &b.text)
+    let has_video = b
+        .media
+        .iter()
+        .any(|m| m.kind == "video" || m.kind == "animated_gif");
+    classify_with_media(&crate::brief::topic_of(b), &b.text, has_video)
 }
 
 /// Classify from a topic and full text (used by the brief, which renders
 /// hydrated/expanded text rather than the stored excerpt).
 pub fn classify_text(topic: &str, text: &str) -> Option<TryItTag> {
-    let cues = detect_cues(text);
-    if cues.is_empty() {
-        return None;
-    }
+    classify_with_media(topic, text, false)
+}
+
+/// Deterministic rule set:
+/// - structural cues (numbered/bulleted lists, durations, imperatives) never
+///   tag on their own: list-style advice posts stay untagged;
+/// - a practice cue (breath, hold, reps, each side, mindfulness, ingredients,
+///   practice/demo words) tags on a hands-on topic, or with an explicit
+///   "try it" or a second practice cue, or numbered/imperative steps; numbered imperative steps tag on a
+///   hands-on topic;
+/// - a short video demo (video media, or a short post with a link) tags when
+///   it carries a practice cue or an action verb.
+pub fn classify_with_media(topic: &str, text: &str, has_video: bool) -> Option<TryItTag> {
+    let mut cues = detect_cues(text);
+    let hands_on = topic_is_hands_on(topic);
+    let practice: Vec<&str> = cues
+        .iter()
+        .copied()
+        .filter(|c| !STRUCTURAL.contains(c))
+        .collect();
     let explicit = cues.contains(&CUE_EXPLICIT);
-    let tagged = explicit || topic_is_hands_on(topic) || cues.len() >= 2;
+    let body = practice.iter().filter(|c| **c != CUE_EXPLICIT).count();
+    let short_demo = is_short_demo(text);
+    let video_demo =
+        (has_video || short_demo) && (body > 0 || has_action_verb(&text.to_lowercase()));
+    if video_demo {
+        cues.push(if has_video { CUE_VIDEO } else { CUE_SHORT_DEMO });
+    }
+    let steps = cues.contains(&CUE_NUMBERED) && cues.contains(&CUE_IMPERATIVE);
+    let tagged = video_demo
+        || (body > 0
+            && (hands_on
+                || explicit
+                || body >= 2
+                || cues.contains(&CUE_NUMBERED)
+                || cues.contains(&CUE_IMPERATIVE)))
+        || (hands_on && steps);
     if !tagged {
         return None;
     }
     Some(TryItTag {
         reason: format!("{}; topic '{topic}'", cues.join(", ")),
     })
+}
+
+const CUE_VIDEO: &str = "video demo";
+const CUE_SHORT_DEMO: &str = "short demo";
+const CUE_PRACTICE: &str = "practice cue";
+
+/// Cues that describe shape, not a hands-on practice.
+const STRUCTURAL: &[&str] = &[CUE_NUMBERED, CUE_BULLETS, CUE_DURATION, CUE_IMPERATIVE];
+
+/// Words naming something you physically do or practise.
+const PRACTICE_WORDS: &[&str] = &[
+    "mix",
+    "whisk",
+    "bake",
+    "refrigerate",
+    "simmer",
+    "preheat",
+    "chop",
+    "stir",
+    "practice",
+    "practise",
+    "drill",
+    "drills",
+    "technique",
+    "routine",
+    "with me",
+    "isometric",
+    "plank",
+    "squat",
+    "squats",
+    "push-up",
+    "push-ups",
+    "pushup",
+    "pushups",
+    "stretch",
+    "stretches",
+    "stretching",
+    "journal",
+    "answer these",
+    "how you do it",
+    "this is how you",
+    "follow along",
+    "tutorial",
+    "step by step",
+    "step-by-step",
+];
+
+/// Verbs that make a short clip a demo rather than commentary.
+const ACTION_VERBS: &[&str] = &[
+    "practice",
+    "practise",
+    "tie",
+    "tying",
+    "fold",
+    "folding",
+    "cook",
+    "cooking",
+    "stretch",
+    "stretching",
+    "lift",
+    "lifting",
+    "throw",
+    "swing",
+    "serve",
+    "build",
+    "make",
+    "making",
+    "fix",
+    "fixing",
+    "do",
+    "learn",
+    "watch how",
+    "how to",
+    "skills",
+    "trick",
+    "hack",
+    "drill",
+    "workout",
+    "exercise",
+];
+
+fn has_action_verb(lower: &str) -> bool {
+    has_any_phrase(lower, ACTION_VERBS)
+}
+
+/// A short post (under 120 chars once links are removed) that carries a
+/// link: usually a video clip whose caption names the activity.
+fn is_short_demo(text: &str) -> bool {
+    let has_link = text.contains("https://t.co/");
+    let body: String = text
+        .split_whitespace()
+        .filter(|w| !w.starts_with("http"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    has_link && body.chars().count() < 120
 }
 
 /// Extract up to [`MAX_STEPS`] practice steps: numbered or bulleted steps
@@ -306,6 +437,9 @@ fn detect_cues(text: &str) -> Vec<&'static str> {
     }
     if contains_phrase(&lower, "ingredients") {
         cues.push(CUE_INGREDIENTS);
+    }
+    if has_any_phrase(&lower, PRACTICE_WORDS) {
+        cues.push(CUE_PRACTICE);
     }
     if has_imperative(text) {
         cues.push(CUE_IMPERATIVE);
@@ -1181,5 +1315,34 @@ mod tests {
         shown.sort();
         assert_eq!(shown, vec!["h1".to_string(), "h2".to_string()]);
         assert_eq!(pending_followups(&log), ["h1", "h2"].map(str::to_string));
+    }
+
+    #[test]
+    fn list_style_advice_is_not_tagged() {
+        let t =
+            "5 things for your marriage:\n1. Weekly date night, 30 minutes.\n2. Say thanks daily.";
+        assert!(classify_with_media("Relationships", t, false).is_none());
+        let b = "- Anger means a boundary.\n- Anxiety is preparation.";
+        assert!(classify_with_media("Mental Health", b, false).is_none());
+    }
+
+    #[test]
+    fn short_video_demo_is_tagged() {
+        let t = "Practical knot-tying skills https://t.co/abc";
+        assert!(classify_with_media("Misc", t, false).is_some());
+        let v = "Watch how to fold a fitted sheet";
+        let tag = classify_with_media("Misc", v, true).unwrap();
+        assert!(tag.reason.contains("video demo"), "{}", tag.reason);
+        assert!(classify_with_media("Misc", "Funny cat", true).is_none());
+    }
+
+    #[test]
+    fn explicit_try_needs_practice_cue() {
+        assert!(classify_with_media(
+            "Programming",
+            "Try this debugging trick. Explain the bug out loud.",
+            false
+        )
+        .is_none());
     }
 }
