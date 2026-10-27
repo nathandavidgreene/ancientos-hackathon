@@ -369,7 +369,8 @@ fn layout(title: &str, body: &str, state: &State) -> String {
          <a href=\"/try\">Try it</a><a href=\"/wiki\">Wiki</a>\
          <a href=\"/hidden-authors\">Hidden</a>\
          <a href=\"/approvals\">Approvals ({})</a>\
-         <a href=\"/log\">Log</a><a href=\"/stats\">Stats</a></nav><hr>{body}</body></html>",
+         <a href=\"/log\">Log</a><a href=\"/stats\">Stats</a>\
+         <a href=\"/accuracy\">Accuracy</a></nav><hr>{body}</body></html>",
         escape(title),
         pending_count(state),
     )
@@ -1526,6 +1527,71 @@ fn decide_approval(state: &State, body: &[u8], approve_it: bool) -> Response {
     }
 }
 
+/// Accuracy panel: eval metrics computed live from the committed synthetic
+/// data compiled into the binary (never eval-private, never this data dir).
+/// Shows try-it classification and brief-ranking P@5 for today's order, the
+/// vote-learned ranker, ranking by meaning, and the blend. An eval error
+/// renders a 500 with the reason (fail closed: no numbers shown).
+fn page_accuracy(state: &State) -> Response {
+    let (report, cmp) = match ancientos_eval::harness::synthetic_panel() {
+        Ok(v) => v,
+        Err(e) => return Response::status(500, error_page("Accuracy unavailable", &e, state)),
+    };
+    let f3 = |x: f64| format!("{x:.3}");
+    let opt = |x: Option<f64>| x.map_or_else(|| "n/a".to_string(), f3);
+    let t = &report.try_it;
+    let r = &report.ranking;
+    let mut body = String::from(
+        "<h1>Accuracy</h1><p>Measured on the committed synthetic eval set only \
+         (fixtures/eval), offline, with cached local embeddings. No private data.</p>",
+    );
+    body.push_str(&format!(
+        "<h2>Try-it classification</h2><p>{} labeled posts.</p>",
+        t.n()
+    ));
+    body.push_str(&kv_table(
+        "Metric",
+        "Value",
+        &[
+            ("Accuracy".to_string(), f3(t.accuracy())),
+            ("Precision".to_string(), f3(t.precision())),
+            ("Recall".to_string(), f3(t.recall())),
+            ("F1".to_string(), f3(t.f1())),
+        ],
+    ));
+    body.push_str(&format!(
+        "<h2>Brief ranking</h2><p>All {} posts, today's order: P@5 {}, brief-worthy base rate {}.</p>",
+        report.n_matched,
+        f3(r.precision_at_5),
+        f3(r.base_rate),
+    ));
+    body.push_str(&format!(
+        "<h2>Personal ranking</h2><p>The earlier {} votes train; the later {} posts \
+         ({} brief-worthy) are scored.</p>",
+        cmp.n_train, cmp.n_test, cmp.n_test_worthy
+    ));
+    body.push_str(&kv_table(
+        "Picks",
+        "P@5",
+        &[
+            ("Today's order".to_string(), f3(cmp.baseline_precision_at_5)),
+            (
+                "Votes (personal ranker)".to_string(),
+                f3(cmp.ranked_precision_at_5),
+            ),
+            (
+                "Meaning (local embeddings)".to_string(),
+                opt(cmp.semantic_precision_at_5),
+            ),
+            (
+                "Votes + meaning (blend)".to_string(),
+                opt(cmp.blended_precision_at_5),
+            ),
+        ],
+    ));
+    Response::ok(layout("Accuracy", &body, state))
+}
+
 /// Render `rows` as a two-column HTML table with escaped cells and a
 /// header row (`head0`, `head1`). Args: the header labels and the
 /// `(name, count)` rows; returns the table HTML; never fails.
@@ -1797,6 +1863,7 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("POST", "/unhide-author") => do_unhide_author(state, &req.body),
         ("GET", "/log") => page_log(state),
         ("GET", "/stats") => page_stats(state),
+        ("GET", "/accuracy") => page_accuracy(state),
         ("GET", "/approvals") => page_approvals(state),
         ("POST", "/approvals/approve") => decide_approval(state, &req.body, true),
         ("POST", "/approvals/deny") => decide_approval(state, &req.body, false),
@@ -3895,6 +3962,29 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn accuracy_panel_shows_synthetic_metrics_only() {
+        let (_dir, state) = test_state();
+        let resp = handle(&Request::get("/accuracy"), &state);
+        assert_eq!(resp.status, 200);
+        for want in [
+            "<a href=\"/accuracy\">Accuracy</a>",
+            "committed synthetic eval set",
+            "Try-it classification",
+            "Votes (personal ranker)",
+            "Meaning (local embeddings)",
+            "Votes + meaning (blend)",
+        ] {
+            assert!(resp.body.contains(want), "missing {want}: {}", resp.body);
+        }
+        let (_, cmp) = ancientos_eval::harness::synthetic_panel().unwrap();
+        let blended = format!("{:.3}", cmp.blended_precision_at_5.unwrap());
+        assert!(resp.body.contains(&blended), "{}", resp.body);
+        // Aggregates only: no synthetic post ids or private paths.
+        assert!(!resp.body.contains("eval-1"), "{}", resp.body);
+        assert!(!resp.body.contains("eval-private"), "{}", resp.body);
     }
 
     #[test]

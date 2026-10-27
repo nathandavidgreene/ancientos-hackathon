@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# No doc examples here; rustdoc --test cannot resolve ancientos-router
+# through ancientos-eval when clippy metadata shares the target dir.
+[lib]
+doctest = false
+
 [[bin]]
 name = "web-ui"
 path = "src/main.rs"
@@ -11,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 ancientos-core = { path = "../core" }
 bookmarks-agent = { path = "../bookmarks-agent" }
+ancientos-eval = { path = "../eval" }
 serde_json.workspace = true
 
 [dev-dependencies]

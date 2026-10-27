@@ -725,6 +725,7 @@ name = "web-ui"
 version = "0.1.0"
 dependencies = [
  "ancientos-core",
+ "ancientos-eval",
  "bookmarks-agent",
  "serde_json",
  "tempfile",
