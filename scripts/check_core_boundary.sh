@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 fail=0
-deps=$(cargo metadata --format-version 1 --no-deps --offline 2>/dev/null \
+deps=$(cargo metadata --format-version 1 --no-deps --offline \
   | python3 -c '
 import json, sys
 m = json.load(sys.stdin)

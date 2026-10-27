@@ -27,6 +27,8 @@ if [ $# -eq 2 ]; then
 fi
 export CARGO_HOME="${CARGO_HOME:-/tmp/cargo-home}"
 cargo build -q -p demo-runner -p bookmarks-agent
+# The demo swaps HOME to a temp dir; rustup still needs the real one.
+REAL_HOME="$HOME"
 export ANCIENTOS_HOME="$DATA/home"
 export HOME="$DATA/home"
 export DECISION_LOG_PATH="$DATA/decision_log.jsonl"
@@ -136,6 +138,8 @@ shot14() {
   echo "==== Shot 14/14: Roadmap ===="
   echo "Roadmap: more agents on core, custom X feed ranking, go-deeper sessions."
   echo "Bookmarks is the first agent; the rest of AncientOS plugs into the same core."
+  # Core-plus-apps (P7): the same check CI runs; deterministic, offline.
+  HOME="$REAL_HOME" scripts/check_core_boundary.sh
   echo "Go deeper (offline, quoted + linked, shortened):"
   # "Saved:" carries the temp dir path, so filter it to stay byte-identical.
   # Shortened to the first lines to keep the 3:00 budget.
