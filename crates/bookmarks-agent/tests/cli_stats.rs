@@ -55,6 +55,7 @@ fn seed(log_path: &Path) -> u64 {
     let mut log = DecisionLog::open(log_path).unwrap();
     ancientos_core::approvals::request(
         &mut log,
+        &bookmarks_agent::app_gate(),
         "bookmarks-agent",
         "x.post",
         "synthetic stats cli proposal",

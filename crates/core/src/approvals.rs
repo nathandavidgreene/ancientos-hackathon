@@ -8,8 +8,8 @@
 //! a tampered log is an error that appends nothing.
 //!
 //! Flow:
-//! 1. [`request`] records a proposal, but only for actions the
-//!    [`default_gate`](crate::gate::default_gate) evaluates as `NeedsHuman`.
+//! 1. [`request`] records a proposal, but only for actions the caller-provided
+//!    [`Gate`](crate::gate::Gate) evaluates as `NeedsHuman`.
 //!    Gate-allowed actions are refused ("no approval is needed") and
 //!    gate-denied actions are refused with the deny reason.
 //! 2. A human calls [`approve`] or [`deny`] exactly once, passing the
@@ -54,7 +54,7 @@
 //! and second decisions are ignored (first valid entry wins). Request entries
 //! are additionally checked by recomputing the id and the payload hash.
 
-use crate::gate::{default_gate, Proposal, Verdict};
+use crate::gate::{Gate, Proposal, Verdict};
 use crate::log::{DecisionLog, Entry, LogError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -478,14 +478,18 @@ fn all(log: &DecisionLog) -> Result<Vec<Approval>, ApprovalError> {
     Ok(out)
 }
 
-/// Record a proposal for a risky action. Only actions the default gate
-/// evaluates as `NeedsHuman` are accepted: gate-allowed actions fail with
-/// "no approval is needed" and gate-denied (including unknown) actions fail
-/// with the deny reason. A duplicate pending request for the same
-/// agent+action+payload hash returns the existing request without appending.
-/// `ttl` is seconds from `now`; `None` means [`DEFAULT_TTL_SECS`].
+/// Record a proposal for a risky action. Only actions the caller-provided
+/// `gate` evaluates as `NeedsHuman` are accepted: gate-allowed actions fail
+/// with "no approval is needed" and gate-denied (including unknown) actions
+/// fail with the deny reason. An empty gate denies every action, so a caller
+/// with no policy registered gets deny-all, never allow-all. A duplicate
+/// pending request for the same agent+action+payload hash returns the existing
+/// request without appending. `ttl` is seconds from `now`; `None` means
+/// [`DEFAULT_TTL_SECS`].
+#[allow(clippy::too_many_arguments)]
 pub fn request(
     log: &mut DecisionLog,
+    gate: &Gate,
     agent: &str,
     action: &str,
     summary: &str,
@@ -493,7 +497,7 @@ pub fn request(
     now: u64,
     ttl: Option<u64>,
 ) -> Result<ApprovalRequest, ApprovalError> {
-    match default_gate().evaluate(&Proposal {
+    match gate.evaluate(&Proposal {
         agent: agent.to_string(),
         action: action.to_string(),
     }) {
@@ -741,6 +745,14 @@ mod tests {
     const RISKY: &str = "x.post";
     const NOW: u64 = 1_700_000_000;
 
+    fn test_gate() -> Gate {
+        use crate::gate::Risk;
+        let mut g = Gate::new();
+        g.register("brief.include", Risk::Low);
+        g.register(RISKY, Risk::High);
+        g
+    }
+
     fn open_log() -> (tempfile::TempDir, DecisionLog, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("decision_log.jsonl");
@@ -755,6 +767,7 @@ mod tests {
     fn propose(log: &mut DecisionLog, now: u64, payload: serde_json::Value) -> ApprovalRequest {
         request(
             log,
+            &test_gate(),
             AGENT,
             RISKY,
             "synthetic test proposal",
@@ -787,6 +800,7 @@ mod tests {
         let (_dir, mut log, _path) = open_log();
         let err = request(
             &mut log,
+            &test_gate(),
             AGENT,
             "brief.include",
             "synthetic",
@@ -805,6 +819,7 @@ mod tests {
         let (_dir, mut log, _path) = open_log();
         let err = request(
             &mut log,
+            &test_gate(),
             AGENT,
             "wipe.drive",
             "synthetic",
@@ -826,6 +841,7 @@ mod tests {
         // Same key at a later time returns the existing request, no new entry.
         let dup = request(
             &mut log,
+            &test_gate(),
             AGENT,
             RISKY,
             "different summary, same key",
@@ -848,7 +864,17 @@ mod tests {
         let payload = json!({"draft": "again"});
         let first = propose(&mut log, NOW, payload.clone());
         approve(&mut log, &first.id, &first.payload_hash, "human", NOW + 1).unwrap();
-        let second = request(&mut log, AGENT, RISKY, "re-propose", payload, NOW + 2, None).unwrap();
+        let second = request(
+            &mut log,
+            &test_gate(),
+            AGENT,
+            RISKY,
+            "re-propose",
+            payload,
+            NOW + 2,
+            None,
+        )
+        .unwrap();
         assert_ne!(second.id, first.id);
         assert_eq!(len(&log), 3); // requested, approved, requested
     }
@@ -865,7 +891,16 @@ mod tests {
         ));
         let (_dir, mut log, _path) = open_log();
         assert!(matches!(
-            request(&mut log, AGENT, RISKY, "s", json!({}), NOW, Some(0)),
+            request(
+                &mut log,
+                &test_gate(),
+                AGENT,
+                RISKY,
+                "s",
+                json!({}),
+                NOW,
+                Some(0)
+            ),
             Err(ApprovalError::BadExpiry(_, _))
         ));
         assert_eq!(len(&log), 0);
@@ -979,6 +1014,7 @@ mod tests {
         let (_dir, mut log, _path) = open_log();
         let r = request(
             &mut log,
+            &test_gate(),
             AGENT,
             RISKY,
             "short-lived",
@@ -1014,6 +1050,7 @@ mod tests {
         let (_dir, mut log, _path) = open_log();
         let r = request(
             &mut log,
+            &test_gate(),
             AGENT,
             RISKY,
             "decide fast",
@@ -1208,6 +1245,7 @@ mod tests {
         let b = propose(&mut log, NOW + 1, json!({"which": "b"}));
         let c = request(
             &mut log,
+            &test_gate(),
             AGENT,
             RISKY,
             "short",
@@ -1293,6 +1331,7 @@ mod tests {
         let (_dir, mut log, _path) = open_log();
         let r = request(
             &mut log,
+            &test_gate(),
             AGENT,
             RISKY,
             "short-lived",
@@ -1309,22 +1348,67 @@ mod tests {
     }
 
     #[test]
-    fn daemon_paid_actions_round_trip_through_request() {
-        use crate::gate::{BRIEF_PAID_ACTION, DEEPER_PAID_ACTION};
+    fn request_with_empty_gate_denies_every_action() {
+        for gate in [Gate::new(), Gate::default()] {
+            let (_dir, mut log, _path) = open_log();
+            for action in ["x.post", "brief.include", "deeper.paid", "anything.at.all"] {
+                let err = request(
+                    &mut log,
+                    &gate,
+                    AGENT,
+                    action,
+                    "synthetic",
+                    json!({}),
+                    NOW,
+                    None,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(err, ApprovalError::GateDenied(_)),
+                    "action {action:?} must deny, got {err:?}"
+                );
+            }
+            assert_eq!(len(&log), 0, "denied requests append nothing");
+        }
+    }
+
+    #[test]
+    fn request_refuses_unregistered_action_with_populated_gate() {
+        use crate::gate::Risk;
+        let mut gate = Gate::new();
+        gate.register("demo.write", Risk::High);
         let (_dir, mut log, _path) = open_log();
-        for action in [BRIEF_PAID_ACTION, DEEPER_PAID_ACTION] {
-            let r = request(
+        for action in ["demo.write2", "demo", "DEMO.WRITE", ""] {
+            let err = request(
                 &mut log,
+                &gate,
                 AGENT,
                 action,
-                "synthetic daemon proposal",
-                json!({"n": 15}),
+                "synthetic",
+                json!({}),
                 NOW,
                 None,
             )
-            .unwrap();
-            assert_eq!(r.action, action);
-            assert_eq!(get(&log, &r.id).unwrap().status, Status::Pending);
+            .unwrap_err();
+            assert!(
+                matches!(err, ApprovalError::GateDenied(_)),
+                "action {action:?} must deny, got {err:?}"
+            );
         }
+        assert_eq!(len(&log), 0, "denied requests append nothing");
+        // The registered action itself still round-trips.
+        let r = request(
+            &mut log,
+            &gate,
+            AGENT,
+            "demo.write",
+            "synthetic",
+            json!({"n": 1}),
+            NOW,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.action, "demo.write");
+        assert_eq!(get(&log, &r.id).unwrap().status, Status::Pending);
     }
 }

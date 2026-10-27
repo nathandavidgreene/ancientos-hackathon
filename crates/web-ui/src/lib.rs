@@ -3472,6 +3472,7 @@ mod tests {
         let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
         ancientos_core::approvals::request(
             &mut log,
+            &bookmarks_agent::app_gate(),
             "bookmarks-agent",
             "x.post",
             summary,
@@ -3706,6 +3707,7 @@ mod tests {
         let propose = |log: &mut DecisionLog, draft: &str, at: u64, ttl: Option<u64>| {
             request(
                 log,
+                &bookmarks_agent::app_gate(),
                 "bookmarks-agent",
                 "x.post",
                 "synthetic stats proposal",

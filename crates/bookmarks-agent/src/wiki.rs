@@ -2328,8 +2328,9 @@ pub fn lint_and_propose(wiki: &Path, log_path: &Path, now: u64) -> Result<LintRe
     for f in &findings {
         let req = ancientos_core::approvals::request(
             &mut log,
+            &crate::app_gate(),
             crate::brief::AGENT_NAME,
-            ancientos_core::gate::WIKI_EDIT_ACTION,
+            crate::WIKI_EDIT_ACTION,
             &format!(
                 "wiki lint [{}] {}: {}",
                 f.kind,
@@ -3044,13 +3045,13 @@ mod tests {
         let pending = ancientos_core::approvals::pending(&clog, NOW).unwrap();
         assert_eq!(pending.len(), report.approvals.len());
         for a in &pending {
-            assert_eq!(a.request.action, ancientos_core::gate::WIKI_EDIT_ACTION);
+            assert_eq!(a.request.action, crate::WIKI_EDIT_ACTION);
         }
-        let gate = ancientos_core::gate::default_gate();
+        let gate = crate::app_gate();
         assert_eq!(
             gate.evaluate(&ancientos_core::gate::Proposal {
                 agent: "t".to_string(),
-                action: ancientos_core::gate::WIKI_EDIT_ACTION.to_string(),
+                action: crate::WIKI_EDIT_ACTION.to_string(),
             }),
             ancientos_core::gate::Verdict::NeedsHuman
         );

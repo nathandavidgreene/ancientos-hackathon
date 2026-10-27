@@ -39,6 +39,7 @@ fn seed_at(
     let mut log = ancientos_core::log::DecisionLog::open(log_path).unwrap();
     ancientos_core::approvals::request(
         &mut log,
+        &bookmarks_agent::app_gate(),
         "bookmarks-agent",
         "x.post",
         summary,

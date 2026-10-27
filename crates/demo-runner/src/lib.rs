@@ -2,7 +2,6 @@
 //! brief, record feedback, show the threshold shift and the decision log.
 //! Uses mock model clients only; never makes network or paid calls.
 use ancientos_core::approvals;
-use ancientos_core::gate::DEEPER_PAID_ACTION;
 use ancientos_core::log::DecisionLog;
 use ancientos_router::dispatch::{dispatch, Backends};
 use ancientos_router::muse::MuseUsage;
@@ -11,14 +10,15 @@ use bookmarks_agent::feedback::{self, FeedbackRecord, ThresholdPolicy, Verdict};
 use bookmarks_agent::fixture::{self, Bookmark};
 use bookmarks_agent::{
     author_filter, brief, daemon, deeper, idea_card, media, translate, try_it, unroll,
+    DEEPER_PAID_ACTION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Categories whose content is treated as sensitive (stays on local Llama).
-/// Single source: the router's data-class table maps these to Confidential.
-pub const SENSITIVE_CATEGORIES: &[&str] = ancientos_router::data_class::SENSITIVE_CATEGORIES;
+/// Single source: the bookmarks agent's category table maps these to Confidential.
+pub const SENSITIVE_CATEGORIES: &[&str] = bookmarks_agent::SENSITIVE_CATEGORIES;
 pub const BRIEF_SIZE: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -50,9 +50,7 @@ pub fn category(b: &Bookmark) -> String {
 pub fn sensitivity(cat: &str) -> Sensitivity {
     // Same rule as before, via the shared data-class table: sensitive and
     // unknown categories are above Public, everything else is Public.
-    if ancientos_router::data_class::class_of_category(cat)
-        > ancientos_router::data_class::DataClass::Public
-    {
+    if bookmarks_agent::class_of_category(cat) > ancientos_router::data_class::DataClass::Public {
         Sensitivity::Sensitive
     } else {
         Sensitivity::Sanitized

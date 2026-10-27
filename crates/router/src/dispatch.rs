@@ -471,7 +471,7 @@ mod tests {
             &b,
             Sensitivity::Sensitive,
             true,
-            JevTask::BookmarkClassification,
+            JevTask::Classification,
             &off,
             "PRIVATE",
         )
@@ -483,7 +483,7 @@ mod tests {
             &b,
             Sensitivity::Sanitized,
             false,
-            JevTask::BookmarkClassification,
+            JevTask::Classification,
             &intent_only,
             "public",
         )
@@ -543,13 +543,13 @@ mod tests {
             jev_typesafe: None,
             jev_local: None,
         };
-        let on = JevTasks::of(&[JevTask::BookmarkClassification]);
+        let on = JevTasks::of(&[JevTask::Classification]);
         assert!(matches!(
             dispatch_for_task(
                 &b,
                 Sensitivity::Sanitized,
                 false,
-                JevTask::BookmarkClassification,
+                JevTask::Classification,
                 &on,
                 "public",
             ),
@@ -780,7 +780,7 @@ mod tests {
         let typesafe = Recorder::new(Destination::Jev);
         let local_jev = Recorder::new(Destination::LocalJev);
         let b = jev_backends(&local, &spark, &wonder, &typesafe, &local_jev);
-        let on = JevTasks::of(&[JevTask::BookmarkClassification]);
+        let on = JevTasks::of(&[JevTask::Classification]);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.jsonl");
         let mut log = DecisionLog::open(&path).unwrap();
@@ -790,7 +790,7 @@ mod tests {
                 Sensitivity::Sanitized,
                 DataClass::Restricted,
                 false,
-                JevTask::BookmarkClassification,
+                JevTask::Classification,
                 &on,
                 "test-dispatch",
                 Some(&mut log),

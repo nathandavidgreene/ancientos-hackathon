@@ -224,26 +224,6 @@ pub fn ceiling_from_env(route: Route) -> DataClass {
     parse_ceiling_value(&raw).map(|v| v.min(def)).unwrap_or(def)
 }
 
-/// Categories whose content stays on the device (same rule the brief demo
-/// has always used; see also [`class_of_category`]).
-pub const SENSITIVE_CATEGORIES: &[&str] = &["Health & Personal"];
-
-/// Class of a bookmark category: sensitive categories are
-/// [`DataClass::Confidential`], empty or `"unknown"` categories are
-/// [`DataClass::Restricted`] (unclassified: fail closed), anything else is
-/// [`DataClass::Public`].
-pub fn class_of_category(category: &str) -> DataClass {
-    let trimmed = category.trim();
-    if trimmed.is_empty() || trimmed == "unknown" {
-        return DataClass::Restricted;
-    }
-    if SENSITIVE_CATEGORIES.contains(&trimmed) {
-        DataClass::Confidential
-    } else {
-        DataClass::Public
-    }
-}
-
 /// Highest class among several sources. Content built from several sources
 /// (post text plus enrichment, thread plus quotes) takes the maximum, so one
 /// Restricted source taints the whole. Empty input is
@@ -503,22 +483,6 @@ mod tests {
         assert_eq!(ceiling_from_env(Route::Modal), DataClass::Public);
         assert_eq!(ceiling_from_env(Route::LocalLlama), DataClass::Restricted);
         assert_eq!(ceiling_from_env(Route::LocalJev), DataClass::Restricted);
-    }
-
-    #[test]
-    fn category_mapping_matches_the_existing_rule() {
-        // Sensitive categories stay local; unknown/blank fail closed harder.
-        assert_eq!(
-            class_of_category("Health & Personal"),
-            DataClass::Confidential
-        );
-        assert_eq!(class_of_category("unknown"), DataClass::Restricted);
-        assert_eq!(class_of_category(""), DataClass::Restricted);
-        assert_eq!(class_of_category("   "), DataClass::Restricted);
-        // Anything else is public.
-        for cat in ["Rust & Systems", "Hot Takes", "AI Agents", "Unknown Topics"] {
-            assert_eq!(class_of_category(cat), DataClass::Public, "cat {cat:?}");
-        }
     }
 
     #[test]

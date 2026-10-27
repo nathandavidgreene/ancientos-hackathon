@@ -92,8 +92,8 @@ pub const ANCIENTOS_JEV_TASKS_ENV: &str = "ANCIENTOS_JEV_TASKS";
 pub enum JevTask {
     /// Intent routing (`intent` in [`ANCIENTOS_JEV_TASKS_ENV`]).
     IntentRouting,
-    /// Bookmark classification (`bookmarks` in [`ANCIENTOS_JEV_TASKS_ENV`]).
-    BookmarkClassification,
+    /// Item classification (`bookmarks` in ANCIENTOS_JEV_TASKS_ENV, kept for config compatibility).
+    Classification,
 }
 
 impl JevTask {
@@ -101,7 +101,7 @@ impl JevTask {
     pub fn name(self) -> &'static str {
         match self {
             JevTask::IntentRouting => "intent",
-            JevTask::BookmarkClassification => "bookmarks",
+            JevTask::Classification => "bookmarks",
         }
     }
 
@@ -110,7 +110,7 @@ impl JevTask {
     pub fn parse(value: &str) -> Result<Self, RouterError> {
         match value.trim() {
             "intent" => Ok(JevTask::IntentRouting),
-            "bookmarks" => Ok(JevTask::BookmarkClassification),
+            "bookmarks" => Ok(JevTask::Classification),
             other => Err(RouterError::Refused(format!(
                 "unknown {ANCIENTOS_JEV_TASKS_ENV} value {other:?} (want intent,bookmarks)"
             ))),
@@ -379,7 +379,7 @@ mod tests {
         Sensitivity::Sanitized,
         Sensitivity::Unknown,
     ];
-    const ALL_TASKS: [JevTask; 2] = [JevTask::IntentRouting, JevTask::BookmarkClassification];
+    const ALL_TASKS: [JevTask; 2] = [JevTask::IntentRouting, JevTask::Classification];
 
     #[test]
     fn plain_route_never_picks_jev() {
@@ -397,11 +397,40 @@ mod tests {
     #[test]
     fn jev_task_names_round_trip() {
         assert_eq!(JevTask::IntentRouting.name(), "intent");
-        assert_eq!(JevTask::BookmarkClassification.name(), "bookmarks");
+        assert_eq!(JevTask::Classification.name(), "bookmarks");
         for task in ALL_TASKS {
             assert_eq!(JevTask::parse(task.name()).unwrap(), task);
             assert_eq!(task.name().parse::<JevTask>().unwrap(), task);
         }
+    }
+
+    #[test]
+    fn jev_task_rename_keeps_env_value_byte_identical() {
+        // The variant was renamed, but its only serialized form, the
+        // env-list name, is unchanged.
+        assert_eq!(JevTask::Classification.name(), "bookmarks");
+        assert_eq!(
+            JevTask::parse("bookmarks").unwrap(),
+            JevTask::Classification
+        );
+        assert_eq!(
+            "bookmarks".parse::<JevTask>().unwrap(),
+            JevTask::Classification
+        );
+        let tasks = JevTasks::from_comma_list("intent,bookmarks").unwrap();
+        let joined = tasks
+            .iter()
+            .map(JevTask::name)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(joined, "intent,bookmarks");
+        assert_eq!(joined.as_bytes(), b"intent,bookmarks");
+        // The unknown-value error text is unchanged too.
+        let err = JevTask::parse("nope").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "refused: unknown ANCIENTOS_JEV_TASKS value \"nope\" (want intent,bookmarks)"
+        );
     }
 
     #[test]
@@ -416,15 +445,15 @@ mod tests {
         let intent = JevTasks::from_comma_list("intent").unwrap();
         assert_eq!(intent, JevTasks::of(&[JevTask::IntentRouting]));
         assert!(intent.contains(JevTask::IntentRouting));
-        assert!(!intent.contains(JevTask::BookmarkClassification));
+        assert!(!intent.contains(JevTask::Classification));
         let bookmarks = JevTasks::from_comma_list("  bookmarks ").unwrap();
-        assert!(bookmarks.contains(JevTask::BookmarkClassification));
+        assert!(bookmarks.contains(JevTask::Classification));
         assert!(!bookmarks.contains(JevTask::IntentRouting));
         let both = JevTasks::from_comma_list("intent,bookmarks").unwrap();
         assert_eq!(both.len(), 2);
         assert_eq!(
             both.iter().collect::<Vec<_>>(),
-            vec![JevTask::IntentRouting, JevTask::BookmarkClassification]
+            vec![JevTask::IntentRouting, JevTask::Classification]
         );
         let dupes = JevTasks::from_comma_list("bookmarks, intent,,bookmarks,").unwrap();
         assert_eq!(dupes, both);
@@ -485,7 +514,7 @@ mod tests {
         let _env = EnvGuard::set(ANCIENTOS_JEV_TASKS_ENV, Some("intent,bookmarks"));
         let tasks = JevTasks::from_env().unwrap();
         assert!(tasks.contains(JevTask::IntentRouting));
-        assert!(tasks.contains(JevTask::BookmarkClassification));
+        assert!(tasks.contains(JevTask::Classification));
         // Unknown fails closed: from_env errors, or_empty stays off.
         let _env = EnvGuard::set(ANCIENTOS_JEV_TASKS_ENV, Some("intent,bogus"));
         assert!(matches!(JevTasks::from_env(), Err(RouterError::Refused(_))));
@@ -506,7 +535,7 @@ mod tests {
 
         let _env = EnvGuard::set(ANCIENTOS_JEV_TASKS_ENV, Some("bookmarks"));
         let cfg = RouterConfig::from_env();
-        assert!(cfg.jev_enabled_for(JevTask::BookmarkClassification));
+        assert!(cfg.jev_enabled_for(JevTask::Classification));
         assert!(!cfg.jev_enabled_for(JevTask::IntentRouting));
 
         // Malformed list: from_env fails closed to off, try_from_env errors.
@@ -528,7 +557,7 @@ mod tests {
                 for task in ALL_TASKS {
                     assert_eq!(route_for_task(s, creative, task, &off), route(s, creative));
                     let other = if task == JevTask::IntentRouting {
-                        JevTask::BookmarkClassification
+                        JevTask::Classification
                     } else {
                         JevTask::IntentRouting
                     };

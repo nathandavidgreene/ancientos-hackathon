@@ -132,7 +132,7 @@ accuracy. Routing never picks `Destination::Jev` unless the calling task is
 explicitly opted in via the per-task set `JevTasks` (`RouterConfig.jev_tasks`,
 `route_for_task` / `dispatch_for_task`), read from `ANCIENTOS_JEV_TASKS` as a
 comma list: `intent` enables `JevTask::IntentRouting`, `bookmarks` enables
-`JevTask::BookmarkClassification`. Unset or empty means off; any unknown value
+`JevTask::Classification`. Unset or empty means off; any unknown value
 is an error (fail closed). When a task is opted in, sanitized content routes
 to TypeSafe (`Destination::Jev`) while sensitive or unknown content routes
 only to the local Jev server (`Destination::LocalJev`) — sensitive content

@@ -10,7 +10,7 @@
 //! `ANCIENTOS_ALLOW_PAID=1` the brief agent proposes a `brief.paid`
 //! approval and the deeper-queue agent proposes `deeper.paid` approvals
 //! (both [`Risk::High`](ancientos_core::gate::Risk) in the single
-//! [`default_gate`](ancientos_core::gate::default_gate) policy) instead of
+//! [`app_gate`](crate::app_gate) policy) instead of
 //! calling Muse. A paid walkthrough runs only after a human approves the
 //! exact payload and the daemon claims and releases it
 //! ([`claim_release_token`](ancientos_core::approvals::claim_release_token)
@@ -27,8 +27,8 @@
 //! tests. Ctrl-C stops the loop via the default disposition (there is no
 //! signal handler without new crates); the loop also checks a stop flag.
 
+use crate::{BRIEF_PAID_ACTION, DEEPER_PAID_ACTION};
 use ancientos_core::approvals;
-use ancientos_core::gate::{BRIEF_PAID_ACTION, DEEPER_PAID_ACTION};
 use ancientos_core::log::DecisionLog;
 use ancientos_core::scheduler::{Agent, Scheduler};
 use std::path::{Path, PathBuf};
@@ -240,6 +240,7 @@ pub fn brief_tick(ctx: &AgentCtx, now: u64, paid: bool) -> Result<BriefTick, Str
         let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
         let req = approvals::request(
             &mut log,
+            &crate::app_gate(),
             DAEMON_AGENT_NAME,
             BRIEF_PAID_ACTION,
             &format!(
@@ -496,6 +497,7 @@ fn paid_job_step(
     let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
     let req = match approvals::request(
         &mut log,
+        &crate::app_gate(),
         DAEMON_AGENT_NAME,
         DEEPER_PAID_ACTION,
         &format!("Paid go-deeper walkthrough for {}", job.post_id),
@@ -1278,6 +1280,7 @@ mod tests {
         let mut log2 = DecisionLog::open(&ctx2.log_path).unwrap();
         approvals::request(
             &mut log2,
+            &crate::app_gate(),
             DAEMON_AGENT_NAME,
             DEEPER_PAID_ACTION,
             "synthetic short-lived",
@@ -1498,12 +1501,12 @@ mod tests {
 
     #[test]
     fn daemon_paid_actions_share_the_single_gate_policy() {
-        use ancientos_core::gate::{default_gate, Proposal, Verdict};
+        use ancientos_core::gate::{Proposal, Verdict};
         // The daemon imports the gate's constants (one place): both actions
         // need a human, and anything unregistered fails closed.
         assert_eq!(BRIEF_PAID_ACTION, "brief.paid");
         assert_eq!(DEEPER_PAID_ACTION, "deeper.paid");
-        let gate = default_gate();
+        let gate = crate::app_gate();
         for action in [BRIEF_PAID_ACTION, DEEPER_PAID_ACTION] {
             assert_eq!(
                 gate.evaluate(&Proposal {
