@@ -7,5 +7,6 @@
 pub mod approvals;
 pub mod gate;
 pub mod log;
+pub mod loop_guard;
 pub mod redact;
 pub mod scheduler;

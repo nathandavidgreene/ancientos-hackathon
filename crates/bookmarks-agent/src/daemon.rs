@@ -30,6 +30,7 @@
 use crate::{BRIEF_PAID_ACTION, DEEPER_PAID_ACTION};
 use ancientos_core::approvals;
 use ancientos_core::log::DecisionLog;
+use ancientos_core::loop_guard::{self, Budgets, LoopGuard};
 use ancientos_core::scheduler::{Agent, Scheduler};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -334,7 +335,13 @@ pub struct DeeperQueueTick {
     pub executed_paid: Vec<String>,
     pub waiting: Vec<String>,
     pub skipped_denied: Vec<String>,
+    /// Resume approval proposed when this tick's loop guard tripped; the
+    /// remaining paid jobs wait for the next tick (fail closed).
+    pub guard_resume: Option<String>,
 }
+
+/// Loop-guard name for the paid deeper-queue loop.
+pub const DEEPER_LOOP_NAME: &str = "deeper_queue";
 
 /// True when a daemon approval matches the job's exact payload.
 fn is_job_approval(a: &approvals::Approval, action: &str, payload_hash: &str) -> bool {
@@ -379,6 +386,7 @@ pub fn deeper_queue_tick_with(
     let jobs = crate::deeper::due_jobs(&entries, now);
     let mut out = DeeperQueueTick::default();
     let mut errors: Vec<String> = Vec::new();
+    let mut guard = LoopGuard::new(DEEPER_LOOP_NAME, Budgets::default(), now);
     for job in jobs {
         let payload = deeper_paid_payload(&job.post_id, job.at);
         if !paid {
@@ -409,6 +417,22 @@ pub fn deeper_queue_tick_with(
                 }
                 Err(e) => errors.push(format!("{}: {e}", job.post_id)),
             }
+            continue;
+        }
+        if guard.tripped().is_some() || guard.step(&job.post_id, true, now).is_err() {
+            if out.guard_resume.is_none() {
+                let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+                let req = loop_guard::propose_resume(
+                    &mut log,
+                    &crate::app_gate(),
+                    DAEMON_AGENT_NAME,
+                    &guard,
+                    now,
+                )
+                .map_err(|e| e.to_string())?;
+                out.guard_resume = req.map(|r| r.id);
+            }
+            out.waiting.push(job.post_id.clone());
             continue;
         }
         match paid_job_step(ctx, &job, &payload, now, fetch_thread, fetch_post, call)? {

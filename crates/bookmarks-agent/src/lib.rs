@@ -63,6 +63,7 @@ pub fn app_gate() -> ancientos_core::gate::Gate {
         BRIEF_PAID_ACTION,
         DEEPER_PAID_ACTION,
         WIKI_EDIT_ACTION,
+        ancientos_core::loop_guard::RESUME_ACTION,
     ] {
         g.register(action, Risk::High);
     }

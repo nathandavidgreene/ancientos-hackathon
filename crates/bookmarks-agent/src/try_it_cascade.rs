@@ -30,10 +30,12 @@
 //! [`CascadeDecision::is_rate_limited`].
 use crate::topic_filter::excluded_topic;
 use ancientos_core::log::DecisionLog;
+use ancientos_core::loop_guard::LoopGuard;
 use ancientos_router::data_class::{check_egress, DataClass, Route};
 use ancientos_router::jev_client::JevClient;
 use ancientos_router::muse::{MuseChatResponse, MuseClient};
 use ancientos_router::RouterError;
+use std::cell::RefCell;
 
 /// Try-it definition shared by the Jev question and the Muse prompt. The eval
 /// crate's `bookmark_questions()` carries the same wording; the router cannot
@@ -401,6 +403,7 @@ pub struct Cascade<'a> {
     jev: Option<&'a JevClient>,
     muse: Option<&'a MuseClient>,
     jev_threshold: f64,
+    guard: Option<&'a RefCell<LoopGuard>>,
 }
 
 impl<'a> Cascade<'a> {
@@ -410,7 +413,16 @@ impl<'a> Cascade<'a> {
             jev,
             muse,
             jev_threshold: TRY_IT_THRESHOLD,
+            guard: None,
         }
+    }
+
+    /// Bound the hosted stages with a loop guard: each item that would reach
+    /// Jev/Muse first takes one paid step (keyed by the item text). A refused
+    /// step answers with the rules verdict and makes no call (fail closed).
+    pub fn with_guard(mut self, guard: &'a RefCell<LoopGuard>) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     /// Override the Jev yes threshold (`noul >= threshold` answers yes).
@@ -497,6 +509,11 @@ impl<'a> Cascade<'a> {
         if class > DataClass::Public {
             let _ = check_egress(class, Route::Jev, "cascade", log);
             return rules_only(rules, "rules unsure (non-public)");
+        }
+        if let Some(g) = self.guard {
+            if g.borrow_mut().step(text, true, now_secs()).is_err() {
+                return rules_only(rules, "rules unsure (loop guard tripped)");
+            }
         }
         // Stage 2: Jev. Yes stops here; no falls through to Muse.
         stats.jev_calls += 1;
@@ -590,6 +607,14 @@ impl<'a> Cascade<'a> {
             }
         }
     }
+}
+
+/// Wall clock in unix seconds (0 if the clock is before the epoch).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Rules-alone decision: no call was made, so no error is recorded.
@@ -955,6 +980,32 @@ mod tests {
         assert_eq!(stats.muse_calls, 0);
         assert_eq!(stats.fail_closed, 0);
         assert_eq!(stats.errors, 0);
+    }
+
+    #[test]
+    fn tripped_loop_guard_makes_no_hosted_call() {
+        use ancientos_core::loop_guard::{Budgets, LoopGuard};
+        // Closed URLs prove no network is attempted once the paid budget is 0.
+        let jev = jev_client(closed_url(), true);
+        let muse = muse_client(closed_url(), true);
+        let b = Budgets {
+            max_paid: 0,
+            ..Budgets::default()
+        };
+        let guard = RefCell::new(LoopGuard::new("cascade", b, now_secs()));
+        let cascade = Cascade::new(Some(&jev), Some(&muse)).with_guard(&guard);
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "x",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            None,
+        );
+        assert!(!d.try_it);
+        assert_eq!(d.stage, CascadeStage::Rules);
+        assert_eq!(stats.jev_calls + stats.muse_calls, 0);
+        assert!(guard.borrow().tripped().is_some());
     }
 
     #[test]
