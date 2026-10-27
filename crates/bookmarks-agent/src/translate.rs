@@ -111,11 +111,6 @@ pub struct CacheEntry {
     pub source_lang: Option<String>,
 }
 
-/// True when the bookmark needs translation (not English).
-pub fn needs_translation(b: &Bookmark) -> bool {
-    !crate::language::is_english(b)
-}
-
 /// SHA-256 hex of `text` (cache key ingredient).
 pub fn sha256_hex(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
@@ -579,7 +574,7 @@ mod tests {
             assert!(cache.is_empty(), "English never touches the cache");
             assert_eq!(marker_for(&b, &t), None, "English shows no marker");
             assert_eq!(english_for(&b, &t), b.text);
-            assert!(!needs_translation(&b));
+            assert!(crate::language::is_english(&b));
         }
     }
 
@@ -618,7 +613,7 @@ mod tests {
     fn heuristic_non_english_uses_und_display_lang() {
         let _env = crate::test_support::EnvHold::paid_off();
         let b = bm("h1", ES, None);
-        assert!(needs_translation(&b));
+        assert!(!crate::language::is_english(&b));
         let mut cache = HashMap::new();
         let t = translate_one(&b, &mut cache, None, None, None);
         assert_eq!(t.status, TranslationStatus::Untranslated);
