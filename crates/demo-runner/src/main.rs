@@ -3,7 +3,7 @@
 //! backend (sensitive -> local LLM, sanitized -> Muse) for live demos.
 use ancientos_core::feedback::{ThresholdPolicy, Verdict};
 use ancientos_core::log::DecisionLog;
-use ancientos_router::dispatch::{dispatch, Backends};
+use ancientos_router::dispatch::Backends;
 use ancientos_router::Sensitivity;
 use demo_runner::{demo_date, demo_now_secs, routing_demo, Workspace};
 use std::path::Path;
@@ -156,8 +156,17 @@ fn run(args: &[String]) -> Result<(), String> {
             } else {
                 Sensitivity::Sanitized
             };
-            let (dest, reply) =
-                dispatch(&backends, sens, false, &text).map_err(|e| e.to_string())?;
+            // User-marked sensitive means the highest class (local only);
+            // anything else the user sends here is their own Public text.
+            let class = if sensitive {
+                ancientos_router::data_class::DataClass::Restricted
+            } else {
+                ancientos_router::data_class::DataClass::Public
+            };
+            let (dest, reply) = ancientos_router::dispatch::dispatch_with_class(
+                &backends, sens, class, false, "route", None, &text,
+            )
+            .map_err(|e| e.to_string())?;
             // Log the routing decision (metadata only, never the prompt text).
             DecisionLog::open(ws.log_path())
                 .and_then(|mut l| {

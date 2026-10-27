@@ -9,14 +9,15 @@
 //! - English posts are unchanged and never translated (no cache, no calls).
 //!
 //! Routing (privacy router decides where data goes):
-//! - Only [`Sensitivity::Sanitized`] text may reach the hosted Muse client,
-//!   and only when `ANCIENTOS_ALLOW_PAID=1`; the sanitized text is sent
-//!   (see [`crate::sanitize`]).
-//! - [`Sensitivity::Sensitive`] (or unknown) text goes to the local model
-//!   only ([`LocalLlmClient`], via `scripts/local_llm.sh`) or stays
-//!   [`TranslationStatus::Untranslated`]; it is never sent to a hosted model.
-//! - Sensitivity is derived from the original text: when sanitizing strips
-//!   anything (urls, handles, emails, phones), the text counts as sensitive.
+//! - Only [`DataClass::Public`](ancientos_router::data_class::DataClass) text
+//!   may reach the hosted Muse client, and only when `ANCIENTOS_ALLOW_PAID=1`;
+//!   the sanitized text is sent, never the raw text (see [`crate::sanitize`]).
+//! - Anything else goes to the local model only ([`LocalLlmClient`], via
+//!   `scripts/local_llm.sh`) or stays [`TranslationStatus::Untranslated`];
+//!   it is never sent to a hosted model.
+//! - The class comes from [`class_of`]: text whose only stripped parts are
+//!   URLs and @handles is Public; emails and phone numbers are Confidential;
+//!   detected secrets are Restricted.
 //!
 //! Cache: translations live on disk in the data dir as JSON
 //! ([`CACHE_FILE_NAME`], no secrets), keyed by `post_id` plus the SHA-256 of
@@ -24,7 +25,8 @@
 //! off, or missing client yields [`TranslationStatus::Untranslated`] — fail
 //! open on visibility: the post is still shown.
 use crate::fixture::Bookmark;
-use ancientos_router::Sensitivity;
+use ancientos_core::log::DecisionLog;
+use ancientos_router::data_class::{check_egress, DataClass, Route};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -188,15 +190,19 @@ pub fn save_cache(path: &Path, cache: &HashMap<String, CacheEntry>) -> Result<()
     Ok(())
 }
 
-/// Sensitivity of free text: [`Sensitivity::Sensitive`] when sanitizing
-/// strips anything (urls, handles, emails, phones), else
-/// [`Sensitivity::Sanitized`]. Sensitive text never reaches a hosted model.
-pub fn sensitivity_of(text: &str) -> Sensitivity {
-    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if crate::sanitize::sanitize_uncapped(text) == collapsed {
-        Sensitivity::Sanitized
+/// Data class of free text: [`DataClass::Restricted`] when it carries a
+/// detected secret, [`DataClass::Confidential`] when it carries an email
+/// address or a phone number, else [`DataClass::Public`]. Text whose only
+/// stripped parts are URLs and @handles is Public — but hosted calls still
+/// receive only the sanitized text, never the raw text. Non-public text
+/// never reaches a hosted model.
+pub fn class_of(text: &str) -> DataClass {
+    if crate::sanitize::contains_secret(text) {
+        DataClass::Restricted
+    } else if crate::sanitize::contains_email(text) || crate::sanitize::contains_phone(text) {
+        DataClass::Confidential
     } else {
-        Sensitivity::Sensitive
+        DataClass::Public
     }
 }
 
@@ -275,10 +281,12 @@ pub fn cached_only(b: &Bookmark, cache: &HashMap<String, CacheEntry>) -> Transla
 /// calls) and inserting successful translations (the caller saves).
 ///
 /// - English posts: returned unchanged, no cache, no calls.
-/// - Sensitive text: local client only (original text), never Muse; no
-///   local client or any error yields `Untranslated`.
-/// - Sanitized text: Muse only (sanitized text) when paid calls are on;
-///   paid off, missing Muse client, or any error yields `Untranslated`.
+/// - Non-public text ([`class_of`]): local client only (original text),
+///   never Muse; the refused hosted egress is logged when `log` is given.
+///   No local client or any error yields `Untranslated`.
+/// - Public text: Muse only (sanitized text, never the raw text) when paid
+///   calls are on; paid off, missing Muse client, or any error yields
+///   `Untranslated`.
 ///
 /// Empty replies are treated as errors (never cached). The post is always
 /// surfaced: failures yield `Untranslated`, never an error.
@@ -287,6 +295,7 @@ pub fn translate_one(
     cache: &mut HashMap<String, CacheEntry>,
     muse: Option<&dyn ancientos_router::ModelClient>,
     local: Option<&dyn ancientos_router::ModelClient>,
+    log: Option<&mut DecisionLog>,
 ) -> Translation {
     if crate::language::is_english(b) {
         return Translation::english(b.text.clone());
@@ -305,8 +314,12 @@ pub fn translate_one(
             );
         }
     }
-    let english = if sensitivity_of(&b.text) != Sensitivity::Sanitized {
-        // Sensitive: local model only, original text (handles/urls kept).
+    let class = class_of(&b.text);
+    let english = if class > DataClass::Public {
+        // Non-public: local model only, original text (handles/urls kept).
+        // The refused hosted egress is logged (best-effort: translation
+        // stays fail-open to local either way); no hosted call is attempted.
+        let _ = check_egress(class, Route::MuseSpark, "translate", log);
         let Some(local) = local else {
             return Translation::untranslated(b.text.clone(), source_lang);
         };
@@ -315,7 +328,8 @@ pub fn translate_one(
             _ => None,
         }
     } else {
-        // Sanitized: Muse only, sanitized text, paid-gated.
+        // Public: Muse only, sanitized text (never the raw text), paid-gated.
+        // The client enforces the ceiling again and logs the decision.
         if !is_paid_allowed() {
             return Translation::untranslated(b.text.clone(), source_lang);
         }
@@ -323,7 +337,12 @@ pub fn translate_one(
             return Translation::untranslated(b.text.clone(), source_lang);
         };
         let sanitized = crate::sanitize::sanitize_uncapped(&b.text);
-        match muse.complete(&translate_prompt(&sanitized, source_lang.as_deref())) {
+        match muse.complete_with_class(
+            class,
+            "translate",
+            log,
+            &translate_prompt(&sanitized, source_lang.as_deref()),
+        ) {
             Ok(reply) if !reply.trim().is_empty() => Some(reply.trim().to_string()),
             _ => None,
         }
@@ -346,8 +365,13 @@ pub fn translate_one(
 /// Translate one bookmark with the env-wired clients
 /// ([`MuseClient`](ancientos_router::muse::MuseClient) plus
 /// [`LocalLlmClient`](ancientos_router::local_llm::LocalLlmClient)), consulting
-/// `cache` first. Same fail-open rules as [`translate_one`].
-pub fn translate_with_env(b: &Bookmark, cache: &mut HashMap<String, CacheEntry>) -> Translation {
+/// `cache` first. Same fail-open rules as [`translate_one`]; egress
+/// decisions are logged when `log` is given.
+pub fn translate_with_env(
+    b: &Bookmark,
+    cache: &mut HashMap<String, CacheEntry>,
+    log: Option<&mut DecisionLog>,
+) -> Translation {
     if crate::language::is_english(b) {
         return Translation::english(b.text.clone());
     }
@@ -363,24 +387,31 @@ pub fn translate_with_env(b: &Bookmark, cache: &mut HashMap<String, CacheEntry>)
     }
     let muse = ancientos_router::muse::MuseClient::from_env();
     let local = ancientos_router::local_llm::LocalLlmClient::from_env();
-    translate_one(b, cache, Some(&muse), Some(&local))
+    translate_one(b, cache, Some(&muse), Some(&local), log)
 }
 
 /// Translate every non-English bookmark, sharing one cache. English posts
 /// are skipped (no entry). Failures yield `Untranslated` entries: every
 /// non-English post gets a translation, never an error.
+// The log is lent to one call per bookmark; each `as_deref_mut` reborrow
+// is required (a move would not compile) despite the lint name.
+#[allow(clippy::needless_option_as_deref)]
 pub fn translate_all(
     bookmarks: &[Bookmark],
     cache: &mut HashMap<String, CacheEntry>,
     muse: Option<&dyn ancientos_router::ModelClient>,
     local: Option<&dyn ancientos_router::ModelClient>,
+    mut log: Option<&mut DecisionLog>,
 ) -> HashMap<String, Translation> {
     let mut out = HashMap::new();
     for b in bookmarks {
         if crate::language::is_english(b) {
             continue;
         }
-        out.insert(b.post_id.clone(), translate_one(b, cache, muse, local));
+        out.insert(
+            b.post_id.clone(),
+            translate_one(b, cache, muse, local, log.as_deref_mut()),
+        );
     }
     out
 }
@@ -479,7 +510,7 @@ mod tests {
         );
         let muse = muse_mock("MUST NOT BE CALLED");
         let local = local_mock("MUST NOT BE CALLED");
-        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local));
+        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local), None);
         assert_eq!(t.status, TranslationStatus::Translated);
         assert_eq!(t.english.as_deref(), Some(ES_EN));
         assert_eq!(t.original, ES);
@@ -496,7 +527,7 @@ mod tests {
         let mut cache = HashMap::new();
         let muse = muse_mock("MUST NOT BE CALLED");
         let local = local_mock("MUST NOT BE CALLED");
-        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local));
+        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local), None);
         assert_eq!(t.status, TranslationStatus::Untranslated);
         assert_eq!(t.english, None);
         assert_eq!(t.original, ES);
@@ -513,13 +544,13 @@ mod tests {
         // PII (email + phone + handle + url) marks the text sensitive.
         let text = "[synthetic] El gobierno presentó un plan escríbeme a ana@example.com o llama al 555-123-4567 @syn_handle https://t.co/abc123";
         let b = bm("es2", text, Some("es"));
-        assert_eq!(sensitivity_of(&b.text), Sensitivity::Sensitive);
+        assert_eq!(class_of(&b.text), DataClass::Confidential);
 
         // Local succeeds: translated, hosted untouched.
         let mut cache = HashMap::new();
         let muse = muse_mock("MUST NOT BE CALLED");
         let local = local_mock(ES_EN);
-        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local));
+        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local), None);
         assert_eq!(t.status, TranslationStatus::Translated);
         assert_eq!(t.english.as_deref(), Some(ES_EN));
         assert_eq!(muse.calls(), 0, "sensitive must never hit hosted");
@@ -534,7 +565,7 @@ mod tests {
         // No local client: untranslated, hosted still untouched.
         let mut cache = HashMap::new();
         let muse = muse_mock("MUST NOT BE CALLED");
-        let t = translate_one(&b, &mut cache, Some(&muse), None);
+        let t = translate_one(&b, &mut cache, Some(&muse), None, None);
         assert_eq!(t.status, TranslationStatus::Untranslated);
         assert_eq!(muse.calls(), 0);
     }
@@ -545,7 +576,7 @@ mod tests {
         let b = bm("es1", ES, Some("es"));
         let mut cache = HashMap::new();
         let muse = Mock::err(ancientos_router::Destination::MuseSpark);
-        let t = translate_one(&b, &mut cache, Some(&muse), None);
+        let t = translate_one(&b, &mut cache, Some(&muse), None, None);
         assert_eq!(t.status, TranslationStatus::Untranslated);
         assert_eq!(t.original, ES);
         assert_eq!(t.source_lang.as_deref(), Some("es"));
@@ -566,7 +597,7 @@ mod tests {
             let mut cache = HashMap::new();
             let muse = muse_mock("MUST NOT BE CALLED");
             let local = local_mock("MUST NOT BE CALLED");
-            let t = translate_one(&b, &mut cache, Some(&muse), Some(&local));
+            let t = translate_one(&b, &mut cache, Some(&muse), Some(&local), None);
             assert_eq!(t.original, b.text);
             assert_eq!(t.english, None);
             assert_eq!(muse.calls(), 0, "English never calls hosted");
@@ -583,10 +614,10 @@ mod tests {
         let _env = crate::test_support::EnvHold::paid_on();
         // No PII: sanitized, so Muse is allowed.
         let b = bm("es1", ES, Some("es"));
-        assert_eq!(sensitivity_of(&b.text), Sensitivity::Sanitized);
+        assert_eq!(class_of(&b.text), DataClass::Public);
         let mut cache = HashMap::new();
         let muse = muse_mock(ES_EN);
-        let t = translate_one(&b, &mut cache, Some(&muse), None);
+        let t = translate_one(&b, &mut cache, Some(&muse), None, None);
         assert_eq!(t.status, TranslationStatus::Translated);
         assert_eq!(muse.calls(), 1);
         let prompt = muse.seen.borrow()[0].clone();
@@ -615,7 +646,7 @@ mod tests {
         let b = bm("h1", ES, None);
         assert!(needs_translation(&b));
         let mut cache = HashMap::new();
-        let t = translate_one(&b, &mut cache, None, None);
+        let t = translate_one(&b, &mut cache, None, None, None);
         assert_eq!(t.status, TranslationStatus::Untranslated);
         assert_eq!(t.source_lang, None);
         assert_eq!(marker_for(&b, &t).as_deref(), Some("Untranslated (und)"));
@@ -628,10 +659,146 @@ mod tests {
         let mut cache = HashMap::new();
         let muse = muse_mock("MUST NOT BE CALLED");
         let local = local_mock("MUST NOT BE CALLED");
-        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local));
+        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local), None);
         assert_eq!(t.status, TranslationStatus::Untranslated);
         assert_eq!(muse.calls(), 0);
         assert_eq!(local.calls(), 0);
+    }
+
+    #[test]
+    fn class_of_matrix() {
+        use ancientos_router::data_class::DataClass;
+        // URLs and @handles alone are Public.
+        for text in [
+            ES,
+            "[synthetic] Lee esto https://t.co/abc123 ahora",
+            "hola @syn_user, gran publicación https://example.invalid/x",
+        ] {
+            assert_eq!(class_of(text), DataClass::Public, "{text}");
+        }
+        // Emails and phones are Confidential.
+        for text in [
+            "[synthetic] escríbeme a ana@example.com por favor",
+            "[synthetic] llámame al 555-123-4567 ahora",
+            "[synthetic] hola https://t.co/abc123 o mail ana@example.com",
+        ] {
+            assert_eq!(class_of(text), DataClass::Confidential, "{text}");
+        }
+        // Detected secrets are Restricted.
+        for text in [
+            "[synthetic] mi password: hunter2-hunter aquí",
+            "token sk-synthetic-test-key-value-1234 filtrado",
+            "clave -----BEGIN RSA PRIVATE KEY----- sintética",
+        ] {
+            assert_eq!(class_of(text), DataClass::Restricted, "{text}");
+        }
+    }
+
+    #[test]
+    fn public_post_with_tco_link_reaches_hosted_with_sanitized_prompt() {
+        use ancientos_router::data_class::DataClass;
+        let _env = crate::test_support::EnvHold::paid_on();
+        // A public post carrying a t.co link and a @handle: Public, so the
+        // hosted stage runs (this used to be local-only: the bug this fixes).
+        let text =
+            "[synthetic] El gobierno presentó un plan económico https://t.co/abc123 @syn_user";
+        let b = bm("es-link", text, Some("es"));
+        assert_eq!(class_of(&b.text), DataClass::Public);
+        let mut cache = HashMap::new();
+        let muse = muse_mock(ES_EN);
+        let local = local_mock("MUST NOT BE CALLED");
+        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local), None);
+        assert_eq!(t.status, TranslationStatus::Translated);
+        assert_eq!(muse.calls(), 1, "public posts reach hosted");
+        assert_eq!(local.calls(), 0);
+        // The hosted prompt carries only sanitized text: no URL, no handle.
+        let prompt = muse.seen.borrow()[0].clone();
+        assert!(!prompt.contains("https://"), "{prompt}");
+        assert!(!prompt.contains("t.co"), "{prompt}");
+        assert!(!prompt.contains("@syn_user"), "{prompt}");
+        assert!(
+            prompt.contains(&crate::sanitize::sanitize_uncapped(text)),
+            "sanitized text is sent: {prompt}"
+        );
+    }
+
+    #[test]
+    fn post_with_email_never_reaches_hosted() {
+        use ancientos_router::data_class::DataClass;
+        let _env = crate::test_support::EnvHold::paid_on();
+        let text = "[synthetic] El gobierno presentó un plan escríbeme a ana@example.com";
+        let b = bm("es-mail", text, Some("es"));
+        assert_eq!(class_of(&b.text), DataClass::Confidential);
+        // Local succeeds: translated, hosted untouched, denial logged.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = ancientos_core::log::DecisionLog::open(&path).unwrap();
+        let mut cache = HashMap::new();
+        let muse = muse_mock("MUST NOT BE CALLED");
+        let local = local_mock(ES_EN);
+        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local), Some(&mut log));
+        assert_eq!(t.status, TranslationStatus::Translated);
+        assert_eq!(muse.calls(), 0, "email posts never hit hosted");
+        assert_eq!(local.calls(), 1);
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].kind,
+            ancientos_router::data_class::EGRESS_DENIED_KIND
+        );
+        assert_eq!(entries[0].payload["class"], "confidential");
+        assert_eq!(entries[0].payload["route"], "muse_spark");
+        assert_eq!(entries[0].payload["caller"], "translate");
+        // No local client: untranslated, hosted still untouched.
+        let mut cache = HashMap::new();
+        let muse = muse_mock("MUST NOT BE CALLED");
+        let t = translate_one(&b, &mut cache, Some(&muse), None, None);
+        assert_eq!(t.status, TranslationStatus::Untranslated);
+        assert_eq!(muse.calls(), 0);
+    }
+
+    #[test]
+    fn secret_post_is_restricted_and_stays_local() {
+        use ancientos_router::data_class::DataClass;
+        let _env = crate::test_support::EnvHold::paid_on();
+        let text = "[synthetic] El plan dice password: hunter2-hunter aquí";
+        let b = bm("es-sec", text, Some("es"));
+        assert_eq!(class_of(&b.text), DataClass::Restricted);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = ancientos_core::log::DecisionLog::open(&path).unwrap();
+        let mut cache = HashMap::new();
+        let muse = muse_mock("MUST NOT BE CALLED");
+        let local = local_mock(ES_EN);
+        let t = translate_one(&b, &mut cache, Some(&muse), Some(&local), Some(&mut log));
+        assert_eq!(t.status, TranslationStatus::Translated);
+        assert_eq!(muse.calls(), 0);
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].payload["class"], "restricted");
+        let raw = serde_json::to_string(&entries[0].payload).unwrap();
+        assert!(!raw.contains("hunter2"), "{raw}");
+    }
+
+    #[test]
+    fn real_hosted_client_sees_zero_requests_for_email_post() {
+        use ancientos_router::muse::MuseClient;
+        let _env = crate::test_support::EnvHold::paid_on();
+        std::env::set_var("META_API_KEY", "test-key");
+        // Closed port: any hosted attempt would fail, so a translation via
+        // the local mock proves the real hosted client saw zero requests.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let closed = format!("http://{}", probe.local_addr().expect("probe addr"));
+        drop(probe);
+        let real_muse = MuseClient::new("m", closed, 16, true);
+        let text = "[synthetic] El gobierno presentó un plan escríbeme a ana@example.com";
+        let b = bm("es-mail2", text, Some("es"));
+        let mut cache = HashMap::new();
+        let local = local_mock(ES_EN);
+        let t = translate_one(&b, &mut cache, Some(&real_muse), Some(&local), None);
+        assert_eq!(t.status, TranslationStatus::Translated);
+        assert_eq!(t.english.as_deref(), Some(ES_EN));
+        assert_eq!(local.calls(), 1);
     }
 
     #[test]

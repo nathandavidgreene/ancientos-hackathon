@@ -36,8 +36,10 @@ dependencies = [
 name = "ancientos-router"
 version = "0.1.0"
 dependencies = [
+ "ancientos-core",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "ureq",
 ]

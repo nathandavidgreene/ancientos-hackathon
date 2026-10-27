@@ -368,6 +368,7 @@ pub fn deeper_queue_tick_with(
                 call,
                 &ctx.log_path,
                 &ctx.deeper_dir,
+                None,
             ) {
                 Ok(_) => {
                     // run_with appended through its own handle; reopen before
@@ -532,6 +533,7 @@ fn execute_paid(
         call,
         &ctx.log_path,
         &ctx.deeper_dir,
+        None,
     ) {
         Ok(_) => {
             let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;

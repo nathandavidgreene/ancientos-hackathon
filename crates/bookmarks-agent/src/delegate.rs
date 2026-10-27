@@ -5,6 +5,7 @@
 //! one X conversation search and one Muse call per run. Post text and the
 //! summary never enter the decision log — only metadata.
 use ancientos_core::log::DecisionLog;
+use ancientos_router::data_class::{check_egress, max_of, DataClass, Route};
 use ancientos_router::muse::MuseUsage;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -115,28 +116,47 @@ pub fn run(post_id: &str) -> Result<DelegateResult, String> {
         .with_max_completion_tokens(DELEGATE_MAX_COMPLETION_TOKENS)
         .with_reasoning_effort(DELEGATE_REASONING_EFFORT);
     let call = |prompt: &str| {
-        client.chat(prompt).map_err(|e| e.to_string()).map(|r| {
-            let model = if r.model.is_empty() {
-                client.model().to_string()
-            } else {
-                r.model
-            };
-            (r.content, model, r.usage)
-        })
+        // Public: run_with classified the thread (refusing non-public ones)
+        // before this closure runs.
+        client
+            .chat_with_class(DataClass::Public, "delegate", None, prompt)
+            .map_err(|e| e.to_string())
+            .map(|r| {
+                let model = if r.model.is_empty() {
+                    client.model().to_string()
+                } else {
+                    r.model
+                };
+                (r.content, model, r.usage)
+            })
     };
+    let log_path = crate::brief::decision_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            crate::token_store::ensure_dir_0700(parent)
+                .map_err(|e| format!("log dir failed: {e}"))?;
+        }
+    }
+    let mut log = DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
     run_with(
         post_id,
         allow_paid,
         &crate::x_api::fetch_thread,
         &call,
-        &crate::brief::decision_log_path()?,
+        &log_path,
         &inspiration_path()?,
         &crate::brief::current_date(),
+        Some(&mut log),
     )
 }
 
 /// Same as [`run`] with injected thread fetch, Muse call, and paths.
 /// Still fails closed without `allow_paid` and on empty input/output.
+/// The prompt only covers Public threads: content from every post (plus
+/// inline quoted text) takes the highest class, and anything above Public
+/// is refused before the Muse call (logged as `router.egress_denied` when
+/// `log` is given; allowed runs log `router.egress_allowed`).
+#[allow(clippy::too_many_arguments)]
 pub fn run_with(
     post_id: &str,
     allow_paid: bool,
@@ -145,6 +165,7 @@ pub fn run_with(
     log_path: &Path,
     insp_path: &Path,
     date: &str,
+    log: Option<&mut DecisionLog>,
 ) -> Result<DelegateResult, String> {
     if !allow_paid {
         return Err("paid calls are disabled (set ANCIENTOS_ALLOW_PAID=1 to enable)".to_string());
@@ -156,6 +177,18 @@ pub fn run_with(
     if thread.posts.is_empty() {
         return Err("thread fetch returned no posts".to_string());
     }
+    let class = {
+        let mut classes = Vec::new();
+        for p in &thread.posts {
+            classes.push(crate::translate::class_of(&p.text));
+            if let Some((user, quoted_text)) = &p.quoted {
+                classes.push(crate::translate::class_of(user));
+                classes.push(crate::translate::class_of(quoted_text));
+            }
+        }
+        max_of(classes)
+    };
+    check_egress(class, Route::MuseSpark, "delegate", log).map_err(|e| e.to_string())?;
     let prompt = build_prompt(&thread.posts);
     let (output, model, usage) = call(&prompt)?;
     if output.trim().is_empty() {
@@ -391,6 +424,7 @@ mod tests {
             &log_path,
             &insp_path,
             "2026-10-26",
+            None,
         )
         .unwrap();
         assert_eq!(seen.borrow().len(), 1, "exactly one Muse call");
@@ -431,6 +465,7 @@ mod tests {
             &dir.path().join("d.jsonl"),
             &dir.path().join(INSPIRATION_FILE_NAME),
             "2026-10-26",
+            None,
         )
         .unwrap();
         assert_eq!(res.thread_posts, 1);
@@ -464,6 +499,7 @@ mod tests {
             &log_path,
             &insp_path,
             "2026-10-26",
+            None,
         )
         .unwrap();
         let log = DecisionLog::open(&log_path).unwrap();
@@ -493,6 +529,7 @@ mod tests {
             &log_path,
             &insp_path,
             "2026-10-26",
+            None,
         )
         .unwrap_err();
         assert!(err.contains("paid calls are disabled"), "{err}");
@@ -506,7 +543,8 @@ mod tests {
             &call_fn,
             &log_path,
             &insp_path,
-            "2026-10-26"
+            "2026-10-26",
+            None,
         )
         .is_err());
         let empty_fn = |_: &str| Ok(("  \n ".into(), "m".into(), None));
@@ -517,7 +555,8 @@ mod tests {
             &empty_fn,
             &log_path,
             &insp_path,
-            "2026-10-26"
+            "2026-10-26",
+            None,
         )
         .is_err());
         let no_posts = |_: &str| -> Result<crate::x_api::ThreadFetch, String> {
@@ -536,8 +575,78 @@ mod tests {
             &call_fn,
             &log_path,
             &insp_path,
-            "2026-10-26"
+            "2026-10-26",
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn run_with_refuses_non_public_thread_with_zero_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        let insp_path = dir.path().join(INSPIRATION_FILE_NAME);
+        let fetch_fn = |_: &str| {
+            Ok(fetch(
+                vec![post("p1", "synthetic root mail quokka@example.invalid now")],
+                true,
+            ))
+        };
+        let calls = std::cell::RefCell::new(0usize);
+        let call_count = |_: &str| {
+            *calls.borrow_mut() += 1;
+            Ok(("synthetic".into(), "m".into(), None))
+        };
+        let mut log = DecisionLog::open(&log_path).unwrap();
+        let err = run_with(
+            "p1",
+            true,
+            &fetch_fn,
+            &call_count,
+            &log_path,
+            &insp_path,
+            "2026-10-26",
+            Some(&mut log),
+        )
+        .unwrap_err();
+        assert!(err.contains("egress denied"), "{err}");
+        assert_eq!(*calls.borrow(), 0, "no Muse call on refusal");
+        assert!(!insp_path.exists());
+        // One denied entry: class, route, caller, no content.
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "router.egress_denied");
+        assert_eq!(entries[0].payload["class"], "confidential");
+        assert_eq!(entries[0].payload["route"], "muse_spark");
+        assert_eq!(entries[0].payload["caller"], "delegate");
+        let raw = entries[0].payload.to_string();
+        assert!(!raw.contains("quokka"), "{raw}");
+    }
+
+    #[test]
+    fn run_with_logs_allowed_entry_before_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        let insp_path = dir.path().join(INSPIRATION_FILE_NAME);
+        let fetch_fn = |_: &str| Ok(fetch(vec![post("p1", "synthetic root")], true));
+        let call_fn = |_: &str| Ok(("synthetic summary".into(), "m".into(), None));
+        let mut log = DecisionLog::open(&log_path).unwrap();
+        run_with(
+            "p1",
+            true,
+            &fetch_fn,
+            &call_fn,
+            &log_path,
+            &insp_path,
+            "2026-10-26",
+            Some(&mut log),
+        )
+        .unwrap();
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, "router.egress_allowed");
+        assert_eq!(entries[0].payload["class"], "public");
+        assert_eq!(entries[0].payload["route"], "muse_spark");
+        assert_eq!(entries[1].kind, DELEGATE_DONE_KIND);
     }
 }

@@ -4,6 +4,7 @@
 //! come from env vars; paid calls are off by default.
 use serde::Serialize;
 
+pub mod data_class;
 pub mod dispatch;
 pub mod jev_client;
 pub mod local_llm;
@@ -45,6 +46,13 @@ pub enum RouterError {
     BadResponse(String),
     #[error("refused: {0}")]
     Refused(String),
+    #[error("egress denied: {class} content exceeds the {route} ceiling ({ceiling}) for caller {caller}")]
+    EgressDenied {
+        class: data_class::DataClass,
+        route: data_class::Route,
+        ceiling: data_class::DataClass,
+        caller: String,
+    },
 }
 
 pub trait ModelClient {
@@ -56,6 +64,19 @@ pub trait ModelClient {
     fn complete_with_sensitivity(
         &self,
         _sensitivity: Sensitivity,
+        prompt: &str,
+    ) -> Result<String, RouterError> {
+        self.complete(prompt)
+    }
+    /// Data-class-aware completion. Hosted clients override this to refuse
+    /// content whose class exceeds their route ceiling before any network I/O
+    /// (logging the decision to `log` when given); the default delegates to
+    /// [`Self::complete`], which is only correct for local clients and mocks.
+    fn complete_with_class(
+        &self,
+        _class: data_class::DataClass,
+        _caller: &str,
+        _log: Option<&mut ancientos_core::log::DecisionLog>,
         prompt: &str,
     ) -> Result<String, RouterError> {
         self.complete(prompt)

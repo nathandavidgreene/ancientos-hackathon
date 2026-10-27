@@ -42,10 +42,13 @@
 //! Gates: network fetches need the opt-in `ANCIENTOS_FETCH_LINKS=1`
 //! (default off means no network and empty enrichment). Everything fetched
 //! is sanitized with [`crate::sanitize`] before it could reach a paid model,
-//! and private bookmarks (the same rule [`crate::translate`] uses: the
-//! post text is not [`Sensitivity::Sanitized`](ancientos_router::Sensitivity))
+//! and non-public bookmarks (the same rule [`crate::translate`] uses: the
+//! post text is above
+//! [`DataClass::Public`](ancientos_router::data_class::DataClass))
 //! are enriched for local use only — [`cascade_input`] withholds their
-//! enrichment from the cascade text that paid models may see.
+//! enrichment from the cascade text that paid models may see. The cascade
+//! input itself is the sanitized post text plus the sanitized enrichment,
+//! so hosted stages never see raw URLs, handles, emails, or phone numbers.
 //!
 //! Cache: fetched text lives on disk as JSON keyed by SHA-256 of the
 //! normalized URL (pages), `youtube-subs:{normalized URL}` (subtitles), or
@@ -57,6 +60,7 @@
 //! a recorded reason in [`Enrichment::notes`]. [`enrich`] never panics and
 //! never blocks the decision.
 use crate::fixture::Bookmark;
+use ancientos_router::data_class::{max_of, DataClass};
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -1578,12 +1582,11 @@ pub fn enrich_at(
     now: u64,
     timeout: Duration,
 ) -> Enrichment {
-    let local_only =
-        crate::translate::sensitivity_of(&b.text) != ancientos_router::Sensitivity::Sanitized;
+    let post_class = crate::translate::class_of(&b.text);
     if !is_fetch_enabled() {
         return Enrichment {
             text: String::new(),
-            local_only,
+            local_only: post_class > DataClass::Public,
             notes: vec!["fetch disabled (ANCIENTOS_FETCH_LINKS!=1)".to_string()],
         };
     }
@@ -1757,9 +1760,14 @@ pub fn enrich_at(
     if has_video && captions.is_empty() && transcripts.is_empty() {
         notes.push("captions unavailable".to_string());
     }
+    let text = parts.join("\n\n");
+    // Content built from several sources takes the highest class: a secret
+    // in fetched text (sanitize strips PII, not secrets) withholds the whole
+    // enrichment from paid models.
+    let class = max_of([post_class, crate::translate::class_of(&text)]);
     Enrichment {
-        text: parts.join("\n\n"),
-        local_only,
+        text,
+        local_only: class > DataClass::Public,
         notes,
     }
 }
@@ -1770,14 +1778,17 @@ pub fn will_append(e: &Enrichment) -> bool {
     !e.local_only && !e.text.trim().is_empty()
 }
 
-/// Cascade input text: post text plus `"\n\nLinked/Media context:\n"` plus
-/// the enrichment when [`will_append`] holds, else the post text unchanged.
-/// Topic filtering and the paid stages all see this one text.
+/// Cascade input text: the SANITIZED post text plus `"\n\nLinked/Media
+/// context:\n"` plus the enrichment when [`will_append`] holds, else the
+/// sanitized post text alone. Topic filtering and the paid stages all see
+/// this one text; hosted stages never see raw URLs, handles, emails, or
+/// phone numbers from the post.
 pub fn cascade_input(post_text: &str, e: &Enrichment) -> String {
+    let clean_post = crate::sanitize::sanitize_uncapped(post_text);
     if will_append(e) {
-        format!("{post_text}\n\n{CONTEXT_HEADER}\n{}", e.text)
+        format!("{clean_post}\n\n{CONTEXT_HEADER}\n{}", e.text)
     } else {
-        post_text.to_string()
+        clean_post
     }
 }
 
@@ -1809,9 +1820,10 @@ mod tests {
     /// sanitized (may reach paid models once enriched).
     const SANITIZED_TEXT: &str =
         "[synthetic] A short post about a morning stretch routine with a link.";
-    /// Post text carrying a URL: sensitive, so local-only enrichment.
+    /// Post text carrying an email address: Confidential, so local-only
+    /// enrichment. (A URL alone is Public: see `url_only_post_is_public_enriched_and_hosted`.)
     const PRIVATE_TEXT: &str =
-        "[synthetic] See https://example.invalid/guide for the full routine.";
+        "[synthetic] Mail quokka@example.invalid for the full routine and hold.";
 
     type Hits = Arc<Mutex<usize>>;
 
@@ -2495,12 +2507,19 @@ mod tests {
         let e = enrich_at(&priv_b, &mut cache, 5_000_000, Duration::from_secs(5));
         assert!(e.local_only);
         assert!(e.text.contains("MarkerSnippet"), "{}", e.text);
-        // ... but the cascade input (which paid models may see) is unchanged.
+        // ... but the cascade input (which paid models may see) withholds it
+        // and carries only sanitized post text.
         assert!(!will_append(&e));
-        assert_eq!(cascade_input(PRIVATE_TEXT, &e), PRIVATE_TEXT);
-        let paid_prompt =
-            ancientos_router::try_it_cascade::muse_prompt(&cascade_input(PRIVATE_TEXT, &e));
+        let input = cascade_input(PRIVATE_TEXT, &e);
+        assert_eq!(input, crate::sanitize::sanitize_uncapped(PRIVATE_TEXT));
+        assert!(!input.contains("quokka@example.invalid"), "{input}");
+        assert!(!input.contains("MarkerSnippet"), "{input}");
+        let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
         assert!(!paid_prompt.contains("MarkerSnippet"), "{paid_prompt}");
+        assert!(
+            !paid_prompt.contains("quokka@example.invalid"),
+            "{paid_prompt}"
+        );
         // Sanitized post: the same enrichment is appended and may be sent.
         let mut pub_b = bm("pub1", SANITIZED_TEXT);
         pub_b.urls = vec![format!("{base}/page")];
@@ -2511,6 +2530,43 @@ mod tests {
         assert!(input.contains("MarkerSnippet"), "{input}");
         let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
         assert!(paid_prompt.contains("MarkerSnippet"), "{paid_prompt}");
+    }
+
+    #[test]
+    fn url_only_post_is_public_enriched_and_hosted() {
+        let _env = crate::test_support::EnvHold::fetch_on();
+        let (base, _) = mock_server(
+            vec![page_route(
+                "/page",
+                "<title>MarkerSnippet</title><p>usable text</p>",
+            )],
+            5,
+        );
+        // A public post carrying only a t.co link and a @handle: Public, so
+        // the enrichment is appended and the cascade input reaches hosted
+        // stages (this used to be local-only: the bug this fixes).
+        let text = "[synthetic] See https://t.co/abc123 from @syn_user for the routine.";
+        assert_eq!(
+            crate::translate::class_of(text),
+            ancientos_router::data_class::DataClass::Public
+        );
+        let mut b = bm("url1", text);
+        b.urls = vec![format!("{base}/page")];
+        let mut cache = HashMap::new();
+        let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
+        assert!(!e.local_only);
+        assert!(will_append(&e));
+        let input = cascade_input(text, &e);
+        assert!(input.contains("MarkerSnippet"), "{input}");
+        assert!(input.contains("Linked/Media context:"), "{input}");
+        // The hosted prompt carries sanitized text only: no raw URL, no handle.
+        let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
+        assert!(paid_prompt.contains("MarkerSnippet"), "{paid_prompt}");
+        assert!(
+            !paid_prompt.contains("https://t.co/abc123"),
+            "{paid_prompt}"
+        );
+        assert!(!paid_prompt.contains("@syn_user"), "{paid_prompt}");
     }
 
     #[test]
@@ -3348,9 +3404,14 @@ exit 0
             e.text
         );
         assert!(!will_append(&e));
-        assert_eq!(cascade_input(PRIVATE_TEXT, &e), PRIVATE_TEXT);
-        let paid_prompt =
-            ancientos_router::try_it_cascade::muse_prompt(&cascade_input(PRIVATE_TEXT, &e));
+        let input = cascade_input(PRIVATE_TEXT, &e);
+        assert_eq!(input, crate::sanitize::sanitize_uncapped(PRIVATE_TEXT));
+        assert!(!input.contains("quokka@example.invalid"), "{input}");
+        let paid_prompt = ancientos_router::try_it_cascade::muse_prompt(&input);
+        assert!(
+            !paid_prompt.contains("quokka@example.invalid"),
+            "{paid_prompt}"
+        );
         assert!(
             !paid_prompt.contains("QuokkaMarkerSubtitles"),
             "{paid_prompt}"

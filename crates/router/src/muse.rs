@@ -1,10 +1,15 @@
 //! Real Meta Model API client for Muse Spark (OpenAI-compatible chat API).
 //!
 //! The API key is read from `META_API_KEY` at call time and never stored on
-//! the client, logged, or printed. Calls fail closed: they are refused unless
-//! the paid-call switch `ANCIENTOS_ALLOW_PAID` equals `"1"` and a key is set.
+//! the client, logged, or printed. Calls fail closed: content whose
+//! [`DataClass`](crate::data_class::DataClass) exceeds the hosted ceiling
+//! ([`DataClass::Public`](crate::data_class::DataClass)) is refused before
+//! any network I/O, and the rest are refused unless the paid-call switch
+//! `ANCIENTOS_ALLOW_PAID` equals `"1"` and a key is set.
 
-use crate::{Destination, ModelClient, RouterError};
+use crate::data_class::{check_egress, DataClass, Route};
+use crate::{Destination, ModelClient, RouterError, Sensitivity};
+use ancientos_core::log::DecisionLog;
 
 /// Default API base; override with `META_API_BASE`.
 pub const DEFAULT_BASE_URL: &str = "https://api.meta.ai/v1";
@@ -152,19 +157,52 @@ impl MuseClient {
     }
 
     /// Send one prompt and parse the full response (content, model, usage).
-    /// Fails closed without the paid switch or the API key; never touches
-    /// the network in those cases.
+    /// The class is unknown here, so this always fails closed with
+    /// [`RouterError::EgressDenied`]; callers with classified content use
+    /// [`Self::chat_with_class`].
     pub fn chat(&self, prompt: &str) -> Result<MuseChatResponse, RouterError> {
-        self.chat_messages(serde_json::json!([{"role": "user", "content": prompt}]))
+        self.chat_with_class(DataClass::Restricted, "muse.chat", None, prompt)
     }
 
     /// Send an explicit multi-turn message list and parse the full response.
-    /// Same fail-closed rules as [`Self::chat`]; existing single-prompt
-    /// callers keep using [`Self::chat`] unchanged.
+    /// Like [`Self::chat`], the class is unknown, so this always fails closed;
+    /// callers with classified content use [`Self::chat_messages_with_class`].
     pub fn chat_messages(
         &self,
         messages: serde_json::Value,
     ) -> Result<MuseChatResponse, RouterError> {
+        self.chat_messages_with_class(DataClass::Restricted, "muse.chat_messages", None, messages)
+    }
+
+    /// Send one prompt with an explicit data class and caller. Content above
+    /// [`DataClass::Public`] is refused before any network I/O; the decision
+    /// is appended to `log` when given (class/route/caller, never content).
+    /// The paid switch and API key gates apply after the class check.
+    pub fn chat_with_class(
+        &self,
+        class: DataClass,
+        caller: &str,
+        log: Option<&mut DecisionLog>,
+        prompt: &str,
+    ) -> Result<MuseChatResponse, RouterError> {
+        self.chat_messages_with_class(
+            class,
+            caller,
+            log,
+            serde_json::json!([{"role": "user", "content": prompt}]),
+        )
+    }
+
+    /// Send an explicit multi-turn message list with an explicit data class
+    /// and caller. Same fail-closed rules as [`Self::chat_with_class`].
+    pub fn chat_messages_with_class(
+        &self,
+        class: DataClass,
+        caller: &str,
+        log: Option<&mut DecisionLog>,
+        messages: serde_json::Value,
+    ) -> Result<MuseChatResponse, RouterError> {
+        check_egress(class, Route::MuseSpark, caller, log)?;
         if !self.allow_paid {
             return Err(RouterError::PaidCallsDisabled);
         }
@@ -251,8 +289,30 @@ impl ModelClient for MuseClient {
         Destination::MuseSpark
     }
 
+    /// Fail-closed: the class is unknown here, so this always refuses with
+    /// [`RouterError::EgressDenied`]. Dispatch passes the routed class via
+    /// [`Self::complete_with_class`].
     fn complete(&self, prompt: &str) -> Result<String, RouterError> {
         self.chat(prompt).map(|r| r.content)
+    }
+
+    fn complete_with_sensitivity(
+        &self,
+        s: Sensitivity,
+        prompt: &str,
+    ) -> Result<String, RouterError> {
+        self.complete_with_class(DataClass::from(s), "muse", None, prompt)
+    }
+
+    fn complete_with_class(
+        &self,
+        class: DataClass,
+        caller: &str,
+        log: Option<&mut DecisionLog>,
+        prompt: &str,
+    ) -> Result<String, RouterError> {
+        self.chat_with_class(class, caller, log, prompt)
+            .map(|r| r.content)
     }
 }
 
@@ -310,16 +370,22 @@ mod tests {
         let client = MuseClient::from_env();
         assert!(!client.allow_paid());
         assert!(matches!(
-            client.complete("hi"),
+            client.chat_with_class(DataClass::Public, "test", None, "hi"),
             Err(RouterError::PaidCallsDisabled)
+        ));
+        assert!(matches!(
+            test_client(false).complete_with_class(DataClass::Public, "test", None, "hi"),
+            Err(RouterError::PaidCallsDisabled)
+        ));
+        // Bare chat/complete have unknown class: always egress-denied, even
+        // before the paid gate is consulted.
+        assert!(matches!(
+            client.complete("hi"),
+            Err(RouterError::EgressDenied { .. })
         ));
         assert!(matches!(
             client.chat("hi"),
-            Err(RouterError::PaidCallsDisabled)
-        ));
-        assert!(matches!(
-            test_client(false).complete("hi"),
-            Err(RouterError::PaidCallsDisabled)
+            Err(RouterError::EgressDenied { .. })
         ));
 
         if let Some(v) = saved {
@@ -335,7 +401,9 @@ mod tests {
 
         // Unroutable base URL proves no network is attempted: a missing key
         // must fail before any HTTP call.
-        let err = test_client(true).complete("hi").unwrap_err();
+        let err = test_client(true)
+            .chat_with_class(DataClass::Public, "test", None, "hi")
+            .unwrap_err();
         assert!(
             matches!(err, RouterError::MissingEnv("META_API_KEY")),
             "unexpected: {err:?}"
@@ -559,5 +627,239 @@ mod tests {
         let dbg = format!("{:?}", test_client(true));
         assert!(!dbg.contains("META_API_KEY"));
         assert!(!dbg.contains("Bearer"));
+    }
+
+    /// Set one process env var for a test, restoring the previous value on drop.
+    struct EnvGuard {
+        key: &'static str,
+        saved: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let saved = std::env::var(key).ok();
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Hit counter for the mock server below.
+    type Hits = std::sync::Arc<std::sync::Mutex<usize>>;
+
+    /// Mock chat-completions server: counts hits, replies `body` with 200 to
+    /// up to `max_hits` connections, then exits. Tests asserting zero
+    /// requests pass `max_hits` 0 and join with a short accept deadline.
+    fn mock_server(body: &str, max_hits: usize) -> (String, Hits, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking mock server");
+        let url = format!("http://{}", listener.local_addr().expect("mock addr"));
+        let hits: Hits = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let hits_thread = std::sync::Arc::clone(&hits);
+        let body = body.to_string();
+        let handle = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            loop {
+                if *hits_thread.lock().expect("hits lock") >= max_hits {
+                    return;
+                }
+                // Deadline so a client bug fails the test instead of hanging it.
+                if start.elapsed() > std::time::Duration::from_secs(5) {
+                    return;
+                }
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let mut stream = stream;
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("read timeout");
+                // Drain headers + body (the test only counts the hit).
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1];
+                let mut content_length = 0usize;
+                let mut line = Vec::new();
+                while let Ok(1) = stream.read(&mut buf) {
+                    head.push(buf[0]);
+                    line.push(buf[0]);
+                    if buf[0] == b'\n' {
+                        let text = String::from_utf8_lossy(&line);
+                        if text.to_lowercase().starts_with("content-length:") {
+                            content_length = text
+                                .split(':')
+                                .nth(1)
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                        }
+                        if line == b"\r\n" || line == b"\n" {
+                            break;
+                        }
+                        line.clear();
+                    }
+                    if head.len() > 65536 {
+                        break;
+                    }
+                }
+                let mut rest = vec![0u8; content_length.min(1 << 20)];
+                let mut filled = 0;
+                while filled < rest.len() {
+                    match stream.read(&mut rest[filled..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => filled += n,
+                    }
+                }
+                *hits_thread.lock().expect("hits lock") += 1;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (url, hits, handle)
+    }
+
+    fn chat_ok_body() -> String {
+        serde_json::json!({
+            "model": "muse-spark-1.3",
+            "choices": [{"message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"}],
+        })
+        .to_string()
+    }
+
+    /// A base URL with nothing listening. Calls attempted against it fail
+    /// fast with connection refused (a `Http` error), so an `EgressDenied`
+    /// result proves zero network use.
+    fn closed_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let url = format!("http://{}", listener.local_addr().expect("probe addr"));
+        drop(listener);
+        url
+    }
+
+    #[test]
+    fn over_ceiling_calls_refuse_with_zero_requests_and_denied_entry() {
+        let _guard = env_lock();
+        let _key = EnvGuard::set("META_API_KEY", Some("test-key"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        for class in [
+            DataClass::Internal,
+            DataClass::Confidential,
+            DataClass::Restricted,
+        ] {
+            // Closed URL: any network attempt would surface as Http, so
+            // EgressDenied proves the refusal happened before any I/O.
+            let client = MuseClient::new("m", closed_url(), 16, true);
+            let err = client
+                .chat_with_class(class, "test-muse", Some(&mut log), "canary-prompt")
+                .unwrap_err();
+            assert!(
+                matches!(err, RouterError::EgressDenied { .. }),
+                "unexpected: {err:?}"
+            );
+        }
+        // One denied entry per refusal: class, route, caller, no content.
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 3);
+        for (e, class) in entries
+            .iter()
+            .zip(["internal", "confidential", "restricted"])
+        {
+            assert_eq!(e.kind, crate::data_class::EGRESS_DENIED_KIND);
+            assert_eq!(e.payload["class"], class);
+            assert_eq!(e.payload["route"], "muse_spark");
+            assert_eq!(e.payload["caller"], "test-muse");
+            let raw = serde_json::to_string(&e.payload).unwrap();
+            assert!(!raw.contains("canary"), "{raw}");
+        }
+        // Literal zero-hit proof against a live mock server: the refusal is
+        // synchronous, so after it returns no request can still arrive.
+        let (url, hits, _handle) = mock_server(&chat_ok_body(), 1);
+        let client = MuseClient::new("m", url, 16, true);
+        assert!(matches!(
+            client.chat_with_class(DataClass::Confidential, "test-muse", None, "canary"),
+            Err(RouterError::EgressDenied { .. })
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(*hits.lock().expect("hits lock"), 0);
+    }
+
+    #[test]
+    fn public_call_succeeds_with_zero_extra_requests_and_allowed_entry() {
+        let _guard = env_lock();
+        let _key = EnvGuard::set("META_API_KEY", Some("test-key"));
+        let (url, hits, handle) = mock_server(&chat_ok_body(), 1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        let client = MuseClient::new("m", url, 16, true);
+        let resp = client
+            .chat_with_class(
+                DataClass::Public,
+                "test-muse",
+                Some(&mut log),
+                "public prompt",
+            )
+            .expect("public muse call ok");
+        handle.join().expect("server thread");
+        assert_eq!(resp.content, "ok");
+        assert_eq!(*hits.lock().expect("hits lock"), 1);
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, crate::data_class::EGRESS_ALLOWED_KIND);
+        assert_eq!(entries[0].payload["class"], "public");
+        assert_eq!(entries[0].payload["route"], "muse_spark");
+        assert!(entries[0].payload.get("caller").is_none());
+    }
+
+    #[test]
+    fn sensitivity_bridge_refuses_non_sanitized() {
+        let _guard = env_lock();
+        let _key = EnvGuard::set("META_API_KEY", Some("test-key"));
+        let client = test_client(true);
+        assert!(matches!(
+            ModelClient::complete_with_sensitivity(
+                &client,
+                crate::Sensitivity::Sensitive,
+                "PRIVATE"
+            ),
+            Err(RouterError::EgressDenied { .. })
+        ));
+        assert!(matches!(
+            ModelClient::complete_with_sensitivity(&client, crate::Sensitivity::Unknown, "x"),
+            Err(RouterError::EgressDenied { .. })
+        ));
+        // Sanitized maps to Public: passes the class check, then fails on the
+        // unroutable test URL (proving the class check passed first).
+        assert!(matches!(
+            ModelClient::complete_with_sensitivity(
+                &client,
+                crate::Sensitivity::Sanitized,
+                "public"
+            ),
+            Err(RouterError::Http(_))
+        ));
     }
 }

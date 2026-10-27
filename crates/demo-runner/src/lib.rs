@@ -17,7 +17,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Categories whose content is treated as sensitive (stays on local Llama).
-pub const SENSITIVE_CATEGORIES: &[&str] = &["Health & Personal"];
+/// Single source: the router's data-class table maps these to Confidential.
+pub const SENSITIVE_CATEGORIES: &[&str] = ancientos_router::data_class::SENSITIVE_CATEGORIES;
 pub const BRIEF_SIZE: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,7 +48,11 @@ pub fn category(b: &Bookmark) -> String {
 }
 
 pub fn sensitivity(cat: &str) -> Sensitivity {
-    if cat == "unknown" || SENSITIVE_CATEGORIES.contains(&cat) {
+    // Same rule as before, via the shared data-class table: sensitive and
+    // unknown categories are above Public, everything else is Public.
+    if ancientos_router::data_class::class_of_category(cat)
+        > ancientos_router::data_class::DataClass::Public
+    {
         Sensitivity::Sensitive
     } else {
         Sensitivity::Sanitized
@@ -1029,9 +1034,9 @@ impl Workspace {
         let _ = self;
         require_paid_off()?;
         let post_id = "demo-5001";
-        let original = "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales. Detalles en https://example.invalid/demo_plan"
+        let original = "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales. Detalles en https://example.invalid/demo_plan o en fiestas@example.invalid"
             .to_string();
-        let english_expected = "[synthetic] The government presented an economic plan to support small local businesses. Details at the demo plan page."
+        let english_expected = "[synthetic] The government presented an economic plan to support small local businesses. Details at the demo plan page or at the demo mailbox."
             .to_string();
         let b = Bookmark {
             post_id: post_id.to_string(),
@@ -1049,9 +1054,10 @@ impl Workspace {
         if bookmarks_agent::language::is_english(&b) {
             return Err("translate demo: demo-5001 must not be English".to_string());
         }
-        if translate::sensitivity_of(&b.text) != Sensitivity::Sensitive {
+        if translate::class_of(&b.text) != ancientos_router::data_class::DataClass::Confidential {
             return Err(
-                "translate demo: demo-5001 must be sensitive (URL) for the local mock".to_string(),
+                "translate demo: demo-5001 must be Confidential (email) for the local mock"
+                    .to_string(),
             );
         }
         let mock = FixedReply {
@@ -1059,7 +1065,7 @@ impl Workspace {
             reply: english_expected.clone(),
         };
         let mut cache: HashMap<String, translate::CacheEntry> = HashMap::new();
-        let t = translate::translate_one(&b, &mut cache, None, Some(&mock));
+        let t = translate::translate_one(&b, &mut cache, None, Some(&mock), None);
         if t.status != translate::TranslationStatus::Translated {
             return Err("translate demo: mock local must translate".to_string());
         }

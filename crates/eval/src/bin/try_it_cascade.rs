@@ -10,8 +10,10 @@
 //! Items run through the cascade sequentially from env
 //! ([`JevClient::from_env`] with `JEV_BACKEND`, [`MuseClient::from_env`]
 //! pinned to muse-spark-1.3 / low reasoning / 1024 completion tokens).
-//! Bookmark text is public X content, so every item runs as
-//! [`Sensitivity::Sanitized`]. The run stops early on HTTP 429 instead of
+//! Every item is classified ([`class_of`](bookmarks_agent::translate::class_of)):
+//! Public items (URL/@handle-only differences included) run the paid stages
+//! on sanitized text; anything else falls back to the rules verdict. The run
+//! stops early on HTTP 429 instead of
 //! continuing. Without `ANCIENTOS_ALLOW_PAID=1` it still runs, rules only,
 //! and says so.
 //!
@@ -28,12 +30,12 @@
 //! and reuse the on-disk link cache (saved after the run); without the
 //! opt-in nothing is fetched and nothing is appended. The summary reports
 //! an `enriched` count.
+use ancientos_router::data_class::{max_of, DataClass};
 use ancientos_router::jev_client::JevClient;
 use ancientos_router::muse::MuseClient;
 use ancientos_router::try_it_cascade::{
     jev_threshold_from_env, Cascade, CascadeStats, RulesVerdict, TRY_IT_MUSE_MAX_COMPLETION_TOKENS,
 };
-use ancientos_router::Sensitivity;
 use bookmarks_agent::brief::topic_of;
 use bookmarks_agent::fixture::Bookmark;
 use bookmarks_agent::try_it::rules_confident;
@@ -368,19 +370,33 @@ fn run(args: &Args) -> Result<(), String> {
             RulesVerdict::Unsure
         };
         // With --enrich, the cascade (topic filter, Jev, Muse) decides on
-        // the post text plus linked/media context. Private bookmarks keep
-        // their enrichment local-only: `cascade_input` withholds it, so it
-        // is never counted here and never reaches a paid model.
-        let cascade_text = if args.enrich {
+        // the sanitized post text plus linked/media context. Non-public
+        // bookmarks keep their enrichment local-only: `cascade_input`
+        // withholds it, so it is never counted here and never reaches a
+        // paid model. The class gate runs on the ORIGINALS: an email post
+        // stays rules-only even though its sanitized text would be safe.
+        let (cascade_text, class) = if args.enrich {
             let e = bookmarks_agent::link_context::enrich(bookmark, &mut lcache);
             if bookmarks_agent::link_context::will_append(&e) {
                 enriched += 1;
             }
-            bookmarks_agent::link_context::cascade_input(&scoring_text, &e)
+            let class = max_of([
+                bookmarks_agent::translate::class_of(&scoring_text),
+                if bookmarks_agent::link_context::will_append(&e) {
+                    bookmarks_agent::translate::class_of(&e.text)
+                } else {
+                    DataClass::Public
+                },
+            ]);
+            (
+                bookmarks_agent::link_context::cascade_input(&scoring_text, &e),
+                class,
+            )
         } else {
-            scoring_text.into_owned()
+            let class = bookmarks_agent::translate::class_of(&scoring_text);
+            (scoring_text.into_owned(), class)
         };
-        let decision = cascade.decide(&cascade_text, Sensitivity::Sanitized, verdict, &mut stats);
+        let decision = cascade.decide(&cascade_text, class, verdict, &mut stats, None);
         cascade_pairs.push((label.try_it, decision.try_it));
         rules_pairs.push((label.try_it, confident));
         rows.push(serde_json::json!({

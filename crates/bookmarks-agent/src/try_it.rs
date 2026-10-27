@@ -2068,6 +2068,7 @@ mod tests {
 
         fn call(
             &self,
+            _class: ancientos_router::data_class::DataClass,
             _prompt: &str,
         ) -> Result<crate::brief::ModelReply, ancientos_router::RouterError> {
             Err(ancientos_router::RouterError::PaidCallsDisabled)

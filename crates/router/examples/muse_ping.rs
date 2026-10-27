@@ -3,11 +3,13 @@
 //! Requires `META_API_KEY` and `ANCIENTOS_ALLOW_PAID=1` in the environment.
 //! Prints only the model id, the reply text, and token usage.
 
+use ancientos_router::data_class::DataClass;
 use ancientos_router::muse::MuseClient;
 
 fn main() {
     let client = MuseClient::from_env().with_max_completion_tokens(256);
-    match client.chat("Reply with: ok") {
+    // The ping prompt is a fixed public string, so Public is honest here.
+    match client.chat_with_class(DataClass::Public, "muse_ping", None, "Reply with: ok") {
         Ok(resp) => {
             println!("model: {}", resp.model);
             println!("reply: {}", resp.content);

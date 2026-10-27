@@ -9,14 +9,14 @@
 //! TypeSafe (frontier) is a hosted, paid API: `TYPESAFE_BASE_URL` (default
 //! `https://api.typesafe.ai`), `TYPESAFE_API_KEY` (required),
 //! `TYPESAFE_DEFAULT_MODEL` (default `jev-preview`). Real calls need the paid
-//! switch `ANCIENTOS_ALLOW_PAID=1`, and only sanitized/public content may go
-//! there — sensitive or unknown content is refused with an error.
+//! switch `ANCIENTOS_ALLOW_PAID=1`, and only `Public` content may go there —
+//! anything above the hosted ceiling is refused before any network I/O.
 //!
 //! LocalJev is a local server in the style of [`crate::local_llm`]:
 //! `LOCALJEV_BASE_URL` (default `http://127.0.0.1:8080`),
 //! `LOCALJEV_DEFAULT_MODEL` (default `localjev-default`), optional
 //! `LOCALJEV_API_KEY` Bearer token. It is not paid-gated, and data stays on
-//! the device, so any sensitivity is allowed.
+//! the device, so every data class is allowed.
 //!
 //! Keys are read from env at call time and never stored on the client,
 //! logged, or printed. The HTTP request/response shape is shared by both
@@ -28,7 +28,9 @@
 //! and returns `{model, answers: {name: {type, noul|choice,...}}, usage: {input_tokens, output_tokens}}`.
 //! `/v1/chat/completions` returns 404. Use [`JevClient::ask`]; freeform
 //! [`JevClient::chat`] fails closed after the usual gates.
+use crate::data_class::{check_egress, DataClass, Route};
 use crate::{Destination, ModelClient, RouterError, Sensitivity};
+use ancientos_core::log::DecisionLog;
 
 /// Backend selector: `auto` (default) | `typesafe` | `localjev`.
 pub const JEV_BACKEND_ENV: &str = "JEV_BACKEND";
@@ -191,19 +193,32 @@ impl JevClient {
     }
 
     /// Send one prompt with an explicit sensitivity. The TypeSafe backend
-    /// refuses anything but [`Sensitivity::Sanitized`] (unknown counts as
-    /// sensitive); the local backend accepts all sensitivities because data
-    /// never leaves the device. Refusals never touch the network.
+    /// refuses anything above [`DataClass::Public`](crate::data_class::DataClass)
+    /// (sensitive maps to Confidential, unknown to Restricted); the local
+    /// backend accepts all sensitivities because data never leaves the
+    /// device. Refusals never touch the network.
     pub fn complete_with_sensitivity(
         &self,
         s: Sensitivity,
         prompt: &str,
     ) -> Result<String, RouterError> {
-        if self.backend == JevBackend::TypeSafe && s != Sensitivity::Sanitized {
-            return Err(RouterError::Refused(
-                "sensitive content must stay local; TypeSafe accepts sanitized/public content only"
-                    .into(),
-            ));
+        self.complete_with_class(DataClass::from(s), "jev", None, prompt)
+    }
+
+    /// Send one prompt with an explicit data class and caller. The TypeSafe
+    /// backend refuses content above [`DataClass::Public`](crate::data_class::DataClass)
+    /// before any network I/O (logging the decision to `log` when given);
+    /// the local backend accepts every class without logging (local calls
+    /// are not egress).
+    pub fn complete_with_class(
+        &self,
+        class: DataClass,
+        caller: &str,
+        log: Option<&mut DecisionLog>,
+        prompt: &str,
+    ) -> Result<String, RouterError> {
+        if self.backend == JevBackend::TypeSafe {
+            check_egress(class, Route::Jev, caller, log)?;
         }
         self.chat(prompt)
     }
@@ -237,18 +252,33 @@ impl JevClient {
     }
 
     /// Ask structured questions about `state` (System One). TypeSafe refuses
-    /// anything but sanitized content before touching the network.
+    /// anything above [`DataClass::Public`](crate::data_class::DataClass)
+    /// before touching the network. Prefer [`Self::ask_with_class`] when the
+    /// class and a decision log are available.
     pub fn ask(
         &self,
         s: Sensitivity,
         state: &str,
         questions: &serde_json::Value,
     ) -> Result<SystemOneReply, RouterError> {
-        if self.backend == JevBackend::TypeSafe && s != Sensitivity::Sanitized {
-            return Err(RouterError::Refused(
-                "sensitive content must stay local; TypeSafe accepts sanitized/public content only"
-                    .into(),
-            ));
+        self.ask_with_class(DataClass::from(s), "jev.ask", None, state, questions)
+    }
+
+    /// Ask structured questions about `state` with an explicit data class and
+    /// caller. The TypeSafe backend refuses content above
+    /// [`DataClass::Public`](crate::data_class::DataClass) before any network
+    /// I/O (logging the decision to `log` when given); the local backend
+    /// accepts every class without logging.
+    pub fn ask_with_class(
+        &self,
+        class: DataClass,
+        caller: &str,
+        log: Option<&mut DecisionLog>,
+        state: &str,
+        questions: &serde_json::Value,
+    ) -> Result<SystemOneReply, RouterError> {
+        if self.backend == JevBackend::TypeSafe {
+            check_egress(class, Route::Jev, caller, log)?;
         }
         let key = self.preflight()?;
         post_systemone(
@@ -288,11 +318,11 @@ impl ModelClient for JevClient {
         self.backend.destination()
     }
 
-    /// Fail-closed: sensitivity is unknown here, so the TypeSafe backend
+    /// Fail-closed: the class is unknown here, so the TypeSafe backend
     /// refuses and only the local backend proceeds. Dispatch passes the routed
-    /// sensitivity via the trait's `complete_with_sensitivity`.
+    /// class via the trait's `complete_with_class`.
     fn complete(&self, prompt: &str) -> Result<String, RouterError> {
-        JevClient::complete_with_sensitivity(self, Sensitivity::Unknown, prompt)
+        JevClient::complete_with_class(self, DataClass::Restricted, "jev.complete", None, prompt)
     }
 
     fn complete_with_sensitivity(
@@ -301,6 +331,16 @@ impl ModelClient for JevClient {
         prompt: &str,
     ) -> Result<String, RouterError> {
         JevClient::complete_with_sensitivity(self, s, prompt)
+    }
+
+    fn complete_with_class(
+        &self,
+        class: DataClass,
+        caller: &str,
+        log: Option<&mut DecisionLog>,
+        prompt: &str,
+    ) -> Result<String, RouterError> {
+        JevClient::complete_with_class(self, class, caller, log, prompt)
     }
 }
 
@@ -720,27 +760,111 @@ mod tests {
     fn typesafe_refuses_sensitive_unknown_and_bare_complete() {
         let _guard = env_lock();
         let _env = EnvGuard::set(&[(TYPESAFE_API_KEY_ENV, Some("test-key"))]);
-        // Closed URL proves refusals never touch the network.
+        // Closed URL proves refusals never touch the network: any attempt
+        // would surface as Http, so EgressDenied proves zero network use.
         let client = typesafe_client(closed_url(), true);
         for s in [Sensitivity::Sensitive, Sensitivity::Unknown] {
             let err = client
                 .complete_with_sensitivity(s, "PRIVATE health note")
                 .unwrap_err();
             assert!(
-                matches!(err, RouterError::Refused(_)),
+                matches!(err, RouterError::EgressDenied { .. }),
                 "unexpected: {err:?}"
             );
-            assert!(err.to_string().contains("local"));
+            assert!(err.to_string().contains("egress denied"));
         }
-        // Bare complete() has unknown sensitivity, so it refuses too.
+        // Bare complete() has unknown class, so it refuses too.
         assert!(matches!(
             client.complete("anything"),
-            Err(RouterError::Refused(_))
+            Err(RouterError::EgressDenied { .. })
         ));
         assert!(matches!(
             ModelClient::complete_with_sensitivity(&client, Sensitivity::Sensitive, "x"),
-            Err(RouterError::Refused(_))
+            Err(RouterError::EgressDenied { .. })
         ));
+    }
+
+    #[test]
+    fn typesafe_ask_refuses_over_ceiling_with_denied_entry() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[(TYPESAFE_API_KEY_ENV, Some("test-key"))]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        for class in [
+            DataClass::Internal,
+            DataClass::Confidential,
+            DataClass::Restricted,
+        ] {
+            // Closed URL: EgressDenied proves the refusal beat the network.
+            let client = typesafe_client(closed_url(), true);
+            let err = client
+                .ask_with_class(class, "test-jev", Some(&mut log), "canary-state", &qs())
+                .unwrap_err();
+            assert!(
+                matches!(err, RouterError::EgressDenied { .. }),
+                "unexpected: {err:?}"
+            );
+        }
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 3);
+        for (e, class) in entries
+            .iter()
+            .zip(["internal", "confidential", "restricted"])
+        {
+            assert_eq!(e.kind, crate::data_class::EGRESS_DENIED_KIND);
+            assert_eq!(e.payload["class"], class);
+            assert_eq!(e.payload["route"], "jev");
+            assert_eq!(e.payload["caller"], "test-jev");
+            let raw = serde_json::to_string(&e.payload).unwrap();
+            assert!(!raw.contains("canary"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn typesafe_ask_public_logs_allowed_with_one_request() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[(TYPESAFE_API_KEY_ENV, Some("test-key"))]);
+        let (url, seen, handle) = mock_server(200, OK_BODY);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        let out = typesafe_client(url, true)
+            .ask_with_class(DataClass::Public, "test-jev", Some(&mut log), "hi", &qs())
+            .expect("public ask ok");
+        handle.join().expect("server thread");
+        assert_eq!(out.noul("q"), Some(0.9));
+        assert_eq!(seen.lock().expect("seen lock").len(), 1);
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, crate::data_class::EGRESS_ALLOWED_KIND);
+        assert_eq!(entries[0].payload["class"], "public");
+        assert_eq!(entries[0].payload["route"], "jev");
+    }
+
+    #[test]
+    fn localjev_accepts_every_class_without_entries() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[(LOCALJEV_API_KEY_ENV, None)]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        for class in [
+            DataClass::Public,
+            DataClass::Internal,
+            DataClass::Confidential,
+            DataClass::Restricted,
+        ] {
+            let (url, seen, handle) = mock_server(200, OK_BODY);
+            let out = localjev_client(url)
+                .ask_with_class(class, "test-jev", Some(&mut log), "local state", &qs())
+                .unwrap_or_else(|e| panic!("local {class:?} must be allowed: {e}"));
+            handle.join().expect("server thread");
+            assert_eq!(out.noul("q"), Some(0.9));
+            assert_eq!(seen.lock().expect("seen lock").len(), 1);
+        }
+        // Local calls are not egress: allowed, but never logged.
+        assert_eq!(log.verify_or_empty().unwrap().len(), 0);
     }
 
     #[test]

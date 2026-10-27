@@ -14,6 +14,7 @@ use crate::delegate::ThreadFetcher;
 use crate::fixture::Bookmark;
 use crate::unroll::{ReferencedTweet, ThreadPost};
 use ancientos_core::log::{DecisionLog, Entry};
+use ancientos_router::data_class::{check_egress, max_of, DataClass, Route};
 use ancientos_router::muse::MuseUsage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1257,6 +1258,12 @@ fn combine_usage(a: Option<MuseUsage>, b: Option<MuseUsage>) -> Option<MuseUsage
 /// are made when `allow_paid` is set (first try plus one continuation on
 /// `finish_reason` "length"). Any fetch error, model error, or empty model
 /// output fails closed with nothing written.
+///
+/// The paid path only runs for Public threads: content from the thread plus
+/// quoted/linked posts takes the highest class, and anything above Public
+/// is refused before any model call (logged as `router.egress_denied` when
+/// `log` is given; allowed paid runs log `router.egress_allowed`). The local
+/// fallback handles every class.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with(
     post_id: &str,
@@ -1267,6 +1274,7 @@ pub fn run_with(
     call: &DeeperMuseCaller<'_>,
     log_path: &Path,
     out_dir: &Path,
+    log: Option<&mut DecisionLog>,
 ) -> Result<DeeperResult, String> {
     validate_post_id(post_id)?;
     let (thread, username, quoted, linked, media) = match offline_fixture {
@@ -1276,6 +1284,19 @@ pub fn run_with(
     if thread.is_empty() {
         return Err("thread is empty".to_string());
     }
+    // Highest class across the thread plus quoted/linked posts (and inline
+    // quoted text): the paid prompt below carries all of it.
+    let class = {
+        let mut classes = Vec::new();
+        for p in thread.iter().chain(quoted.iter()).chain(linked.iter()) {
+            classes.push(crate::translate::class_of(&p.text));
+            if let Some((user, quoted_text)) = &p.quoted {
+                classes.push(crate::translate::class_of(user));
+                classes.push(crate::translate::class_of(quoted_text));
+            }
+        }
+        max_of(classes)
+    };
     let mut thread_joined = String::new();
     for p in thread.iter() {
         if !thread_joined.is_empty() {
@@ -1307,6 +1328,7 @@ pub fn run_with(
     };
     let is_try_it = crate::try_it::classify(&probe).is_some();
     let (output, model, usage, mode) = if allow_paid && offline_fixture.is_none() {
+        check_egress(class, Route::MuseSpark, "deeper", log).map_err(|e| e.to_string())?;
         let prompt = build_paid_prompt(&thread, &quoted, &linked);
         let (first, model_first, usage_first, reason_first) = call(&prompt, None)?;
         if first.trim().is_empty() && reason_first.as_deref() != Some("length") {
@@ -1414,7 +1436,9 @@ pub fn run_with(
 /// Build the production Muse caller for [`run_with`] from a configured
 /// client: one user prompt first, then a single continuation (user prompt
 /// plus assistant prior plus [`DEEPER_CONTINUE_PROMPT`]) when the first
-/// reply truncates with `finish_reason` "length".
+/// reply truncates with `finish_reason` "length". The caller passes
+/// [`DataClass::Public`]: only use it for prompts [`run_with`] already
+/// classified (it refuses non-public threads before calling).
 #[allow(clippy::type_complexity)]
 pub fn production_muse_caller(
     client: &ancientos_router::muse::MuseClient,
@@ -1422,14 +1446,14 @@ pub fn production_muse_caller(
        + '_ {
     move |prompt: &str, prior: Option<&str>| {
         let resp = match prior {
-            None => client.chat(prompt),
+            None => client.chat_with_class(DataClass::Public, "deeper", None, prompt),
             Some(prior_content) => {
                 let messages = serde_json::json!([
                     {"role": "user", "content": prompt},
                     {"role": "assistant", "content": prior_content},
                     {"role": "user", "content": DEEPER_CONTINUE_PROMPT},
                 ]);
-                client.chat_messages(messages)
+                client.chat_messages_with_class(DataClass::Public, "deeper", None, messages)
             }
         }
         .map_err(|e| e.to_string())?;
@@ -1454,6 +1478,14 @@ pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String>
         .with_max_completion_tokens(DEEPER_MAX_COMPLETION_TOKENS)
         .with_reasoning_effort(DEEPER_REASONING_EFFORT);
     let call = production_muse_caller(&client);
+    let log_path = crate::brief::decision_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            crate::token_store::ensure_dir_0700(parent)
+                .map_err(|e| format!("log dir failed: {e}"))?;
+        }
+    }
+    let mut log = DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
     run_with(
         post_id,
         allow_paid,
@@ -1461,8 +1493,9 @@ pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String>
         &crate::x_api::fetch_thread,
         &crate::x_api::fetch_post,
         &call,
-        &crate::brief::decision_log_path()?,
+        &log_path,
         &deeper_dir()?,
+        Some(&mut log),
     )
 }
 
@@ -1486,6 +1519,13 @@ pub fn run_paid_with_paths(
         .with_max_completion_tokens(DEEPER_MAX_COMPLETION_TOKENS)
         .with_reasoning_effort(DEEPER_REASONING_EFFORT);
     let call = production_muse_caller(&client);
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            crate::token_store::ensure_dir_0700(parent)
+                .map_err(|e| format!("log dir failed: {e}"))?;
+        }
+    }
+    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
     run_with(
         post_id,
         true,
@@ -1495,6 +1535,7 @@ pub fn run_paid_with_paths(
         &call,
         log_path,
         out_dir,
+        Some(&mut log),
     )
 }
 
@@ -1652,6 +1693,7 @@ mod tests {
                 &no_call,
                 &log,
                 &out_dir,
+                None,
             )
             .unwrap()
         };
@@ -1699,6 +1741,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &dir.path().join("deeper"),
+            None,
         )
         .unwrap();
         assert_eq!(res.thread_posts, 2);
@@ -1777,6 +1820,7 @@ mod tests {
                 &no_call,
                 &dir.path().join("d.jsonl"),
                 &dir.path().join("deeper"),
+                None,
             )
             .unwrap()
         };
@@ -1840,6 +1884,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &dir.path().join("deeper"),
+            None,
         )
         .unwrap();
         // Both thread posts contribute claim lines naming their own id.
@@ -1879,6 +1924,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &dir.path().join("deeper"),
+            None,
         )
         .unwrap();
         assert!(res.output.contains("## Steps"), "{}", res.output);
@@ -1908,6 +1954,7 @@ mod tests {
                 &no_call,
                 &log,
                 &out_dir,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("digits only"), "{bad}: {err}");
@@ -1933,6 +1980,7 @@ mod tests {
             &no_call,
             &log,
             &out_dir,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("synthetic fetch boom"), "{err}");
@@ -1952,7 +2000,7 @@ mod tests {
         let post_fail =
             |_: &str| -> Result<ThreadPost, String> { Err("synthetic quoted boom".to_string()) };
         let err = run_with(
-            "100", false, None, &fetch_ok, &post_fail, &no_call, &log, &out_dir,
+            "100", false, None, &fetch_ok, &post_fail, &no_call, &log, &out_dir, None,
         )
         .unwrap_err();
         assert!(err.contains("synthetic quoted boom"), "{err}");
@@ -2008,7 +2056,7 @@ mod tests {
                 ))
             };
         let res = run_with(
-            "300", true, None, &fetch_ok, &post_ok, &call_ok, &log, &out_dir,
+            "300", true, None, &fetch_ok, &post_ok, &call_ok, &log, &out_dir, None,
         )
         .unwrap();
         assert_eq!(seen.borrow().len(), 1, "exactly one Muse call");
@@ -2054,6 +2102,7 @@ mod tests {
             &call_empty,
             &log,
             &out_dir,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("empty walkthrough"), "{err}");
@@ -2062,6 +2111,90 @@ mod tests {
             !out_dir.join("400.md").exists(),
             "file written on empty output"
         );
+    }
+
+    #[test]
+    fn paid_path_refuses_non_public_thread_with_zero_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        let out_dir = dir.path().join("deeper");
+        let fetch_ok = |_: &str| {
+            Ok(fetch(vec![post(
+                "400",
+                "[synthetic] root mail quokka@example.invalid now",
+            )]))
+        };
+        let calls = std::cell::RefCell::new(0usize);
+        let call_count = |_: &str, _: Option<&str>| {
+            *calls.borrow_mut() += 1;
+            Ok(("1. Do the thing".to_string(), "m".to_string(), None, None))
+        };
+        let mut log = DecisionLog::open(&log_path).unwrap();
+        let err = run_with(
+            "400",
+            true,
+            None,
+            &fetch_ok,
+            &no_post_fetch,
+            &call_count,
+            &log_path,
+            &out_dir,
+            Some(&mut log),
+        )
+        .unwrap_err();
+        assert!(err.contains("egress denied"), "{err}");
+        assert_eq!(*calls.borrow(), 0, "no model call on refusal");
+        assert!(!out_dir.join("400.md").exists());
+        // One denied entry: class, route, caller, no content.
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "router.egress_denied");
+        assert_eq!(entries[0].payload["class"], "confidential");
+        assert_eq!(entries[0].payload["route"], "muse_spark");
+        assert_eq!(entries[0].payload["caller"], "deeper");
+        let raw = entries[0].payload.to_string();
+        assert!(!raw.contains("quokka"), "{raw}");
+    }
+
+    #[test]
+    fn paid_path_logs_allowed_entry_before_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("d.jsonl");
+        let out_dir = dir.path().join("deeper");
+        let fetch_ok = |_: &str| {
+            Ok(fetch(vec![post(
+                "300",
+                "[synthetic] Try it now: breathe in 4s.",
+            )]))
+        };
+        let call_ok = |_: &str, _: Option<&str>| {
+            Ok((
+                "1. [synthetic] paid step one".to_string(),
+                "fake-spark".to_string(),
+                None,
+                Some("stop".to_string()),
+            ))
+        };
+        let mut log = DecisionLog::open(&log_path).unwrap();
+        let res = run_with(
+            "300",
+            true,
+            None,
+            &fetch_ok,
+            &no_post_fetch,
+            &call_ok,
+            &log_path,
+            &out_dir,
+            Some(&mut log),
+        )
+        .unwrap();
+        assert_eq!(res.mode, "paid");
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, "router.egress_allowed");
+        assert_eq!(entries[0].payload["class"], "public");
+        assert_eq!(entries[0].payload["route"], "muse_spark");
+        assert_eq!(entries[1].kind, DEEPER_DONE_KIND);
     }
 
     #[test]
@@ -2079,6 +2212,7 @@ mod tests {
             &no_call,
             &log,
             &out_dir,
+            None,
         )
         .unwrap();
         let log_file = DecisionLog::open(&log).unwrap();
@@ -2116,6 +2250,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &out_dir,
+            None,
         )
         .unwrap();
         let file_mode = std::fs::metadata(&res.path).unwrap().permissions().mode() & 0o777;
@@ -2186,6 +2321,7 @@ mod tests {
             &call,
             &log,
             &out_dir,
+            None,
         )
         .unwrap();
         assert_eq!(calls.borrow().len(), 2, "exactly one continuation");
@@ -2242,6 +2378,7 @@ mod tests {
             &call,
             &log,
             &out_dir,
+            None,
         )
         .unwrap();
         assert_eq!(calls.get(), 2, "only one continuation, never more");
@@ -2280,6 +2417,7 @@ mod tests {
             &call,
             &log,
             &out_dir,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("synthetic continuation boom"), "{err}");
@@ -2368,6 +2506,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &dir.path().join("deeper"),
+            None,
         )
         .unwrap();
         let steps_pos = res
@@ -2431,6 +2570,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &dir.path().join("deeper"),
+            None,
         )
         .unwrap();
         let steps_pos = res.output.find("## Steps").expect("Steps present");
@@ -2453,6 +2593,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &dir.path().join("deeper"),
+            None,
         )
         .unwrap();
         let steps_pos = res.output.find("## Steps").expect("Steps present");
@@ -2506,6 +2647,7 @@ mod tests {
                 &no_call,
                 &dir.path().join("d.jsonl"),
                 &dir.path().join("deeper"),
+                None,
             )
             .unwrap();
             let first_line = res.output.lines().next().unwrap_or("");
@@ -2552,6 +2694,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &dir.path().join("deeper"),
+            None,
         )
         .unwrap();
         assert!(
@@ -2699,6 +2842,7 @@ mod tests {
             &no_call,
             &dir.path().join("d.jsonl"),
             &dir.path().join("deeper"),
+            None,
         )
         .unwrap();
         assert!(

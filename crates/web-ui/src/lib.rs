@@ -1118,6 +1118,7 @@ fn do_deeper(state: &State, post_id: &str, body: &[u8]) -> Response {
         &err_model,
         &state.log_path(),
         &out_dir,
+        None,
     ) {
         Ok(_) => Response::redirect(format!("/deeper/{post_id}")),
         Err(e) => Response::status(500, error_page("Go deeper failed", &e, state)),

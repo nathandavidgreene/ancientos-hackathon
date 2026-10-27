@@ -22,6 +22,9 @@ impl EnvHold {
         let lock = lock_env();
         let keys = [
             "ANCIENTOS_ALLOW_PAID",
+            "META_API_KEY",
+            "META_API_BASE",
+            "MUSE_MODEL",
             crate::liveness::OFFLINE_ENV_VAR,
             crate::liveness::CACHE_ENV_VAR,
             crate::link_context::FETCH_ENV_VAR,

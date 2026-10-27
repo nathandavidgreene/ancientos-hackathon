@@ -959,9 +959,15 @@ fn jev_threshold_invalid_env_falls_back_to_default() {
 /// handles, or other strippable tokens).
 const ENRICH_TEXT: &str = "A tip. Roll your shoulders and hold for a moment.";
 
-/// Same idea but carrying a URL, so the translate rule treats it as
-/// private: enrichment stays local-only.
+/// Same idea but carrying an email address, so the translate rule treats
+/// it as Confidential: enrichment stays local-only AND the paid stages never
+/// run (rules verdict instead).
 const ENRICH_PRIVATE_TEXT: &str =
+    "A tip with the full routine at quokka@example.invalid roll your shoulders and hold.";
+
+/// Same idea carrying only a link: Public, so enrichment is appended and the
+/// paid stages run on sanitized text (no raw URL in any hosted prompt).
+const ENRICH_URL_TEXT: &str =
     "A tip with the full routine at https://example.invalid/guide roll your shoulders and hold.";
 
 const ENRICH_PAGE: &str =
@@ -1218,16 +1224,68 @@ fn enrichment_reaches_paid_prompts_for_sanitized_posts() {
 fn private_enrichment_never_reaches_paid_prompts() {
     assert!(
         !bookmarks_agent::try_it::rules_confident("AI Agents", ENRICH_PRIVATE_TEXT),
+        "fixture must stay rules-unsure"
+    );
+    let (link_url, link_seen) =
+        link_mock_server(vec![("/page", "text/html", ENRICH_PAGE.into())], 10);
+    let page_url = format!("{link_url}/page");
+    // Closed ports: any paid-stage attempt would fail the run's verdict, so a
+    // rules verdict proves the Confidential item never reached hosted stages.
+    let jev_url = closed_url();
+    let muse_url = closed_url();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (labels, bookmarks) = enrich_fixtures(ENRICH_PRIVATE_TEXT, &page_url);
+    let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), &labels, &bookmarks);
+    let cache_path = dir.path().join("links.json");
+    let cache_str = cache_path.to_str().unwrap().to_string();
+
+    let (ok, stdout, stderr) = run_bin(
+        &[
+            "--labels",
+            &labels_path,
+            "--bookmarks",
+            &bookmarks_path,
+            "--out",
+            &out_path,
+            "--enrich",
+        ],
+        &[
+            ("JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_BASE_URL", &jev_url),
+            ("TYPESAFE_API_KEY", "test-key"),
+            ("META_API_BASE", &muse_url),
+            ("META_API_KEY", "test-key"),
+            ("ANCIENTOS_ALLOW_PAID", "1"),
+            ("ANCIENTOS_FETCH_LINKS", "1"),
+            ("LINK_CONTEXT_ALLOW_PRIVATE_HOSTS", "1"),
+            ("LINK_CONTEXT_CACHE_PATH", &cache_str),
+        ],
+        &["ANCIENTOS_JEV_TRY_IT_THRESHOLD"],
+    );
+    assert!(ok, "exit ok, stderr: {stderr}");
+    // Rules fallback with zero paid calls: stage rules, not a stage error.
+    let rows = read_out_rows(&out_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["stage"], "rules");
+    assert_eq!(rows[0]["predicted"], false);
+    // The page is fetched (local use) but never appended: 0 enriched.
+    assert!(stdout.contains("0 enriched"), "{stdout}");
+    assert_eq!(link_hits(&link_seen), 1);
+}
+
+#[test]
+fn url_post_is_enriched_and_hosted_with_sanitized_prompts() {
+    assert!(
+        !bookmarks_agent::try_it::rules_confident("AI Agents", ENRICH_URL_TEXT),
         "fixture must stay rules-unsure so the paid stages run"
     );
     let (link_url, link_seen) =
         link_mock_server(vec![("/page", "text/html", ENRICH_PAGE.into())], 10);
     let page_url = format!("{link_url}/page");
     let (jev_url, jev_seen, jev_done) = mock_server(vec![(200, jev_noul_body(0.1))]);
-    let (muse_url, muse_seen, muse_done) =
-        mock_server(vec![(200, muse_body("{\"try_it\":false}"))]);
+    let (muse_url, muse_seen, muse_done) = mock_server(vec![(200, muse_body("{\"try_it\":true}"))]);
     let dir = tempfile::tempdir().expect("tempdir");
-    let (labels, bookmarks) = enrich_fixtures(ENRICH_PRIVATE_TEXT, &page_url);
+    let (labels, bookmarks) = enrich_fixtures(ENRICH_URL_TEXT, &page_url);
     let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), &labels, &bookmarks);
     let cache_path = dir.path().join("links.json");
     let cache_str = cache_path.to_str().unwrap().to_string();
@@ -1262,33 +1320,48 @@ fn private_enrichment_never_reaches_paid_prompts() {
     muse_done
         .recv_timeout(Duration::from_secs(15))
         .expect("muse got exactly 1 call");
-    // The page is fetched (local use) but never appended: 0 enriched.
-    assert!(stdout.contains("0 enriched"), "{stdout}");
+    assert!(stdout.contains("1 enriched"), "{stdout}");
     assert_eq!(link_hits(&link_seen), 1);
+    // Both paid prompts carry the linked-page text ...
     let jev_body = jev_seen.lock().expect("jev seen");
     assert_eq!(jev_body.len(), 1);
     assert!(
-        !jev_body[0].contains("ZestfulQuokkaStretch"),
+        jev_body[0].contains("ZestfulQuokkaStretch"),
         "{}",
         jev_body[0]
     );
     assert!(
-        !jev_body[0].contains("Linked/Media context:"),
+        jev_body[0].contains("Linked/Media context:"),
         "{}",
         jev_body[0]
     );
     let muse_body = muse_seen.lock().expect("muse seen");
     assert_eq!(muse_body.len(), 1);
     assert!(
-        !muse_body[0].contains("ZestfulQuokkaStretch"),
+        muse_body[0].contains("ZestfulQuokkaStretch"),
         "{}",
         muse_body[0]
     );
     assert!(
-        !muse_body[0].contains("Linked/Media context:"),
+        muse_body[0].contains("Linked/Media context:"),
         "{}",
         muse_body[0]
     );
+    // ... while the raw post URL never left the device.
+    assert!(
+        !jev_body[0].contains("https://example.invalid/guide"),
+        "raw URL leaked to jev: {}",
+        jev_body[0]
+    );
+    assert!(
+        !muse_body[0].contains("https://example.invalid/guide"),
+        "raw URL leaked to muse: {}",
+        muse_body[0]
+    );
+    let rows = read_out_rows(&out_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["predicted"], true);
+    assert_eq!(rows[0]["stage"], "muse");
 }
 
 /// Bookmark with one video attachment and no links: `--enrich` can only

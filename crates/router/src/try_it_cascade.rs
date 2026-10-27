@@ -7,7 +7,8 @@
 //! Stage 1 (rules) is an INPUT ([`RulesVerdict`]) because the router cannot
 //! depend on bookmarks-agent: `ConfidentYes` answers yes with no API call.
 //! Anything else goes through the paid/privacy gates — both clients present,
-//! both paid-allowed, [`Sensitivity::Sanitized`] — and then:
+//! both paid-allowed, [`DataClass::Public`](crate::data_class::DataClass) —
+//! and then:
 //!
 //! - Stage 2 (Jev): one `noul` question with the same try-it wording the eval
 //!   uses ([`TRY_IT_INSTRUCTIONS`]); `noul >=` threshold answers yes
@@ -24,10 +25,12 @@
 //! never fails, so one bad item (or a rate limit) never aborts a run;
 //! callers that must stop on HTTP 429 check
 //! [`CascadeDecision::is_rate_limited`].
+use crate::data_class::{check_egress, DataClass, Route};
 use crate::jev_client::JevClient;
 use crate::muse::MuseClient;
 use crate::topic_filter::excluded_topic;
-use crate::{RouterError, Sensitivity};
+use crate::RouterError;
+use ancientos_core::log::DecisionLog;
 
 /// Try-it definition shared by the Jev question and the Muse prompt. The eval
 /// crate's `bookmark_questions()` carries the same wording; the router cannot
@@ -228,12 +231,19 @@ impl<'a> Cascade<'a> {
     }
 
     /// Decide one item, updating `stats`. Never fails: see the module docs.
+    /// Content above [`DataClass::Public`] never reaches the hosted stages:
+    /// the refusal is logged as `router.egress_denied` (route `jev`, caller
+    /// `cascade`) when `log` is given, and the rules verdict is returned.
+    // The log is lent to two sequential hosted calls; each `as_deref_mut`
+    // reborrow is required (a move would not compile) despite the lint name.
+    #[allow(clippy::needless_option_as_deref)]
     pub fn decide(
         &self,
         text: &str,
-        sensitivity: Sensitivity,
+        class: DataClass,
         rules: RulesVerdict,
         stats: &mut CascadeStats,
+        mut log: Option<&mut DecisionLog>,
     ) -> CascadeDecision {
         // Stage 0: excluded topics are never try-it, with no API call —
         // before rules, so even a confident rules yes cannot tag them.
@@ -256,20 +266,29 @@ impl<'a> Cascade<'a> {
                 truncated: false,
             };
         }
-        // Gates: both clients present, both paid-allowed, sanitized only.
+        // Gates: both clients present, both paid-allowed, Public only.
         // Anything else falls back to the rules verdict (Unsure => no).
+        // A class refusal is logged (route jev: the first hosted stage that
+        // would have run) but still returns the rules verdict, never an error.
         let (Some(jev), Some(muse)) = (self.jev, self.muse) else {
             return rules_only(rules);
         };
         if !jev.allow_paid() || !muse.allow_paid() {
             return rules_only(rules);
         }
-        if sensitivity != Sensitivity::Sanitized {
+        if class > DataClass::Public {
+            let _ = check_egress(class, Route::Jev, "cascade", log);
             return rules_only(rules);
         }
         // Stage 2: Jev. Yes stops here; no falls through to Muse.
         stats.jev_calls += 1;
-        match jev.ask(Sensitivity::Sanitized, text, &try_it_questions()) {
+        match jev.ask_with_class(
+            class,
+            "cascade",
+            log.as_deref_mut(),
+            text,
+            &try_it_questions(),
+        ) {
             Ok(reply) => {
                 stats.jev_input_tokens += reply.input_tokens;
                 stats.jev_output_tokens += reply.output_tokens;
@@ -300,7 +319,7 @@ impl<'a> Cascade<'a> {
         // length-truncated reply keeps its finish reason and is flagged as
         // truncated instead of an ordinary Muse "no".
         stats.muse_calls += 1;
-        match muse.chat(&muse_prompt(text)) {
+        match muse.chat_with_class(class, "cascade", log.as_deref_mut(), &muse_prompt(text)) {
             Ok(reply) => match parse_muse_try_it(&reply.content) {
                 Some(answer) => {
                     if answer {
@@ -605,9 +624,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "try it",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::ConfidentYes,
             &mut stats,
+            None,
         );
         assert_eq!(
             d,
@@ -635,9 +655,10 @@ mod tests {
             let mut stats = zero_stats();
             let d = cascade.decide(
                 "x",
-                Sensitivity::Sanitized,
+                DataClass::Public,
                 RulesVerdict::Unsure,
                 &mut stats,
+                None,
             );
             assert!(!d.try_it);
             assert_eq!(d.stage, CascadeStage::Rules);
@@ -655,9 +676,10 @@ mod tests {
             let mut stats = zero_stats();
             let d = cascade.decide(
                 "x",
-                Sensitivity::Sanitized,
+                DataClass::Public,
                 RulesVerdict::Unsure,
                 &mut stats,
+                None,
             );
             assert!(!d.try_it);
             assert_eq!(d.stage, CascadeStage::Rules);
@@ -667,26 +689,31 @@ mod tests {
     }
 
     #[test]
-    fn non_sanitized_is_rules_only_with_zero_calls() {
+    fn non_public_is_rules_only_with_zero_calls() {
         let jev = jev_client(closed_url(), true);
         let muse = muse_client(closed_url(), true);
         let cascade = Cascade::new(Some(&jev), Some(&muse));
-        // Unknown counts as sensitive: fail closed to rules.
-        for s in [Sensitivity::Sensitive, Sensitivity::Unknown] {
+        // Anything above Public fails closed to rules with zero calls.
+        for class in [
+            DataClass::Internal,
+            DataClass::Confidential,
+            DataClass::Restricted,
+        ] {
             let mut stats = zero_stats();
-            let d = cascade.decide("private", s, RulesVerdict::Unsure, &mut stats);
-            assert!(!d.try_it, "sensitivity {s:?}");
+            let d = cascade.decide("private", class, RulesVerdict::Unsure, &mut stats, None);
+            assert!(!d.try_it, "class {class:?}");
             assert_eq!(d.stage, CascadeStage::Rules);
             assert_eq!(d.error, None);
-            assert_eq!(stats, zero_stats(), "sensitivity {s:?}");
+            assert_eq!(stats, zero_stats(), "class {class:?}");
         }
         // Confident rules still answer yes without touching the network.
         let mut stats = zero_stats();
         let d = cascade.decide(
             "private",
-            Sensitivity::Sensitive,
+            DataClass::Confidential,
             RulesVerdict::ConfidentYes,
             &mut stats,
+            None,
         );
         assert!(d.try_it);
         assert_eq!(d.stage, CascadeStage::Rules);
@@ -704,9 +731,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "stretch now",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         assert!(d.try_it);
@@ -745,9 +773,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         assert_eq!((d.try_it, d.stage), (true, CascadeStage::Jev));
@@ -768,9 +797,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         muse_handle.join().expect("server thread");
@@ -801,9 +831,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         muse_handle.join().expect("server thread");
@@ -818,9 +849,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         assert_eq!((d.try_it, d.stage), (true, CascadeStage::Jev));
@@ -870,9 +902,10 @@ mod tests {
             let mut stats = zero_stats();
             let d = cascade.decide(
                 "news blip",
-                Sensitivity::Sanitized,
+                DataClass::Public,
                 RulesVerdict::Unsure,
                 &mut stats,
+                None,
             );
             jev_handle.join().expect("server thread");
             muse_handle.join().expect("server thread");
@@ -913,9 +946,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         assert!(!d.try_it);
@@ -940,9 +974,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         assert!(!d.try_it);
@@ -966,9 +1001,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         muse_handle.join().expect("server thread");
@@ -996,9 +1032,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         muse_handle.join().expect("server thread");
@@ -1025,9 +1062,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         muse_handle.join().expect("server thread");
@@ -1061,9 +1099,10 @@ mod tests {
             let mut stats = zero_stats();
             let d = cascade.decide(
                 "x",
-                Sensitivity::Sanitized,
+                DataClass::Public,
                 RulesVerdict::Unsure,
                 &mut stats,
+                None,
             );
             jev_handle.join().expect("server thread");
             muse_handle.join().expect("server thread");
@@ -1088,9 +1127,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         assert_eq!(d.stage, CascadeStage::FailClosed);
@@ -1100,9 +1140,10 @@ mod tests {
         // The same cascade keeps working: rules decide without the network.
         let d2 = cascade.decide(
             "y",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::ConfidentYes,
             &mut stats,
+            None,
         );
         assert_eq!((d2.try_it, d2.stage), (true, CascadeStage::Rules));
         assert!(!d2.is_rate_limited());
@@ -1117,9 +1158,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "x",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         muse_handle.join().expect("server thread");
@@ -1221,7 +1263,7 @@ mod tests {
             "Try this Hermes Agent quickstart today",
         ] {
             for rules in [RulesVerdict::Unsure, RulesVerdict::ConfidentYes] {
-                let d = cascade.decide(text, Sensitivity::Sanitized, rules, &mut stats);
+                let d = cascade.decide(text, DataClass::Public, rules, &mut stats, None);
                 assert_eq!(
                     d,
                     CascadeDecision {
@@ -1264,9 +1306,10 @@ mod tests {
         let mut stats = zero_stats();
         let d = cascade.decide(
             "Hermes bag review",
-            Sensitivity::Sanitized,
+            DataClass::Public,
             RulesVerdict::Unsure,
             &mut stats,
+            None,
         );
         jev_handle.join().expect("server thread");
         assert_eq!((d.try_it, d.stage), (true, CascadeStage::Jev));
@@ -1284,5 +1327,125 @@ mod tests {
         assert_eq!(CascadeStage::Muse.to_string(), "muse");
         assert!(RulesVerdict::ConfidentYes.answer());
         assert!(!RulesVerdict::Unsure.answer());
+    }
+
+    #[test]
+    fn non_public_logs_denied_with_zero_mock_requests() {
+        // Live mock servers that must see no request. They block on accept,
+        // so they are left unjoined (no request arrives).
+        let (jev_url, jev_seen, _jev_handle) = mock_server(200, &jev_noul_body(0.9));
+        let (muse_url, muse_seen, _muse_handle) = mock_server(200, &muse_body("{\"try_it\":true}"));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        for class in [
+            DataClass::Internal,
+            DataClass::Confidential,
+            DataClass::Restricted,
+        ] {
+            let mut stats = zero_stats();
+            let d = cascade.decide(
+                "canary private",
+                class,
+                RulesVerdict::Unsure,
+                &mut stats,
+                Some(&mut log),
+            );
+            assert!(!d.try_it, "class {class:?}");
+            assert_eq!(d.stage, CascadeStage::Rules);
+            assert_eq!(stats, zero_stats(), "class {class:?}");
+        }
+        assert!(
+            jev_seen.lock().expect("seen lock").is_empty(),
+            "jev must see no request"
+        );
+        assert!(
+            muse_seen.lock().expect("seen lock").is_empty(),
+            "muse must see no request"
+        );
+        // One denied entry per refusal: the cascade's first hosted stage.
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 3);
+        for (e, class) in entries
+            .iter()
+            .zip(["internal", "confidential", "restricted"])
+        {
+            assert_eq!(e.kind, crate::data_class::EGRESS_DENIED_KIND);
+            assert_eq!(e.payload["class"], class);
+            assert_eq!(e.payload["route"], "jev");
+            assert_eq!(e.payload["caller"], "cascade");
+            let raw = serde_json::to_string(&e.payload).unwrap();
+            assert!(!raw.contains("canary"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn public_stages_log_allowed_entries() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[
+            ("META_API_KEY", Some("test-key")),
+            ("TYPESAFE_API_KEY", Some("test-key")),
+        ]);
+        // Jev says no, Muse says yes: the muse stage logs one allowed entry
+        // (the LocalJev test client itself never logs: local, not egress).
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
+        let (muse_url, muse_seen, muse_handle) = mock_server(200, &muse_body("{\"try_it\":true}"));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "public post",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            Some(&mut log),
+        );
+        jev_handle.join().expect("server thread");
+        muse_handle.join().expect("server thread");
+        assert_eq!((d.try_it, d.stage), (true, CascadeStage::Muse));
+        assert_eq!(muse_seen.lock().expect("seen lock").len(), 1);
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, crate::data_class::EGRESS_ALLOWED_KIND);
+        assert_eq!(entries[0].payload["class"], "public");
+        assert_eq!(entries[0].payload["route"], "muse_spark");
+    }
+
+    #[test]
+    fn typesafe_jev_stage_logs_allowed_entry() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("TYPESAFE_API_KEY", Some("test-key"))]);
+        // TypeSafe Jev answers yes: one allowed entry for route jev, and the
+        // closed muse URL proves stage 3 is never reached.
+        let (jev_url, jev_seen, jev_handle) = mock_server(200, &jev_noul_body(0.9));
+        let jev = JevClient::new(JevBackend::TypeSafe, jev_url, "test-jevo", true);
+        let muse = muse_client(closed_url(), true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "public post",
+            DataClass::Public,
+            RulesVerdict::Unsure,
+            &mut stats,
+            Some(&mut log),
+        );
+        jev_handle.join().expect("server thread");
+        assert_eq!((d.try_it, d.stage), (true, CascadeStage::Jev));
+        assert_eq!(jev_seen.lock().expect("seen lock").len(), 1);
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, crate::data_class::EGRESS_ALLOWED_KIND);
+        assert_eq!(entries[0].payload["class"], "public");
+        assert_eq!(entries[0].payload["route"], "jev");
     }
 }

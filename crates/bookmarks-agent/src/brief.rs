@@ -73,10 +73,16 @@ pub struct ModelReply {
     pub usage: Option<MuseUsage>,
 }
 
-/// The single model call the brief is allowed to make.
+/// The single model call the brief is allowed to make. `class` is the
+/// highest data class across the candidates' original texts; the client
+/// refuses anything above its route ceiling.
 pub trait BriefModel {
     fn model_id(&self) -> String;
-    fn call(&self, prompt: &str) -> Result<ModelReply, RouterError>;
+    fn call(
+        &self,
+        class: ancientos_router::data_class::DataClass,
+        prompt: &str,
+    ) -> Result<ModelReply, RouterError>;
 }
 
 /// Full-text hydrator: post ids -> post_id to full text. Called at most once
@@ -94,8 +100,12 @@ impl BriefModel for MuseClient {
         self.model().to_string()
     }
 
-    fn call(&self, prompt: &str) -> Result<ModelReply, RouterError> {
-        let resp = self.chat(prompt)?;
+    fn call(
+        &self,
+        class: ancientos_router::data_class::DataClass,
+        prompt: &str,
+    ) -> Result<ModelReply, RouterError> {
+        let resp = self.chat_with_class(class, "brief", None, prompt)?;
         let model = if resp.model.is_empty() {
             self.model().to_string()
         } else {
@@ -727,23 +737,33 @@ fn run_impl(
         return Err("no bookmarks to brief".to_string());
     }
 
-    // Only sanitized text may leave the device. The prompt is built from
-    // stored excerpts only; hydration happens after picks and is display only.
+    let stored: HashMap<&str, &Bookmark> = rows.iter().map(|b| (b.post_id.as_str(), b)).collect();
+    // Only Public content may leave the device, and only as sanitized
+    // excerpts: the prompt is built from stored excerpts only; hydration
+    // happens after picks and is display only. The class is the highest
+    // across the candidates' ORIGINAL texts (sanitized excerpts would hide
+    // emails and phones); a refusal falls back to local picks below.
     // `None` (local-only callers like the daemon) never calls a model.
+    let class = ancientos_router::data_class::max_of(candidates.iter().map(|c| {
+        stored
+            .get(c.post_id.as_str())
+            .map(|b| crate::translate::class_of(&b.text))
+            .unwrap_or(ancientos_router::data_class::DataClass::Restricted)
+    }));
     let dest = route(Sensitivity::Sanitized, false);
     let (resolved, model_id, usage, fallback) = match model {
-        Some(m) if dest == Destination::MuseSpark => match m.call(&build_prompt(&candidates)) {
-            Ok(reply) => {
-                let picks = parse_model_picks(&reply.content, candidates.len());
-                let resolved = resolve_model_picks(&candidates, &picks);
-                (resolved, reply.model, reply.usage, false)
+        Some(m) if dest == Destination::MuseSpark => {
+            match m.call(class, &build_prompt(&candidates)) {
+                Ok(reply) => {
+                    let picks = parse_model_picks(&reply.content, candidates.len());
+                    let resolved = resolve_model_picks(&candidates, &picks);
+                    (resolved, reply.model, reply.usage, false)
+                }
+                Err(_) => (local_picks(&candidates), "local".to_string(), None, true),
             }
-            Err(_) => (local_picks(&candidates), "local".to_string(), None, true),
-        },
+        }
         _ => (local_picks(&candidates), "local".to_string(), None, true),
     };
-
-    let stored: HashMap<&str, &Bookmark> = rows.iter().map(|b| (b.post_id.as_str(), b)).collect();
     let mut gate = Gate::new();
     gate.register(BRIEF_ACTION, Risk::Low);
     let mut evaluated: Vec<(BriefPick, Verdict, String)> = Vec::new();
@@ -867,7 +887,11 @@ fn run_impl(
             if crate::language::is_english(&tmp) {
                 continue;
             }
-            p.translation = Some(crate::translate::translate_with_env(&tmp, &mut tcache));
+            p.translation = Some(crate::translate::translate_with_env(
+                &tmp,
+                &mut tcache,
+                None,
+            ));
             // Display the translation of the final (hydrated/expanded) text;
             // the original below stays the pick's full text.
             if let Some(t) = p.translation.as_mut() {
@@ -1023,7 +1047,11 @@ mod tests {
             self.model.clone()
         }
 
-        fn call(&self, prompt: &str) -> Result<ModelReply, RouterError> {
+        fn call(
+            &self,
+            _class: ancientos_router::data_class::DataClass,
+            prompt: &str,
+        ) -> Result<ModelReply, RouterError> {
             self.seen.borrow_mut().push(prompt.to_string());
             match &self.content {
                 Some(c) => Ok(ModelReply {
@@ -1237,6 +1265,61 @@ mod tests {
         let log = DecisionLog::open(&log_path).unwrap();
         let entries = log.verify().unwrap();
         assert_eq!(entries[1].payload["fallback"], true);
+    }
+
+    #[test]
+    fn run_falls_back_when_candidates_are_not_public() {
+        use ancientos_router::data_class::{check_egress, DataClass, Route};
+        // A model that enforces the ceiling like the real Muse client: the
+        // call refuses before recording anything.
+        struct EnforcingModel {
+            seen: RefCell<Vec<String>>,
+        }
+        impl BriefModel for EnforcingModel {
+            fn model_id(&self) -> String {
+                "enforcing".to_string()
+            }
+            fn call(&self, class: DataClass, prompt: &str) -> Result<ModelReply, RouterError> {
+                check_egress(class, Route::MuseSpark, "test", None)?;
+                self.seen.borrow_mut().push(prompt.to_string());
+                Ok(ModelReply {
+                    content: "[1]".into(),
+                    model: "enforcing".into(),
+                    usage: None,
+                })
+            }
+        }
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
+        // One candidate carries an email: the whole brief stays local, and
+        // the picks still surface via the local fallback.
+        let mut rows: Vec<Bookmark> = (0..6)
+            .map(|i| bm(&format!("id{i}"), None, Some("TopicB"), None))
+            .collect();
+        rows[1].text = "synthetic mail quokka@example.invalid now".into();
+        let merged = merged_of(rows, &["id0", "id1", "id2", "id3", "id4", "id5"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("decision_log.jsonl");
+        let model = EnforcingModel {
+            seen: RefCell::new(Vec::new()),
+        };
+        let res = run(&merged, &model, &log_path, "2026-10-26").unwrap();
+        assert!(res.fallback);
+        assert_eq!(res.model, "local");
+        assert!(model.seen.borrow().is_empty(), "model must not be called");
+        assert_eq!(res.picks.len(), 5);
+        // And public candidates still reach the model.
+        let rows: Vec<Bookmark> = (0..6)
+            .map(|i| bm(&format!("id{i}"), None, Some("TopicB"), None))
+            .collect();
+        let merged = merged_of(rows, &["id0", "id1", "id2", "id3", "id4", "id5"]);
+        let log_path2 = dir.path().join("decision_log2.jsonl");
+        let model = EnforcingModel {
+            seen: RefCell::new(Vec::new()),
+        };
+        let res = run(&merged, &model, &log_path2, "2026-10-26").unwrap();
+        assert!(!res.fallback);
+        assert_eq!(model.seen.borrow().len(), 1);
     }
 
     #[test]
