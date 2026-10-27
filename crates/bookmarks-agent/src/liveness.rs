@@ -181,11 +181,6 @@ pub fn should_skip(explicit_offline: bool) -> bool {
     !std::env::var("ANCIENTOS_ALLOW_PAID").is_ok_and(|v| v == "1")
 }
 
-/// Current unix seconds (0 when the clock cannot be read; 0 forces expiry).
-pub fn now_secs() -> u64 {
-    crate::idea_card::now_secs()
-}
-
 /// Check `ids` with `lookup`, reusing the 24h disk cache. Batches of at
 /// most [`MAX_BATCH`] ids per request. Offline/paid-off skips
 /// deterministically (all live, no network, no cache writes). A lookup

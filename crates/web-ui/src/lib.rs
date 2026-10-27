@@ -159,7 +159,7 @@ impl State {
             &state.bookmarks,
             &state.liveness_cache_path(),
             offline,
-            bookmarks_agent::liveness::now_secs(),
+            now_secs(),
         )?;
         Ok(Self {
             data_dir: dir,
@@ -738,7 +738,7 @@ fn do_vote(state: &State, body: &[u8]) -> Response {
 
 fn page_ideas(state: &State) -> Response {
     use bookmarks_agent::idea_card::list_due_for_triage;
-    let now = bookmarks_agent::idea_card::now_secs();
+    let now = now_secs();
     let cards = match list_due_for_triage(&state.cards_path(), now) {
         Ok(c) => c,
         Err(e) => return Response::status(500, error_page("Ideas failed", &e, state)),
@@ -799,7 +799,7 @@ fn do_triage(state: &State, body: &[u8]) -> Response {
     if id.trim().is_empty() {
         return Response::status(400, error_page("Bad triage", "Missing id.", state));
     }
-    let now = bookmarks_agent::idea_card::now_secs();
+    let now = now_secs();
     match bookmarks_agent::idea_card::triage(
         &state.cards_path(),
         &state.backlog_path(),
@@ -850,7 +850,7 @@ fn page_try(state: &State) -> Response {
     // same way. Pending posts are never hidden for language: non-English
     // posts show their cached translation plus the original.
     let cache = bookmarks_agent::liveness::load_cache(&state.liveness_cache_path());
-    let now = bookmarks_agent::liveness::now_secs();
+    let now = now_secs();
     let hidden = hidden_authors_of(state);
     let pending: Vec<&String> = pending
         .iter()
@@ -3220,7 +3220,7 @@ mod tests {
         let body = rows.join("\n") + "\n";
         std::fs::write(dir.path().join("store.jsonl"), &body).unwrap();
         // Fresh cache for every id: no lookup runs, so no network is possible.
-        let now = bookmarks_agent::liveness::now_secs();
+        let now = now_secs();
         seed_cache(
             dir.path(),
             &[
@@ -3273,7 +3273,7 @@ mod tests {
         bookmarks_agent::try_it::record_shown(&mut log, "dead1", 1_700_000_000).unwrap();
         bookmarks_agent::try_it::record_shown(&mut log, "live1", 1_700_000_000).unwrap();
         drop(log);
-        let now = bookmarks_agent::liveness::now_secs();
+        let now = now_secs();
         seed_cache(
             dir.path(),
             &[("dead1", "unavailable", Some("deleted"), now)],

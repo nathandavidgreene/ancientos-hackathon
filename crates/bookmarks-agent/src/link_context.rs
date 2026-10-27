@@ -46,6 +46,7 @@
 //! a recorded reason in [`Enrichment::notes`]. [`enrich`] never panics and
 //! never blocks the decision.
 use crate::fixture::Bookmark;
+use crate::sanitize::{collapse_whitespace, truncate_chars};
 use ancientos_router::data_class::{max_of, DataClass};
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -691,18 +692,6 @@ pub fn fetch_caption(url: &str, timeout: Duration) -> Result<String, String> {
     Ok(clean)
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
-    text.chars()
-        .take(max)
-        .collect::<String>()
-        .trim_end()
-        .to_string()
-}
-
-fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn find_bytes(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || from >= haystack.len() {
         return None;
@@ -1135,7 +1124,7 @@ pub fn enrich(b: &Bookmark, cache: &mut HashMap<String, CacheEntry>) -> Enrichme
     enrich_at(
         b,
         cache,
-        crate::liveness::now_secs(),
+        crate::idea_card::now_secs(),
         Duration::from_secs(TIMEOUT_SECS),
     )
 }

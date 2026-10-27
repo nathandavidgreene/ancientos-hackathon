@@ -136,11 +136,11 @@ fn strip_phones(text: &str) -> String {
     out
 }
 
-fn collapse_whitespace(text: &str) -> String {
+pub(crate) fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     let out: String = text.chars().take(max).collect();
     out.trim_end().to_string()
 }

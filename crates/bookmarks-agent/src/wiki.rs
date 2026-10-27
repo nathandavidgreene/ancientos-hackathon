@@ -30,6 +30,7 @@
 //! ([`Risk::High`](ancientos_core::gate::Risk)); findings are never
 //! auto-applied.
 
+use crate::sanitize::truncate_chars;
 use ancientos_router::data_class::{check_egress, max_of, DataClass, Route};
 use ancientos_router::local_llm::LocalLlmClient;
 use ancientos_router::muse::MuseClient;
@@ -143,15 +144,6 @@ pub fn slugify(title: &str) -> String {
 /// Collapse whitespace (including newlines) to one line, trimmed.
 pub fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Truncate to `max` chars (no ellipsis: byte-stable for logs and pages).
-pub fn truncate_chars(s: &str, max: usize) -> String {
-    s.chars()
-        .take(max)
-        .collect::<String>()
-        .trim_end()
-        .to_string()
 }
 
 fn ensure_wiki_dirs(wiki: &Path) -> Result<(), String> {
