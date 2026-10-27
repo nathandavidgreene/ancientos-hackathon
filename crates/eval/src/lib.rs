@@ -336,7 +336,7 @@ pub fn bookmark_questions() -> serde_json::Value {
         .map(|c| (c.to_string(), serde_json::Value::String(String::new())))
         .collect();
     serde_json::json!({
-        "try_it": {"type": "noul", "instructions": "This X bookmark is hands-on practice the reader could physically try now with actionable steps (exercise, stretch, breathing, meditation, recipe, concrete routine, a tool walkthrough with steps). Not general advice lists, news, or hype."},
+        "try_it": {"type": "noul", "instructions": "This X bookmark is try-it the reader would act on: hands-on practice to try now with actionable steps (exercise, stretch, breathing, meditation, recipe, concrete routine, tool walkthrough); research for the reader's personal AI OS project (AncientOS) to learn from to build their agent system better (how LLMs, agents and harnesses work, architecture write-ups, popular or growing GitHub repos worth reviewing for ideas); something to hand off to an agent or bot to review or explore (a repo, a list of tools or APIs, a course, a long thread); or learning content whose actionable thing is in the linked page or video (a tutorial, a tool to install, shortcuts to learn). Not news, hype, opinion, drama, general advice lists, or things the reader already uses."},
         "worth_resurfacing": {"type": "noul", "instructions": "This X bookmark has durable substantive value (insight, how-to, reference). False for jokes, hype, news blips, low-content."},
         "category": {"type": "choice", "instructions": "Topic category of this X bookmark for a personal-knowledge app.", "criteria": cats}
     })
@@ -682,10 +682,13 @@ mod tests {
         // question duplicates this wording; the two must stay identical.
         let q = bookmark_questions();
         assert_eq!(q["try_it"]["type"], "noul");
+        let instructions = q["try_it"]["instructions"].as_str().unwrap();
         assert_eq!(
-            q["try_it"]["instructions"].as_str().unwrap(),
+            instructions,
             ancientos_router::try_it_cascade::TRY_IT_INSTRUCTIONS
         );
+        assert!(instructions.contains("personal AI OS project (AncientOS)"));
+        assert!(instructions.contains("hand off"));
     }
 
     #[test]

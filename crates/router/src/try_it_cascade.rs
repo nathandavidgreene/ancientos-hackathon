@@ -33,7 +33,7 @@ use crate::{RouterError, Sensitivity};
 /// crate's `bookmark_questions()` carries the same wording; the router cannot
 /// depend on the eval crate, so the string lives here and an eval test asserts
 /// the two match.
-pub const TRY_IT_INSTRUCTIONS: &str = "This X bookmark is hands-on practice the reader could physically try now with actionable steps (exercise, stretch, breathing, meditation, recipe, concrete routine, a tool walkthrough with steps). Not general advice lists, news, or hype.";
+pub const TRY_IT_INSTRUCTIONS: &str = "This X bookmark is try-it the reader would act on: hands-on practice to try now with actionable steps (exercise, stretch, breathing, meditation, recipe, concrete routine, tool walkthrough); research for the reader's personal AI OS project (AncientOS) to learn from to build their agent system better (how LLMs, agents and harnesses work, architecture write-ups, popular or growing GitHub repos worth reviewing for ideas); something to hand off to an agent or bot to review or explore (a repo, a list of tools or APIs, a course, a long thread); or learning content whose actionable thing is in the linked page or video (a tutorial, a tool to install, shortcuts to learn). Not news, hype, opinion, drama, general advice lists, or things the reader already uses.";
 
 /// Default Jev `noul` threshold: `>= 0.3` answers yes. Tuned against real
 /// labels for recall; override per cascade with
@@ -381,10 +381,14 @@ pub fn try_it_questions() -> serde_json::Value {
     serde_json::json!({"try_it": {"type": "noul", "instructions": TRY_IT_INSTRUCTIONS}})
 }
 
-/// Stage 3 prompt: strict JSON with the same try-it definition.
+/// Stage 3 prompt: strict JSON with the same try-it definition. The lead
+/// sentence states the yes signals explicitly; the full definition follows.
 pub fn muse_prompt(text: &str) -> String {
     format!(
-        "Decide whether this X bookmark is hands-on content the reader could physically try now. \
+        "Decide whether this X bookmark is try-it for the reader: hands-on practice to try now, \
+         research for the reader's personal AI OS project (AncientOS), \
+         something to hand off to an agent or bot to review or explore, \
+         or learning content whose actionable thing is in the linked page or video. \
          Definition: {TRY_IT_INSTRUCTIONS} \
          Reply with strict JSON {{\"try_it\":true}} or {{\"try_it\":false}} and nothing else.\n\nBookmark text: {text}"
     )
@@ -722,6 +726,12 @@ mod tests {
             sent["questions"]["try_it"]["instructions"],
             TRY_IT_INSTRUCTIONS
         );
+        // The broadened definition carries the research and hand-off signals.
+        let instructions = sent["questions"]["try_it"]["instructions"]
+            .as_str()
+            .expect("instructions is a string");
+        assert!(instructions.contains("personal AI OS project (AncientOS)"));
+        assert!(instructions.contains("hand off"));
     }
 
     #[test]
@@ -1126,9 +1136,43 @@ mod tests {
         assert!(prompt.contains("{\"try_it\":true}"));
         assert!(prompt.contains("{\"try_it\":false}"));
         assert!(prompt.contains("do 10 push-ups"));
+        // Yes signals are stated explicitly in the prompt.
+        assert!(prompt.contains("personal AI OS project (AncientOS)"));
+        assert!(prompt.contains("hand off"));
+        assert!(prompt.contains("linked page or video"));
         let questions = try_it_questions();
         assert_eq!(questions["try_it"]["type"], "noul");
         assert_eq!(questions["try_it"]["instructions"], TRY_IT_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn try_it_instructions_cover_broadened_signals() {
+        // One paragraph, concise enough for a Jev noul question.
+        assert!(!TRY_IT_INSTRUCTIONS.contains('\n'));
+        assert!(
+            TRY_IT_INSTRUCTIONS.len() < 900,
+            "length {}",
+            TRY_IT_INSTRUCTIONS.len()
+        );
+        // Yes signals: hands-on practice, AncientOS research, agent hand-off,
+        // and learning content whose payoff is in the linked page or video.
+        assert!(TRY_IT_INSTRUCTIONS.contains("hands-on practice"));
+        assert!(TRY_IT_INSTRUCTIONS.contains("personal AI OS project (AncientOS)"));
+        assert!(TRY_IT_INSTRUCTIONS.contains("hand off"));
+        assert!(TRY_IT_INSTRUCTIONS.contains("agent or bot"));
+        assert!(TRY_IT_INSTRUCTIONS.contains("linked page or video"));
+        // Still not try-it: news, hype, opinion, drama, advice lists, and
+        // things the reader already uses.
+        for no in [
+            "news",
+            "hype",
+            "opinion",
+            "drama",
+            "general advice lists",
+            "already uses",
+        ] {
+            assert!(TRY_IT_INSTRUCTIONS.contains(no), "missing {no}");
+        }
     }
 
     #[test]
