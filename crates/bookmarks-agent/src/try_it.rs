@@ -127,7 +127,15 @@ pub fn classify_text(topic: &str, text: &str) -> Option<TryItTag> {
 ///   carries a strong practice cue or a hands-on action verb.
 ///
 /// Structural cues (lists, durations, lone imperatives) never tag alone.
+///
+/// Posts about excluded topics (see `ancientos_router::topic_filter`: the
+/// reader has moved past those ecosystems) are never tagged, no matter how
+/// many cues fire. This only withholds the tag; the post still appears in
+/// briefs.
 pub fn classify_with_media(topic: &str, text: &str, has_video: bool) -> Option<TryItTag> {
+    if ancientos_router::topic_filter::excluded_topic(text).is_some() {
+        return None;
+    }
     let det = detect(text);
     let hands_on = topic_is_hands_on(topic);
     let strong = det.strong > 0;
@@ -1807,6 +1815,97 @@ mod tests {
             assert!(!is_try_it(&b), "should not tag: {text}");
             assert!(classify(&b).is_none());
         }
+    }
+
+    #[test]
+    fn excluded_topics_are_never_tagged() {
+        // Each pair: the same hands-on post without and with the topic
+        // mention. The bare post tags (proving the cues fire); the topic
+        // mention withholds the tag through every classifier entry point.
+        let pairs = [
+            (
+                "[synthetic] Desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
+                "[synthetic] OpenClaw desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
+            ),
+            (
+                "[synthetic] Box breathing: inhale 4s, hold 4s, exhale 4s, hold 4s. Repeat 4 rounds.",
+                "[synthetic] Box breathing with the Hermes Agent: inhale 4s, hold 4s, exhale 4s, hold 4s. Repeat 4 rounds.",
+            ),
+            (
+                "[synthetic] Workout: 3 sets of 10 push-ups. Rest 60s between sets.",
+                "[synthetic] Clawdbot workout: 3 sets of 10 push-ups. Rest 60s between sets.",
+            ),
+            (
+                "[synthetic] Morning mobility: touch your toes and hold for 20 seconds, then repeat 3 times.",
+                "[synthetic] Morning mobility via nousresearch/hermes: touch your toes and hold for 20 seconds, then repeat 3 times.",
+            ),
+        ];
+        for (i, (plain, excluded)) in pairs.into_iter().enumerate() {
+            let topic = "Health & Wellness";
+            assert!(
+                classify_text(topic, plain).is_some(),
+                "bare post must tag: {plain}"
+            );
+            assert!(
+                classify_text(topic, excluded).is_none(),
+                "excluded post must not tag: {excluded}"
+            );
+            assert!(
+                classify_with_media(topic, excluded, true).is_none(),
+                "video must not override the filter: {excluded}"
+            );
+            assert!(
+                !rules_confident(topic, excluded),
+                "rules must not be confident: {excluded}"
+            );
+            let b = bm(&format!("ex{i}"), excluded, Some(topic));
+            assert!(!is_try_it(&b), "bookmark must not tag: {excluded}");
+            assert!(classify(&b).is_none());
+        }
+    }
+
+    #[test]
+    fn near_miss_topics_still_tag() {
+        // Bare "Hermes" and "clawback" are not excluded topics: hands-on
+        // posts mentioning them keep their tags.
+        let texts = [
+            "[synthetic] Hermes desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
+            "[synthetic] Clawback stretch routine: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
+        ];
+        for text in texts {
+            assert!(
+                classify_text("Health & Wellness", text).is_some(),
+                "near miss must still tag: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_topic_post_still_appears_in_brief_untagged() {
+        // The filter withholds the [TRY IT] marker only; the post itself
+        // is still rendered in the brief.
+        let text = "[synthetic] OpenClaw desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.";
+        let picks = vec![crate::brief::BriefPick {
+            index: 0,
+            post_id: "ex-brief".to_string(),
+            author: Some("syn_ex".to_string()),
+            url: "https://x.com/i/status/ex-brief".to_string(),
+            topic: "Health & Wellness".to_string(),
+            why: "synthetic pick".to_string(),
+            full_text: text.to_string(),
+            media: Vec::new(),
+            translation: None,
+        }];
+        let counts = crate::merge::MergeCounts {
+            live: 1,
+            fixture: 0,
+            overlap: 0,
+            total: 1,
+            high_confidence: 1,
+        };
+        let md = crate::brief::render_markdown("2026-10-26", &picks, &counts, "synthetic", None);
+        assert!(md.contains("roll shoulders"), "{md}");
+        assert!(!md.contains("[TRY IT]"), "{md}");
     }
 
     #[test]

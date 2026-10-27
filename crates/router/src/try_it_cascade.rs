@@ -1,5 +1,9 @@
 //! "Try it" cascade: cheap rules first, then Jev, then Muse Spark.
 //!
+//! Stage 0 (topic filter) runs before everything: posts about ecosystems the
+//! reader has moved past (see [`crate::topic_filter`]) answer no with no API
+//! call, even when the rules verdict is `ConfidentYes`.
+//!
 //! Stage 1 (rules) is an INPUT ([`RulesVerdict`]) because the router cannot
 //! depend on bookmarks-agent: `ConfidentYes` answers yes with no API call.
 //! Anything else goes through the paid/privacy gates — both clients present,
@@ -21,6 +25,7 @@
 //! [`CascadeDecision::is_rate_limited`].
 use crate::jev_client::JevClient;
 use crate::muse::MuseClient;
+use crate::topic_filter::excluded_topic;
 use crate::{RouterError, Sensitivity};
 
 /// Try-it definition shared by the Jev question and the Muse prompt. The eval
@@ -59,6 +64,8 @@ impl RulesVerdict {
 /// Which stage produced a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CascadeStage {
+    /// Stage 0: excluded topic (reader moved past it): always no, no call.
+    TopicFilter,
     /// Rules alone (confident yes, or gates off: unpaid, non-sanitized,
     /// or a client missing).
     Rules,
@@ -74,6 +81,7 @@ impl CascadeStage {
     /// Stable lowercase name for logs and JSONL output.
     pub fn as_str(self) -> &'static str {
         match self {
+            CascadeStage::TopicFilter => "topic_filter",
             CascadeStage::Rules => "rules",
             CascadeStage::Jev => "jev",
             CascadeStage::Muse => "muse",
@@ -151,8 +159,10 @@ mod status_tests {
 /// token counts record successful Jev replies only. `muse_truncated` counts
 /// the Muse calls that failed closed on a length truncation; those calls
 /// are also counted in `muse_calls`, `fail_closed`, and `errors`.
+/// `topic_filtered` counts stage-0 answers (never try-it, never a call).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadeStats {
+    pub topic_filtered: u64,
     pub rules_yes: u64,
     pub jev_calls: u64,
     pub jev_yes: u64,
@@ -186,6 +196,17 @@ impl<'a> Cascade<'a> {
         rules: RulesVerdict,
         stats: &mut CascadeStats,
     ) -> CascadeDecision {
+        // Stage 0: excluded topics are never try-it, with no API call —
+        // before rules, so even a confident rules yes cannot tag them.
+        if excluded_topic(text).is_some() {
+            stats.topic_filtered += 1;
+            return CascadeDecision {
+                try_it: false,
+                stage: CascadeStage::TopicFilter,
+                error: None,
+                truncated: false,
+            };
+        }
         // Stage 1: confident rules answer yes with no API call.
         if rules == RulesVerdict::ConfidentYes {
             stats.rules_yes += 1;
@@ -1000,7 +1021,77 @@ mod tests {
     }
 
     #[test]
+    fn excluded_topic_answers_no_with_zero_calls() {
+        // Live mock servers that must see no request: both backends paid
+        // and available, yet stage 0 answers before any call. The servers
+        // block on accept, so they are left unjoined (no request arrives).
+        let (jev_url, jev_seen, _jev_handle) = mock_server(200, &jev_noul_body(0.9));
+        let (muse_url, muse_seen, _muse_handle) = mock_server(200, &muse_body("{\"try_it\":true}"));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(muse_url, true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let mut stats = zero_stats();
+        for text in [
+            "OpenClaw setup you can try now: 1) install 2) run it",
+            "Try this Hermes Agent quickstart today",
+        ] {
+            for rules in [RulesVerdict::Unsure, RulesVerdict::ConfidentYes] {
+                let d = cascade.decide(text, Sensitivity::Sanitized, rules, &mut stats);
+                assert_eq!(
+                    d,
+                    CascadeDecision {
+                        try_it: false,
+                        stage: CascadeStage::TopicFilter,
+                        error: None,
+                        truncated: false,
+                    },
+                    "text {text:?} rules {rules:?}"
+                );
+                assert!(!d.is_rate_limited());
+            }
+        }
+        assert_eq!(stats.topic_filtered, 4);
+        assert_eq!(stats.jev_calls, 0);
+        assert_eq!(stats.muse_calls, 0);
+        assert_eq!(stats.rules_yes, 0);
+        assert_eq!(stats.fail_closed, 0);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.jev_input_tokens, 0);
+        assert_eq!(stats.jev_output_tokens, 0);
+        assert!(
+            jev_seen.lock().expect("seen lock").is_empty(),
+            "jev must see no request"
+        );
+        assert!(
+            muse_seen.lock().expect("seen lock").is_empty(),
+            "muse must see no request"
+        );
+    }
+
+    #[test]
+    fn non_excluded_topics_reach_later_stages() {
+        // Bare "Hermes" is not an excluded topic: the cascade proceeds
+        // (here, Jev answers yes).
+        let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.9));
+        let jev = jev_client(jev_url, true);
+        let muse = muse_client(closed_url(), true);
+        let cascade = Cascade::new(Some(&jev), Some(&muse));
+        let mut stats = zero_stats();
+        let d = cascade.decide(
+            "Hermes bag review",
+            Sensitivity::Sanitized,
+            RulesVerdict::Unsure,
+            &mut stats,
+        );
+        jev_handle.join().expect("server thread");
+        assert_eq!((d.try_it, d.stage), (true, CascadeStage::Jev));
+        assert_eq!(stats.topic_filtered, 0);
+        assert_eq!(stats.jev_calls, 1);
+    }
+
+    #[test]
     fn stage_names_are_stable() {
+        assert_eq!(CascadeStage::TopicFilter.as_str(), "topic_filter");
         assert_eq!(CascadeStage::Rules.as_str(), "rules");
         assert_eq!(CascadeStage::Jev.as_str(), "jev");
         assert_eq!(CascadeStage::Muse.as_str(), "muse");

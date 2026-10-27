@@ -9,6 +9,7 @@ pub mod jev_client;
 pub mod local_llm;
 pub mod modal;
 pub mod muse;
+pub mod topic_filter;
 pub mod try_it_cascade;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

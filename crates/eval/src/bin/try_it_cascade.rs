@@ -346,13 +346,14 @@ fn run(args: &Args) -> Result<(), String> {
         rules_prf.tn,
     );
     println!(
-        "calls: jev={} jev_yes={} muse={} muse_yes={} muse_truncated={} rules_yes={} fail_closed={} errors={}",
+        "calls: jev={} jev_yes={} muse={} muse_yes={} muse_truncated={} rules_yes={} topic_filtered={} fail_closed={} errors={}",
         stats.jev_calls,
         stats.jev_yes,
         stats.muse_calls,
         stats.muse_yes,
         stats.muse_truncated,
         stats.rules_yes,
+        stats.topic_filtered,
         stats.fail_closed,
         stats.errors,
     );

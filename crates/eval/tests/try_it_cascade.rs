@@ -280,7 +280,7 @@ fn full_cascade_through_all_stages() {
     );
     assert!(
         stdout.contains(
-            "calls: jev=2 jev_yes=0 muse=2 muse_yes=1 muse_truncated=0 rules_yes=1 fail_closed=0 errors=0"
+            "calls: jev=2 jev_yes=0 muse=2 muse_yes=1 muse_truncated=0 rules_yes=1 topic_filtered=0 fail_closed=0 errors=0"
         ),
         "{stdout}"
     );
@@ -324,6 +324,109 @@ fn full_cascade_through_all_stages() {
 }
 
 #[test]
+fn excluded_topic_is_filtered_before_any_call() {
+    // t1 mentions OpenClaw and would be rules-confident without stage 0;
+    // it must answer no with the topic_filter stage and trigger no call.
+    // t2 is an ordinary unsure item flowing through jev (no) to muse (yes).
+    let t1_text =
+        "Try it: OpenClaw shoulder routine 1) roll shoulders 10x 2) neck tilt 20s each side.";
+    assert!(
+        bookmarks_agent::try_it::rules_confident(
+            "Health & Wellness",
+            "Try it: shoulder routine 1) roll shoulders 10x 2) neck tilt 20s each side.",
+        ),
+        "premise: t1's cues would be rules-confident without the topic word"
+    );
+    let t2_text = "A tip. Roll your shoulders and hold for a moment.";
+    let (jev_url, jev_seen, jev_done) = mock_server(vec![(200, jev_noul_body(0.1))]);
+    let (muse_url, muse_seen, muse_done) = mock_server(vec![(200, muse_body("{\"try_it\":true}"))]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bookmarks = [
+        bookmark("t1", "Health & Wellness", t1_text),
+        bookmark("t2", "AI Agents", t2_text),
+    ]
+    .join("\n")
+        + "\n";
+    let labels = "{\"post_id\":\"t1\",\"try_it\":false}\n{\"post_id\":\"t2\",\"try_it\":true}\n";
+    let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), labels, &bookmarks);
+
+    let (ok, stdout, stderr) = run_bin(
+        &[
+            "--labels",
+            &labels_path,
+            "--bookmarks",
+            &bookmarks_path,
+            "--out",
+            &out_path,
+        ],
+        &[
+            ("JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_BASE_URL", &jev_url),
+            ("TYPESAFE_API_KEY", "test-key"),
+            ("META_API_BASE", &muse_url),
+            ("META_API_KEY", "test-key"),
+            ("ANCIENTOS_ALLOW_PAID", "1"),
+        ],
+        &[],
+    );
+    assert!(ok, "exit ok, stderr: {stderr}");
+    jev_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("jev got exactly 1 call");
+    muse_done
+        .recv_timeout(Duration::from_secs(15))
+        .expect("muse got exactly 1 call");
+
+    assert!(stdout.contains("2 decided"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "calls: jev=1 jev_yes=0 muse=1 muse_yes=1 muse_truncated=0 rules_yes=0 topic_filtered=1 fail_closed=0 errors=0"
+        ),
+        "{stdout}"
+    );
+    // Cascade is perfect; rules alone also say no on t1 (the local
+    // classifier filters it too) but miss t2.
+    assert!(
+        stdout.contains("cascade try_it: P=1.000 R=1.000 F1=1.000 (tp=1 fp=0 fn=0 tn=1)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("rules-only try_it: P=0.000 R=0.000 F1=0.000 (tp=0 fp=0 fn=1 tn=1)"),
+        "{stdout}"
+    );
+
+    let out = std::fs::read_to_string(&out_path).expect("read out");
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("out is jsonl"))
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["post_id"], "t1");
+    assert_eq!(rows[0]["predicted"], false);
+    assert_eq!(rows[0]["stage"], "topic_filter");
+    assert_eq!(rows[0]["truncated"], false);
+    assert_eq!(rows[1]["post_id"], "t2");
+    assert_eq!(rows[1]["predicted"], true);
+    assert_eq!(rows[1]["stage"], "muse");
+
+    // The single Jev/Muse calls are t2's; t1 triggered none.
+    let jev_seen = jev_seen.lock().expect("seen lock");
+    assert_eq!(jev_seen.len(), 1);
+    assert!(
+        jev_seen[0].contains("A tip. Roll your shoulders"),
+        "{}",
+        jev_seen[0]
+    );
+    let muse_seen = muse_seen.lock().expect("seen lock");
+    assert_eq!(muse_seen.len(), 1);
+    assert!(
+        muse_seen[0].contains("A tip. Roll your shoulders"),
+        "{}",
+        muse_seen[0]
+    );
+}
+
+#[test]
 fn paid_off_runs_rules_only_with_zero_calls() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (labels, bookmarks) = fixtures();
@@ -356,7 +459,7 @@ fn paid_off_runs_rules_only_with_zero_calls() {
     assert!(stdout.contains("rules only"), "{stdout}");
     assert!(
         stdout.contains(
-            "calls: jev=0 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 rules_yes=1 fail_closed=0 errors=0"
+            "calls: jev=0 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 rules_yes=1 topic_filtered=0 fail_closed=0 errors=0"
         ),
         "{stdout}"
     );
@@ -500,7 +603,7 @@ fn stops_on_rate_limit() {
     );
     assert!(
         stdout.contains(
-            "calls: jev=1 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 rules_yes=0 fail_closed=1 errors=1"
+            "calls: jev=1 jev_yes=0 muse=0 muse_yes=0 muse_truncated=0 rules_yes=0 topic_filtered=0 fail_closed=1 errors=1"
         ),
         "{stdout}"
     );
@@ -559,7 +662,7 @@ fn truncation_is_counted_separately_from_ordinary_no() {
     // counted separately, not as an ordinary Muse "no".
     assert!(
         stdout.contains(
-            "calls: jev=2 jev_yes=0 muse=2 muse_yes=0 muse_truncated=1 rules_yes=1 fail_closed=1 errors=1"
+            "calls: jev=2 jev_yes=0 muse=2 muse_yes=0 muse_truncated=1 rules_yes=1 topic_filtered=0 fail_closed=1 errors=1"
         ),
         "{stdout}"
     );
