@@ -469,22 +469,47 @@ pub fn render_markdown(
     md
 }
 
-/// Run the brief: select candidates, make at most one model call, gate every
-/// pick, hydrate truncated full text (display only), expand one thread root
-/// (display only), append to the decision log, and render markdown.
+/// Run the brief: filter dead/unavailable posts via liveness, select
+/// candidates, make at most one model call, gate every pick, hydrate
+/// truncated full text (display only), expand one thread root (display
+/// only), append to the decision log, and render markdown.
 pub fn run(
     merged: &MergeOutput,
     model: &dyn BriefModel,
     log_path: &Path,
     date: &str,
 ) -> Result<BriefResult, String> {
-    run_full(
+    run_full_with_liveness(
         merged,
         model,
         log_path,
         date,
         Some(&crate::x_api::hydrate),
         Some(&crate::x_api::fetch_thread_if_root),
+        false,
+        None,
+    )
+}
+
+/// Same as [`run`] with an explicit offline flag for `--offline` / `--demo`:
+/// `true` skips the liveness check deterministically (all posts treated as
+/// live, no network, no cache writes).
+pub fn run_offline_flag(
+    merged: &MergeOutput,
+    model: &dyn BriefModel,
+    log_path: &Path,
+    date: &str,
+    offline: bool,
+) -> Result<BriefResult, String> {
+    run_full_with_liveness(
+        merged,
+        model,
+        log_path,
+        date,
+        Some(&crate::x_api::hydrate),
+        Some(&crate::x_api::fetch_thread_if_root),
+        offline,
+        None,
     )
 }
 
@@ -498,7 +523,7 @@ pub fn run_with_hydrator(
     date: &str,
     hydrator: Option<&Hydrator<'_>>,
 ) -> Result<BriefResult, String> {
-    run_full(merged, model, log_path, date, hydrator, None)
+    run_full_with_liveness(merged, model, log_path, date, hydrator, None, false, None)
 }
 
 /// Same as [`run`] with injectable hydrator and thread expander for tests.
@@ -511,6 +536,34 @@ pub fn run_full(
     date: &str,
     hydrator: Option<&Hydrator<'_>>,
     thread_expander: Option<&ThreadExpander<'_>>,
+) -> Result<BriefResult, String> {
+    run_full_with_liveness(
+        merged,
+        model,
+        log_path,
+        date,
+        hydrator,
+        thread_expander,
+        false,
+        None,
+    )
+}
+
+/// Same as [`run_full`] with an injectable liveness lookup for tests.
+/// `offline=true` skips liveness deterministically; `lookup=None` uses the
+/// real X client. Dead/unknown posts are skipped before candidate selection
+/// (fail closed, excluded from model eval and the approval gate); only a
+/// liveness cache entry is recorded, never a decision-log entry.
+#[allow(clippy::too_many_arguments)]
+pub fn run_full_with_liveness(
+    merged: &MergeOutput,
+    model: &dyn BriefModel,
+    log_path: &Path,
+    date: &str,
+    hydrator: Option<&Hydrator<'_>>,
+    thread_expander: Option<&ThreadExpander<'_>>,
+    offline: bool,
+    lookup: Option<&crate::liveness::Lookup<'_>>,
 ) -> Result<BriefResult, String> {
     if merged.rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
@@ -526,6 +579,18 @@ pub fn run_full(
         .filter(|b| !hidden.contains(&b.post_id))
         .cloned()
         .collect();
+    if rows.is_empty() {
+        return Err("no bookmarks to brief".to_string());
+    }
+    // Liveness: confirm posts still exist before surfacing. Dead/unknown are
+    // skipped (fail closed); the store is never modified and no log entry is
+    // written for them.
+    let cache_path = crate::liveness::cache_path_for_log(log_path)?;
+    let now = crate::liveness::now_secs();
+    let rows: Vec<Bookmark> = match lookup {
+        Some(l) => crate::liveness::filter_with_lookup(&rows, &cache_path, offline, now, l)?,
+        None => crate::liveness::filter_live(&rows, &cache_path, offline, now)?,
+    };
     if rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
@@ -933,6 +998,8 @@ mod tests {
 
     #[test]
     fn run_success_logs_and_renders_markdown() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let rows: Vec<Bookmark> = (0..4)
             .map(|i| bm(&format!("id{i}"), None, Some("TopicA"), Some(0.9)))
             .collect();
@@ -991,6 +1058,8 @@ mod tests {
 
     #[test]
     fn run_falls_back_when_model_fails() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let rows: Vec<Bookmark> = (0..6)
             .map(|i| bm(&format!("id{i}"), None, Some("TopicB"), None))
             .collect();
@@ -1011,6 +1080,8 @@ mod tests {
 
     #[test]
     fn run_sends_only_sanitized_text() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let mut b = bm("s1", None, Some("T"), None);
         b.text = "secret-handle @syn_handle secret-link https://t.co/abc".into();
         let merged = merged_of(vec![b], &["s1"]);
@@ -1032,6 +1103,8 @@ mod tests {
 
     #[test]
     fn run_appends_without_rewriting_history() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let merged = merged_of(vec![bm("s1", None, Some("T"), None)], &["s1"]);
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
@@ -1053,6 +1126,8 @@ mod tests {
 
     #[test]
     fn run_rejects_empty_store() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let merged = merged_of(Vec::new(), &[]);
         let dir = tempfile::tempdir().unwrap();
         let err = run(
@@ -1194,6 +1269,8 @@ mod tests {
 
     #[test]
     fn hydrate_called_at_most_once_for_truncated_picks() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let mut t1 = bm("t1", None, Some("T"), None);
         t1.text = "synthetic truncated one https://t.co/aaa".into();
         let mut t2 = bm("t2", None, Some("T"), None);
@@ -1242,6 +1319,8 @@ mod tests {
 
     #[test]
     fn hydrate_failure_keeps_stored_text() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let mut t1 = bm("t1", None, Some("T"), None);
         t1.text = "synthetic truncated https://t.co/zzz".into();
         let merged = merged_of(vec![t1], &["t1"]);
@@ -1278,6 +1357,8 @@ mod tests {
 
     #[test]
     fn hydrate_does_not_change_model_prompt() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let mut t1 = bm("t1", None, Some("T"), None);
         t1.text = "synthetic stored https://t.co/qqq".into();
         let merged = merged_of(vec![t1], &["t1"]);
@@ -1329,6 +1410,8 @@ mod tests {
 
     #[test]
     fn hidden_posts_are_excluded_from_candidates() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let rows: Vec<Bookmark> = (0..4)
             .map(|i| bm(&format!("id{i}"), None, Some("TopicA"), Some(0.9)))
             .collect();
@@ -1358,6 +1441,8 @@ mod tests {
 
     #[test]
     fn all_hidden_is_no_brief() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let merged = merged_of(vec![bm("only", None, Some("T"), None)], &["only"]);
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
@@ -1387,6 +1472,8 @@ mod tests {
 
     #[test]
     fn thread_root_expands_first_pick_only() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let rows: Vec<Bookmark> = (0..3)
             .map(|i| bm(&format!("id{i}"), None, Some("T"), Some(0.9)))
             .collect();
@@ -1426,6 +1513,8 @@ mod tests {
 
     #[test]
     fn thread_expansion_nests_quoted_text_in_blockquote() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let merged = merged_of(vec![bm("id0", None, Some("T"), None)], &["id0"]);
         let dir = tempfile::tempdir().unwrap();
         let mut reply = thread_post("id0-r1", "synthetic reply one");
@@ -1462,7 +1551,126 @@ mod tests {
     }
 
     #[test]
+    fn liveness_dead_and_unknown_are_excluded_without_log_or_delete() {
+        use std::collections::HashMap;
+        let _env = crate::test_support::EnvHold::paid_on();
+        let rows: Vec<Bookmark> = (0..5)
+            .map(|i| bm(&format!("id{i}"), None, Some("TopicA"), Some(0.9)))
+            .collect();
+        let merged = merged_of(rows, &["id0", "id1", "id2", "id3", "id4"]);
+        let before: Vec<String> = merged.rows.iter().map(|b| b.post_id.clone()).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("decision_log.jsonl");
+        let lookup =
+            |chunk: &[String]| -> Result<HashMap<String, crate::x_api::PostLiveness>, String> {
+                let mut out = HashMap::new();
+                for id in chunk {
+                    let status = if id == "id1" {
+                        crate::x_api::PostLiveness::Deleted
+                    } else if id == "id3" {
+                        crate::x_api::PostLiveness::Unknown
+                    } else {
+                        crate::x_api::PostLiveness::Live
+                    };
+                    out.insert(id.clone(), status);
+                }
+                Ok(out)
+            };
+        let model = FakeModel::ok(
+            r#"[{"n":1,"why":"ok one"},{"n":2,"why":"ok two"},{"n":3,"why":"ok three"}]"#,
+        );
+        let res = run_full_with_liveness(
+            &merged,
+            &model,
+            &log_path,
+            "2026-10-26",
+            None,
+            None,
+            false,
+            Some(&lookup),
+        )
+        .unwrap();
+        // Dead id1 and unknown id3 never surface and never reach eval: not
+        // candidates (model input), not picks (gate input), not markdown.
+        for gone in ["id1", "id3"] {
+            assert!(
+                !res.candidates.iter().any(|c| c.post_id == gone),
+                "candidate {gone}"
+            );
+            assert!(!res.picks.iter().any(|p| p.post_id == gone), "pick {gone}");
+            assert!(
+                !res.markdown.contains(gone),
+                "markdown mentions {gone}: {}",
+                res.markdown
+            );
+            assert!(
+                !model.seen.borrow()[0].contains(&format!("synthetic text for {gone}")),
+                "model prompt saw {gone}"
+            );
+        }
+        assert_eq!(res.candidates.len(), 3);
+        // Merged input is unchanged: nothing deleted.
+        let after: Vec<String> = merged.rows.iter().map(|b| b.post_id.clone()).collect();
+        assert_eq!(before, after);
+        // No decision-log entry mentions the dead post; only the cache does.
+        let entries = DecisionLog::open(&log_path).unwrap().verify().unwrap();
+        for e in &entries {
+            assert!(
+                !e.kind.contains("liveness"),
+                "no liveness log kind allowed: {}",
+                e.kind
+            );
+            assert!(
+                !e.payload.to_string().contains("id1"),
+                "log mentions dead id1: {}",
+                e.payload
+            );
+        }
+        assert!(entries.iter().any(|e| e.kind == "brief.candidates"));
+        let cache = crate::liveness::load_cache(&dir.path().join(crate::liveness::CACHE_FILE_NAME));
+        assert_eq!(cache["id1"].status, "unavailable");
+        assert_eq!(cache["id1"].reason.as_deref(), Some("deleted"));
+        assert!(
+            !cache.contains_key("id3"),
+            "unknown is never cached: {cache:?}"
+        );
+    }
+
+    #[test]
+    fn liveness_offline_flag_skips_check_without_network_or_cache() {
+        use std::collections::HashMap;
+        let _env = crate::test_support::EnvHold::paid_on();
+        let rows: Vec<Bookmark> = (0..3)
+            .map(|i| bm(&format!("id{i}"), None, Some("TopicA"), Some(0.9)))
+            .collect();
+        let merged = merged_of(rows, &["id0", "id1", "id2"]);
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("decision_log.jsonl");
+        let lookup = |_: &[String]| -> Result<HashMap<String, crate::x_api::PostLiveness>, String> {
+            panic!("offline must not call the lookup");
+        };
+        let res = run_full_with_liveness(
+            &merged,
+            &FakeModel::ok(r#"[{"n":1,"why":"ok"}]"#),
+            &log_path,
+            "2026-10-26",
+            None,
+            None,
+            true,
+            Some(&lookup),
+        )
+        .unwrap();
+        assert_eq!(res.candidates.len(), 3);
+        assert!(
+            !dir.path().join(crate::liveness::CACHE_FILE_NAME).exists(),
+            "offline must not write cache"
+        );
+    }
+
+    #[test]
     fn thread_expansion_failures_keep_root_only() {
+        // Hermetic: paid off so liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let merged = merged_of(vec![bm("id0", None, Some("T"), None)], &["id0"]);
         let dir = tempfile::tempdir().unwrap();
         for (name, expander) in [

@@ -25,6 +25,7 @@ convinced the author to rebuild AncientOS in Rust.
 - Rust workspace: `core` (scheduler, fail-closed approval gate, append-only hash-chained decision log), `router` (privacy router, Muse/Llama clients), `bookmarks-agent`.
 - Fail closed everywhere: missing key, paid switch off (`ANCIENTOS_ALLOW_PAID` default off), or gate denial all stop the action.
 - Sync never deletes and never infers removals; merge of live + fixture by post_id keeps the best label.
+- Liveness: brief and web-ui confirm posts still exist via a batched read-only X lookup (deleted/suspended/protected dropped silently, 24h disk cache, offline/demo skip, transient errors fail closed); X is never written to and stored bookmarks are never deleted.
 - Secrets env-only; tokens stored 0600; test `sensitive_data_never_reaches_muse` enforces routing.
 - 155+ tests; `scripts/ci_local.sh` runs fmt, clippy and tests.
 

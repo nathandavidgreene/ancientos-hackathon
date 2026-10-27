@@ -1,10 +1,13 @@
 //! Loopback-only demo web UI: server-rendered HTML, no JS, std only.
 //!
 //! [`handle`] is a pure-ish `(Request, &State) -> Response` handler; `main.rs`
-//! owns sockets and HTTP/1.1 parsing. No network or paid calls are ever made:
-//! votes reuse `bookmarks_agent::vote`, triage reuses `idea_card`, try-it
-//! follow-ups reuse `try_it`, and everything lands in files under the data
-//! dir plus the append-only decision log.
+//! owns sockets and HTTP/1.1 parsing. Request handling makes no network or
+//! paid calls: votes reuse `bookmarks_agent::vote`, triage reuses `idea_card`,
+//! try-it follow-ups reuse `try_it`, and everything lands in files under the
+//! data dir plus the append-only decision log. Liveness is checked once at
+//! startup via [`State::open_with_liveness`] (batched X lookup, 24h cache,
+//! `--demo`/paid-off skips with no network); dead posts are filtered in
+//! memory only and the store is never modified.
 
 use bookmarks_agent::fixture::Bookmark;
 use std::collections::BTreeMap;
@@ -104,7 +107,18 @@ fn resolve_store(dir: &Path) -> PathBuf {
 }
 
 impl State {
+    /// Open offline (no liveness network): used by tests and offline flows.
+    /// Production servers use [`open_with_liveness`](Self::open_with_liveness).
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open_with_liveness(dir, true)
+    }
+
+    /// Open and confirm posts still exist before surfacing them, unless
+    /// `offline` (or paid-off) skips the check deterministically. Dead and
+    /// transient-unknown posts are filtered in memory only; the store file
+    /// is never modified. Outcomes are recorded only in the 24h disk cache
+    /// in this data dir — never the decision log, never the store.
+    pub fn open_with_liveness(dir: impl AsRef<Path>, offline: bool) -> Result<Self, String> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| format!("data dir failed: {e}"))?;
         let mut bookmarks = match std::fs::read_to_string(resolve_store(&dir)) {
@@ -114,9 +128,19 @@ impl State {
                 .map_err(|e| format!("store parse failed: {e}"))?,
         };
         bookmarks.sort_by(|a, b| a.post_id.cmp(&b.post_id));
-        Ok(Self {
+        let state = Self {
             data_dir: dir,
             bookmarks,
+        };
+        let live = bookmarks_agent::liveness::filter_live(
+            &state.bookmarks,
+            &state.liveness_cache_path(),
+            offline,
+            bookmarks_agent::liveness::now_secs(),
+        )?;
+        Ok(Self {
+            data_dir: state.data_dir,
+            bookmarks: live,
         })
     }
 
@@ -134,6 +158,11 @@ impl State {
 
     pub fn backlog_path(&self) -> PathBuf {
         self.data_dir.join("backlog.md")
+    }
+
+    pub fn liveness_cache_path(&self) -> PathBuf {
+        self.data_dir
+            .join(bookmarks_agent::liveness::CACHE_FILE_NAME)
     }
 }
 
@@ -584,11 +613,19 @@ fn page_try(state: &State) -> Response {
         Ok(log) => bookmarks_agent::try_it::pending_followups(&log),
         Err(_) => Vec::new(),
     };
+    // Dead posts get no UI mention: skip pending ids with a fresh
+    // `unavailable` liveness-cache entry (read-only reuse, no network).
+    let cache = bookmarks_agent::liveness::load_cache(&state.liveness_cache_path());
+    let now = bookmarks_agent::liveness::now_secs();
+    let pending: Vec<&String> = pending
+        .iter()
+        .filter(|id| !bookmarks_agent::liveness::is_fresh_unavailable(&cache, id, now))
+        .collect();
     let mut body = String::from("<h1>Try it — pending check-ins</h1>");
     if pending.is_empty() {
         body.push_str("<p>No pending try-it follow-ups.</p>");
     }
-    for id in &pending {
+    for id in pending {
         let text = state
             .bookmarks
             .iter()
@@ -1619,6 +1656,188 @@ mod tests {
         .unwrap();
         let state = State::open(dir.path()).unwrap();
         assert_eq!(state.bookmarks.len(), 1);
+    }
+
+    /// Env guard for liveness tests: paid switch plus `X_CLIENT_ID` cleared
+    /// or set under one local lock (web-ui tests run in their own process;
+    /// clearing the client id guarantees no network even on a cache miss).
+    struct PaidGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl PaidGuard {
+        fn capture() -> (
+            std::sync::MutexGuard<'static, ()>,
+            Vec<(&'static str, Option<String>)>,
+        ) {
+            static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let keys = [
+                "ANCIENTOS_ALLOW_PAID",
+                bookmarks_agent::liveness::OFFLINE_ENV_VAR,
+                bookmarks_agent::liveness::CACHE_ENV_VAR,
+                "X_CLIENT_ID",
+            ];
+            let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            (lock, saved)
+        }
+
+        fn paid_on() -> Self {
+            let (lock, saved) = Self::capture();
+            std::env::set_var("ANCIENTOS_ALLOW_PAID", "1");
+            std::env::remove_var(bookmarks_agent::liveness::OFFLINE_ENV_VAR);
+            std::env::remove_var(bookmarks_agent::liveness::CACHE_ENV_VAR);
+            std::env::remove_var("X_CLIENT_ID");
+            Self { _lock: lock, saved }
+        }
+
+        fn paid_off() -> Self {
+            let (lock, saved) = Self::capture();
+            std::env::remove_var("ANCIENTOS_ALLOW_PAID");
+            std::env::remove_var(bookmarks_agent::liveness::OFFLINE_ENV_VAR);
+            std::env::remove_var(bookmarks_agent::liveness::CACHE_ENV_VAR);
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for PaidGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn seed_cache(dir: &Path, entries: &[(&str, &str, Option<&str>, u64)]) {
+        let mut map = serde_json::Map::new();
+        for (id, status, reason, checked_at) in entries {
+            let mut e = serde_json::json!({"status": status, "checked_at": checked_at});
+            if let Some(r) = reason {
+                e["reason"] = serde_json::json!(r);
+            }
+            map.insert((*id).to_string(), e);
+        }
+        std::fs::write(
+            dir.join(bookmarks_agent::liveness::CACHE_FILE_NAME),
+            serde_json::Value::Object(map).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn open_with_liveness_offline_keeps_everything_without_cache_writes() {
+        let _env = PaidGuard::paid_on();
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            bookmark("dead1", "[synthetic] gone post", None, Vec::new()),
+            bookmark("live1", "[synthetic] kept post", None, Vec::new()),
+        ];
+        std::fs::write(dir.path().join("store.jsonl"), rows.join("\n") + "\n").unwrap();
+        // Offline (`--demo`) skips even with paid on: no network, no cache.
+        let state = State::open_with_liveness(dir.path(), true).unwrap();
+        assert_eq!(state.bookmarks.len(), 2);
+        assert!(
+            !dir.path()
+                .join(bookmarks_agent::liveness::CACHE_FILE_NAME)
+                .exists(),
+            "offline must not write cache"
+        );
+    }
+
+    #[test]
+    fn open_with_liveness_paid_off_skips_without_network() {
+        let _env = PaidGuard::paid_off();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("store.jsonl"),
+            bookmark("p1", "[synthetic] post", None, Vec::new()) + "\n",
+        )
+        .unwrap();
+        let state = State::open_with_liveness(dir.path(), false).unwrap();
+        assert_eq!(state.bookmarks.len(), 1);
+        assert!(!dir
+            .path()
+            .join(bookmarks_agent::liveness::CACHE_FILE_NAME)
+            .exists());
+    }
+
+    #[test]
+    fn open_with_liveness_drops_fresh_dead_without_deleting_or_logging() {
+        let _env = PaidGuard::paid_on();
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            bookmark("dead1", "[synthetic] gone post", None, Vec::new()),
+            bookmark("live1", "[synthetic] kept post", None, Vec::new()),
+        ];
+        let body = rows.join("\n") + "\n";
+        std::fs::write(dir.path().join("store.jsonl"), &body).unwrap();
+        // Fresh cache for every id: no lookup runs, so no network is possible.
+        let now = bookmarks_agent::liveness::now_secs();
+        seed_cache(
+            dir.path(),
+            &[
+                ("dead1", "unavailable", Some("deleted"), now),
+                ("live1", "live", None, now),
+            ],
+        );
+        let state = State::open_with_liveness(dir.path(), false).unwrap();
+        let ids: Vec<&str> = state.bookmarks.iter().map(|b| b.post_id.as_str()).collect();
+        assert_eq!(ids, vec!["live1"]);
+        // The store file is byte-identical: nothing deleted.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("store.jsonl")).unwrap(),
+            body
+        );
+        // No decision-log entry was written for the dead post.
+        assert!(
+            !state.log_path().exists(),
+            "dead posts must not write log entries"
+        );
+        // And the brief page never mentions the dead post.
+        let resp = handle(&Request::get("/"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("post 1 of 1"), "{}", resp.body);
+        assert!(!resp.body.contains("dead1"), "{}", resp.body);
+    }
+
+    #[test]
+    fn try_page_skips_fresh_dead_pending_without_ui_mention() {
+        let _env = PaidGuard::paid_off();
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            bookmark(
+                "dead1",
+                "[synthetic] gone hands-on: 1. Do X 2. Do Y",
+                None,
+                Vec::new(),
+            ),
+            bookmark(
+                "live1",
+                "[synthetic] kept hands-on: 1. Do A 2. Do B",
+                None,
+                Vec::new(),
+            ),
+        ];
+        std::fs::write(dir.path().join("store.jsonl"), rows.join("\n") + "\n").unwrap();
+        let state = State::open(dir.path()).unwrap();
+        assert_eq!(state.bookmarks.len(), 2);
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        bookmarks_agent::try_it::record_shown(&mut log, "dead1", 1_700_000_000).unwrap();
+        bookmarks_agent::try_it::record_shown(&mut log, "live1", 1_700_000_000).unwrap();
+        drop(log);
+        let now = bookmarks_agent::liveness::now_secs();
+        seed_cache(
+            dir.path(),
+            &[("dead1", "unavailable", Some("deleted"), now)],
+        );
+        let resp = handle(&Request::get("/try"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("live1"), "{}", resp.body);
+        assert!(!resp.body.contains("dead1"), "no UI mention: {}", resp.body);
     }
 
     #[test]

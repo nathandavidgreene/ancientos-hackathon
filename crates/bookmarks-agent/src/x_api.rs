@@ -624,6 +624,183 @@ pub fn fetch_thread_if_root(id: &str) -> Result<Option<Vec<ThreadPost>>, String>
     }
 }
 
+/// Liveness of one post as seen by the X API. `Unknown` is fail-closed:
+/// callers must neither treat it as dead nor as verified live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostLiveness {
+    Live,
+    Deleted,
+    Suspended,
+    Protected,
+    Unknown,
+}
+
+impl PostLiveness {
+    /// True only for positively confirmed live posts.
+    pub fn is_live(self) -> bool {
+        self == Self::Live
+    }
+
+    /// True for confirmed-dead posts (deleted, suspended, protected).
+    pub fn is_unavailable(self) -> bool {
+        matches!(self, Self::Deleted | Self::Suspended | Self::Protected)
+    }
+
+    /// Short reason string for logs and cache (`None` for live/unknown).
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Deleted => Some("deleted"),
+            Self::Suspended => Some("suspended"),
+            Self::Protected => Some("protected"),
+            Self::Live | Self::Unknown => None,
+        }
+    }
+}
+
+/// Batched liveness endpoint: same `/tweets?ids=` lookup as [`hydrate_url`]
+/// (max 100 ids). Liveness needs the full response (including `errors`),
+/// so callers use [`XApiSource::fetch_liveness_raw`] instead of [`hydrate`].
+pub fn liveness_url(ids: &[String]) -> Result<String, String> {
+    hydrate_url(ids)
+}
+
+fn liveness_ids_of_error(err: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(id) = err.get("resource_id").and_then(|v| v.as_str()) {
+        if !id.is_empty() {
+            out.push(id.to_string());
+        }
+    }
+    if let Some(params) = err.get("parameters") {
+        for key in ["ids", "id"] {
+            match params.get(key) {
+                Some(serde_json::Value::Array(arr)) => {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            if !s.is_empty() {
+                                out.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                Some(serde_json::Value::String(s)) if !s.is_empty() => {
+                    out.push(s.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn classify_liveness_error(err: &serde_json::Value) -> PostLiveness {
+    let text = format!(
+        "{} {} {}",
+        err.get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        err.get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        err.get("type").and_then(|v| v.as_str()).unwrap_or_default(),
+    )
+    .to_lowercase();
+    if text.contains("suspend") || text.contains("deactivat") {
+        PostLiveness::Suspended
+    } else if text.contains("protect")
+        || text.contains("not-authorized")
+        || text.contains("not authorized")
+        || text.contains("authorization")
+        || text.contains("forbidden")
+        || text.contains("private")
+        || text.contains("cannot see")
+        || text.contains("not allowed")
+    {
+        PostLiveness::Protected
+    } else if text.contains("not found")
+        || text.contains("not-found")
+        || text.contains("resource-not-found")
+        || text.contains("could not find")
+        || text.contains("deleted")
+        || text.contains("does not exist")
+        || text.contains("no such")
+    {
+        PostLiveness::Deleted
+    } else {
+        PostLiveness::Unknown
+    }
+}
+
+/// Map a batched `/tweets?ids=` response to per-id liveness. Pure, for tests.
+/// Ids present in `data` are live; otherwise the `errors` array is searched
+/// for a matching `resource_id` / `parameters.ids` entry and classified.
+/// Missing ids with no matching dead signal are `Unknown` (fail closed),
+/// never `Deleted`, so partial responses cannot fake a removal.
+pub fn parse_liveness_response(
+    requested: &[String],
+    value: &serde_json::Value,
+) -> HashMap<String, PostLiveness> {
+    use std::collections::HashSet;
+    let mut live: HashSet<&str> = HashSet::new();
+    if let Some(tweets) = value.get("data").and_then(|d| d.as_array()) {
+        for t in tweets {
+            if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    live.insert(id);
+                }
+            }
+        }
+    }
+    let mut errors: HashMap<String, PostLiveness> = HashMap::new();
+    if let Some(list) = value.get("errors").and_then(|e| e.as_array()) {
+        for err in list {
+            let status = classify_liveness_error(err);
+            for id in liveness_ids_of_error(err) {
+                errors.entry(id).or_insert(status);
+            }
+        }
+    }
+    requested
+        .iter()
+        .map(|id| {
+            let status = if live.contains(id.as_str()) {
+                PostLiveness::Live
+            } else {
+                errors.get(id).copied().unwrap_or(PostLiveness::Unknown)
+            };
+            (id.clone(), status)
+        })
+        .collect()
+}
+
+impl XApiSource {
+    /// Fetch the raw batched `/tweets?ids=` response (including `errors`)
+    /// for up to 100 ids. Same token handling/refresh as [`hydrate`](Self::hydrate);
+    /// fails closed without the paid switch. Callers map it with
+    /// [`parse_liveness_response`]; transport/HTTP failures are `Err` and
+    /// must be treated as unknown, never dead.
+    pub fn fetch_liveness_raw(&mut self, ids: &[String]) -> Result<serde_json::Value, String> {
+        require_paid()?;
+        let url = liveness_url(ids)?;
+        self.ensure_fresh_token()?;
+        get_json(&url, &self.tokens.access_token.clone())
+    }
+}
+
+/// Fetch the raw batched liveness response using tokens from the store.
+/// Fails closed without the paid switch. Never logs tokens.
+pub fn fetch_liveness_raw(ids: &[String]) -> Result<serde_json::Value, String> {
+    source_from_store()?.fetch_liveness_raw(ids)
+}
+
+/// Batched liveness check for up to 100 ids: one GET plus
+/// [`parse_liveness_response`]. Fails closed without the paid switch;
+/// transport/HTTP failures are `Err` (unknown, never dead).
+pub fn check_liveness(ids: &[String]) -> Result<HashMap<String, PostLiveness>, String> {
+    let raw = fetch_liveness_raw(ids)?;
+    Ok(parse_liveness_response(ids, &raw))
+}
+
 impl BookmarkSource for XApiSource {
     fn fetch(&mut self, pagination_token: Option<&str>) -> Result<Page, String> {
         require_paid()?;
@@ -642,11 +819,9 @@ impl BookmarkSource for XApiSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static ENV_MUTEX: Mutex<()> = Mutex::new(());
-        ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::lock_env()
     }
 
     fn tokens() -> StoredTokens {
@@ -1140,6 +1315,125 @@ mod tests {
         std::env::set_var("X_CLIENT_ID", "synthetic-client");
         assert!(fetch_thread("123").is_err());
         assert!(fetch_thread_if_root("123").is_err());
+        match saved_paid {
+            Some(v) => std::env::set_var("ANCIENTOS_ALLOW_PAID", v),
+            None => std::env::remove_var("ANCIENTOS_ALLOW_PAID"),
+        }
+        match saved_client {
+            Some(v) => std::env::set_var("X_CLIENT_ID", v),
+            None => std::env::remove_var("X_CLIENT_ID"),
+        }
+    }
+
+    #[test]
+    fn liveness_url_reuses_batched_lookup_limit() {
+        let ids = vec!["1".to_string(), "2".to_string()];
+        let u = liveness_url(&ids).unwrap();
+        assert!(u.starts_with("https://api.x.com/2/tweets?ids=1,2"), "{u}");
+        assert!(liveness_url(&[]).is_err());
+        let many: Vec<String> = (0..101).map(|i| i.to_string()).collect();
+        assert!(liveness_url(&many).is_err());
+    }
+
+    #[test]
+    fn parses_liveness_deleted_suspended_protected_and_live() {
+        let requested = vec![
+            "live1".to_string(),
+            "gone1".to_string(),
+            "susp1".to_string(),
+            "prot1".to_string(),
+            "mystery1".to_string(),
+        ];
+        let raw = serde_json::json!({
+            "data": [{"id": "live1", "text": "synthetic live"}],
+            "errors": [
+                {"resource_id": "gone1", "title": "Not Found Error",
+                 "detail": "Could not find tweet with ids: [gone1].",
+                 "type": "https://api.twitter.com/2/problems/resource-not-found"},
+                {"parameters": {"ids": ["susp1"]}, "title": "Forbidden",
+                 "detail": "User has been suspended.",
+                 "type": "https://api.twitter.com/2/problems/suspended"},
+                {"resource_id": "prot1", "title": "Authorization Error",
+                 "detail": "You are not authorized to see this protected post.",
+                 "type": "https://api.twitter.com/2/problems/not-authorized-for-resource"},
+                {"title": "Too Many Requests", "detail": "Rate limited",
+                 "type": "https://api.twitter.com/2/problems/rate-limit"},
+            ],
+        });
+        let out = parse_liveness_response(&requested, &raw);
+        assert_eq!(out.get("live1"), Some(&PostLiveness::Live));
+        assert_eq!(out.get("gone1"), Some(&PostLiveness::Deleted));
+        assert_eq!(out.get("susp1"), Some(&PostLiveness::Suspended));
+        assert_eq!(out.get("prot1"), Some(&PostLiveness::Protected));
+        // Missing with no matching dead signal is unknown, never deleted.
+        assert_eq!(out.get("mystery1"), Some(&PostLiveness::Unknown));
+    }
+
+    #[test]
+    fn liveness_url_is_the_read_only_batched_get() {
+        // Same endpoint as hydrate: one GET to /tweets?ids=, max 100 ids.
+        // No write path exists anywhere on this flow (never un-bookmark).
+        let ids = vec!["1".to_string(), "2".to_string()];
+        let u = liveness_url(&ids).unwrap();
+        assert_eq!(u, hydrate_url(&ids).unwrap());
+        assert!(u.starts_with("https://api.x.com/2/tweets?ids=1,2"), "{u}");
+        assert!(liveness_url(&[]).is_err());
+        let many: Vec<String> = (0..101).map(|i| i.to_string()).collect();
+        assert!(liveness_url(&many).is_err());
+    }
+
+    #[test]
+    fn liveness_parse_is_fail_closed_on_ambiguity() {
+        // Id in data wins over a contradictory error entry.
+        let raw = serde_json::json!({
+            "data": [{"id": "a", "text": "synthetic live"}],
+            "errors": [{"resource_id": "a", "title": "Not Found Error",
+                        "detail": "Could not find tweet.",
+                        "type": "https://api.twitter.com/2/problems/resource-not-found"}],
+        });
+        let out = parse_liveness_response(&["a".to_string()], &raw);
+        assert_eq!(out.get("a"), Some(&PostLiveness::Live));
+
+        // Dead-type error with no attributable id marks nothing dead.
+        let raw = serde_json::json!({
+            "errors": [{"title": "Not Found Error", "detail": "Could not find tweet.",
+                        "type": "https://api.twitter.com/2/problems/resource-not-found"}],
+        });
+        let out = parse_liveness_response(&["b".to_string()], &raw);
+        assert_eq!(out.get("b"), Some(&PostLiveness::Unknown));
+
+        // Attributable but unrecognized error (rate limit) is unknown, not dead.
+        let raw = serde_json::json!({
+            "errors": [{"resource_id": "c", "title": "Too Many Requests",
+                        "detail": "Rate limited",
+                        "type": "https://api.twitter.com/2/problems/rate-limit"}],
+        });
+        let out = parse_liveness_response(&["c".to_string()], &raw);
+        assert_eq!(out.get("c"), Some(&PostLiveness::Unknown));
+
+        // Helpers classify only confirmed outcomes.
+        assert!(PostLiveness::Live.is_live());
+        assert!(!PostLiveness::Deleted.is_live());
+        assert!(!PostLiveness::Unknown.is_live());
+        assert!(PostLiveness::Suspended.is_unavailable());
+        assert!(PostLiveness::Protected.is_unavailable());
+        assert!(!PostLiveness::Unknown.is_unavailable());
+        assert_eq!(PostLiveness::Deleted.reason(), Some("deleted"));
+        assert_eq!(PostLiveness::Live.reason(), None);
+        assert_eq!(PostLiveness::Unknown.reason(), None);
+    }
+
+    #[test]
+    fn liveness_check_fails_closed_without_paid_switch() {
+        // No network (and no X call of any kind) without the paid switch.
+        let _guard = env_lock();
+        let saved_paid = std::env::var("ANCIENTOS_ALLOW_PAID").ok();
+        let saved_client = std::env::var("X_CLIENT_ID").ok();
+        std::env::remove_var("ANCIENTOS_ALLOW_PAID");
+        std::env::set_var("X_CLIENT_ID", "synthetic-client");
+        let ids = vec!["1".to_string()];
+        assert!(check_liveness(&ids).is_err());
+        assert!(fetch_liveness_raw(&ids).is_err());
         match saved_paid {
             Some(v) => std::env::set_var("ANCIENTOS_ALLOW_PAID", v),
             None => std::env::remove_var("ANCIENTOS_ALLOW_PAID"),

@@ -173,7 +173,7 @@ fn run(args: &[String]) -> Result<(), String> {
     } else {
         None
     };
-    let state = State::open(&dir)?;
+    let state = State::open_with_liveness(&dir, parsed.demo)?;
     let addr = loopback_addr(&parsed.host, parsed.port)?;
     let listener = TcpListener::bind(addr).map_err(|e| format!("bind {addr} failed: {e}"))?;
     println!(

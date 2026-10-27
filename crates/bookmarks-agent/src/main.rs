@@ -1,5 +1,5 @@
 //! CLI: `login` | `sync [--max-pages N]` | `load [path]` | `auth-url`
-//! | `brief [--fixture PATH] [--out PATH]`
+//! | `brief [--fixture PATH] [--out PATH] [--offline] [--demo]`
 //! | `vote <post_id> <verdict> [--tag TAG]... [--fixture PATH]`
 //! | `delegate <post_id>` | `deeper <post_id> [--offline <fixture.jsonl>]`
 //! | `ideas` | `triage <id> <adopt|park|drop>`
@@ -26,7 +26,7 @@ use bookmarks_agent::{
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run]";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run]";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -132,9 +132,10 @@ fn cmd_load(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn parse_brief_args(args: &[String]) -> Result<(Option<String>, Option<String>), String> {
+fn parse_brief_args(args: &[String]) -> Result<(Option<String>, Option<String>, bool), String> {
     let mut fixture: Option<String> = None;
     let mut out: Option<String> = None;
+    let mut offline = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -160,22 +161,25 @@ fn parse_brief_args(args: &[String]) -> Result<(Option<String>, Option<String>),
             let v = args.get(i).ok_or_else(|| USAGE.to_string())?;
             out = Some(v.clone());
             i += 1;
+        } else if arg == "--offline" || arg == "--demo" {
+            offline = true;
+            i += 1;
         } else {
             return Err(USAGE.to_string());
         }
     }
-    Ok((fixture, out))
+    Ok((fixture, out, offline))
 }
 
 fn cmd_brief(args: &[String]) -> Result<(), String> {
-    let (fixture, out) = parse_brief_args(args)?;
+    let (fixture, out, offline) = parse_brief_args(args)?;
     let merged = merge::load_merged(fixture.as_deref())?;
     let client = ancientos_router::muse::MuseClient::from_env()
         .with_max_completion_tokens(700)
         .with_reasoning_effort("low");
     let log_path = brief::decision_log_path()?;
     let date = brief::current_date();
-    let result = brief::run(&merged, &client, &log_path, &date)?;
+    let result = brief::run_offline_flag(&merged, &client, &log_path, &date, offline)?;
     print!("{}", result.markdown);
     if let Some(path) = out {
         std::fs::write(&path, &result.markdown)

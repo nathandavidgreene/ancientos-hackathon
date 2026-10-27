@@ -1095,6 +1095,8 @@ mod tests {
 
     #[test]
     fn brief_marks_try_it_picks_and_logs_shown() {
+        // Hermetic: paid off so brief liveness skips with no network.
+        let _env = crate::test_support::EnvHold::paid_off();
         let mut stretch = bm(
             "h1",
             "[synthetic] Desk stretch: 1) roll shoulders 10x 2) neck tilt 20s each side. Try it now.",
