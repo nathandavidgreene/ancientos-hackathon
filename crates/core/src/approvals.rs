@@ -477,14 +477,22 @@ fn fold(entries: &[Entry]) -> BTreeMap<String, Approval> {
     out
 }
 
-/// All approvals, oldest request first. Reads an empty/missing log as empty;
-/// a tampered log is an error (fail closed).
-fn all(log: &DecisionLog) -> Result<Vec<Approval>, ApprovalError> {
-    let mut out: Vec<Approval> = fold(&log.verify_or_empty()?).into_values().collect();
+/// Fold already-loaded entries into per-id lifecycle state, oldest request
+/// first. Read-only view over the same defensive fold the writers use
+/// (first valid entry wins, malformed entries ignored); callers must verify
+/// the chain first (fail closed). Powers `ancientos-log replay-approvals`.
+pub fn replay(entries: &[Entry]) -> Vec<Approval> {
+    let mut out: Vec<Approval> = fold(entries).into_values().collect();
     out.sort_by(|a, b| {
         (a.request.requested_at, &a.request.id).cmp(&(b.request.requested_at, &b.request.id))
     });
-    Ok(out)
+    out
+}
+
+/// All approvals, oldest request first. Reads an empty/missing log as empty;
+/// a tampered log is an error (fail closed).
+fn all(log: &DecisionLog) -> Result<Vec<Approval>, ApprovalError> {
+    Ok(replay(&log.verify_or_empty()?))
 }
 
 /// Record a proposal for a risky action. Only actions the caller-provided
@@ -1358,6 +1366,22 @@ mod tests {
             claim_release_token(&log, &r.id, &r.payload_hash).unwrap_err(),
             ApprovalError::NotApproved(_, _)
         ));
+    }
+
+    #[test]
+    fn replay_folds_loaded_entries_oldest_first() {
+        let (_dir, mut log, _path) = open_log();
+        let first = propose(&mut log, NOW, json!({"n": 20}));
+        let second = propose(&mut log, NOW + 5, json!({"n": 21}));
+        approve(&mut log, &first.id, &first.payload_hash, "human", NOW + 9).unwrap();
+        let entries = log.verify().unwrap();
+        let folded = replay(&entries);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].request.id, first.id);
+        assert_eq!(folded[0].status, Status::Approved);
+        assert_eq!(folded[1].request.id, second.id);
+        assert_eq!(folded[1].status, Status::Pending);
+        assert!(replay(&[]).is_empty());
     }
 
     #[test]

@@ -15,6 +15,58 @@ pub enum LogError {
     Chain(usize),
 }
 
+/// Read-only load failure: either the file could not be read at all, or the
+/// first broken line (1-based) and why it broke. Unlike
+/// [`DecisionLog::open`], a missing file is an error: there is nothing to
+/// inspect, and reporting "0 entries" would hide a typo'd path.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("cannot read log: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("line {line}: {reason}")]
+    Broken { line: usize, reason: String },
+}
+
+/// Build a broken-chain error for a 1-based line.
+fn broken(line: usize, reason: String) -> LoadError {
+    LoadError::Broken { line, reason }
+}
+
+/// Open `path` read-only, parse every line and check the hash chain,
+/// reporting the first broken line (1-based) and reason. Never creates,
+/// writes, or truncates the file: the only I/O is one read-only open.
+/// Fail closed: an unreadable line, invalid JSON, a seq gap, a `prev_hash`
+/// mismatch or a hash mismatch is an error naming that line.
+pub fn load_verified(path: &Path) -> Result<Vec<Entry>, LoadError> {
+    let file = File::open(path)?;
+    let mut prev = GENESIS.to_string();
+    let mut out = Vec::new();
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        let lineno = i + 1;
+        let line = line.map_err(|e| broken(lineno, format!("unreadable line: {e}")))?;
+        let e: Entry = serde_json::from_str(&line)
+            .map_err(|e| broken(lineno, format!("invalid JSON: {e}")))?;
+        if e.seq != i as u64 {
+            return Err(broken(lineno, format!("expected seq {i}, found {}", e.seq)));
+        }
+        if e.prev_hash != prev {
+            return Err(broken(
+                lineno,
+                "prev_hash does not match previous entry (tampered or corrupt)".to_string(),
+            ));
+        }
+        if e.hash != digest(e.seq, &e.prev_hash, &e.kind, &e.payload) {
+            return Err(broken(
+                lineno,
+                "hash mismatch (tampered or corrupt)".to_string(),
+            ));
+        }
+        prev = e.hash.clone();
+        out.push(e);
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     pub seq: u64,
@@ -208,6 +260,57 @@ mod tests {
         // Reopening re-verifies the redacted chain.
         let log2 = DecisionLog::open(&p).unwrap();
         assert_eq!(log2.verify().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn load_verified_reports_first_broken_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&p).unwrap();
+        log.append("a", json!(1)).unwrap();
+        log.append("b", json!(2)).unwrap();
+        // Valid file loads.
+        assert_eq!(load_verified(&p).unwrap().len(), 2);
+        // Same-length tamper on line 2 keeps JSON valid: hash must catch it.
+        let raw = std::fs::read_to_string(&p)
+            .unwrap()
+            .replacen("\"b\"", "\"x\"", 1);
+        std::fs::write(&p, raw).unwrap();
+        match load_verified(&p).unwrap_err() {
+            LoadError::Broken { line, reason } => {
+                assert_eq!(line, 2);
+                assert!(reason.contains("hash mismatch"), "{reason}");
+            }
+            e => panic!("want Broken, got {e}"),
+        }
+    }
+
+    #[test]
+    fn load_verified_rejects_truncated_last_line_empty_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Truncated mid-line: the last line is invalid JSON.
+        let p = dir.path().join("t.jsonl");
+        let mut log = DecisionLog::open(&p).unwrap();
+        log.append("a", json!({"v": 1})).unwrap();
+        log.append("b", json!({"v": 2})).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let cut = raw.len() - 5;
+        std::fs::write(&p, &raw[..cut]).unwrap();
+        match load_verified(&p).unwrap_err() {
+            LoadError::Broken { line, reason } => {
+                assert_eq!(line, 2);
+                assert!(reason.contains("invalid JSON"), "{reason}");
+            }
+            e => panic!("want Broken, got {e}"),
+        }
+        // Empty file is a valid empty log.
+        let e = dir.path().join("e.jsonl");
+        std::fs::write(&e, "").unwrap();
+        assert!(load_verified(&e).unwrap().is_empty());
+        // Missing file is an error (fail closed), and stays missing.
+        let m = dir.path().join("missing.jsonl");
+        assert!(matches!(load_verified(&m).unwrap_err(), LoadError::Io(_)));
+        assert!(!m.exists());
     }
 
     #[test]
