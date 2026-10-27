@@ -12,7 +12,7 @@
 //! | `deny <id> [reason] [--now <rfc3339>]`
 //! | `run [--once] [--now <rfc3339>] [--offline <fixture>]`
 //! | `wiki ingest <post_id>|--delegated` | `wiki query "<question>" [--file-back]`
-//! | `wiki lint` | `wiki show <slug>`.
+//! | `wiki lint` | `wiki show <slug>` | `stats`.
 //!
 //! `login` runs the PKCE loopback flow and saves tokens; `sync` pulls new
 //! bookmarks into the local JSONL store (paid, off by default). `brief`
@@ -46,16 +46,18 @@
 //! model or the deterministic fallback compiles), `query` answers with
 //! citations (`--file-back` files the answer as a new page), `lint`
 //! proposes hygiene fixes as `wiki.edit` approvals (never applied), and
-//! `show` prints one page.
+//! `show` prints one page. `stats` prints the same numbers as the web
+//! UI's `/stats` dashboard as plain text, computed locally from the
+//! decision log and the Muse Code run log (no network, no paid calls).
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
     author_filter, brief, callback, daemon, deeper, delegate, digest, fixture, idea_card, ingest,
-    merge, oauth, ranker, token_store, try_it, vote, wiki, x_api,
+    merge, oauth, ranker, stats, token_store, try_it, vote, wiki, x_api,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | rank [--top N] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> [--now <rfc3339>] | deny <id> [reason] [--now <rfc3339>] | run [--once] [--now <rfc3339>] [--offline <fixture>] | wiki ingest <post_id> | wiki ingest --delegated | wiki query \"<question>\" [--file-back] | wiki lint | wiki show <slug>";
+const USAGE: &str = "usage: bookmarks-agent login | sync [--max-pages N] | load [path] | auth-url | brief [--fixture PATH] [--out PATH] [--offline] [--demo] | rank [--top N] | vote <post_id> <verdict> [--tag TAG]... [--fixture PATH] | unhide-author <username> | hidden-authors | delegate <post_id> | deeper <post_id> [--offline <fixture.jsonl>] | deeper --later <post_id> --at <rfc3339> | deeper-queue | ideas | triage <id> <adopt|park|drop> | tried <post_id> <yes|no|later> [note] | try-pending | digest [--now SECS] [--dry-run] | approvals | approve <id> [--now <rfc3339>] | deny <id> [reason] [--now <rfc3339>] | run [--once] [--now <rfc3339>] [--offline <fixture>] | wiki ingest <post_id> | wiki ingest --delegated | wiki query \"<question>\" [--file-back] | wiki lint | wiki show <slug> | stats";
 
 fn client_id() -> Result<String, String> {
     std::env::var("X_CLIENT_ID")
@@ -1142,6 +1144,33 @@ fn cmd_wiki(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Print the local stats dashboard as plain text: the decision-log chain
+/// status plus entry counts, approvals, verdicts, try-it, cascade stages,
+/// daemon ticks and Muse Code runs, all computed from local files (no
+/// network, no paid calls). Args: `args` must be empty (any arg is a usage
+/// error); the decision log comes from `brief::decision_log_path`, the run
+/// log from `stats::muse_log_path_from_env`, and the clock is the system
+/// time. Returns `Ok` after printing, or a usage/decision-log-path error
+/// string. A broken chain prints `withheld` sections (fail closed) and a
+/// missing run log prints `unavailable`; neither is an error.
+fn cmd_stats(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let log_path = brief::decision_log_path()?;
+    let muse_path = stats::muse_log_path_from_env();
+    let now = idea_card::now_secs();
+    print!(
+        "{}",
+        stats::render_text(&stats::collect(&log_path, &muse_path, now))
+    );
+    Ok(())
+}
+
+/// CLI entry point: dispatch `argv[1]` to one subcommand handler and exit
+/// non-zero with `error: ...` on failure. Args: none (reads process args
+/// and env); returns nothing; failure modes are whatever the chosen
+/// subcommand reports.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -1167,6 +1196,7 @@ fn main() {
         Some("deny") => cmd_deny(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("wiki") => cmd_wiki(&args[1..]),
+        Some("stats") => cmd_stats(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     if let Err(e) = result {

@@ -106,6 +106,9 @@ pub struct State {
     /// Used only to resolve a pending id or idea-card source to its stored
     /// post for filtering; never rendered directly.
     all_bookmarks: Vec<Bookmark>,
+    /// Muse Code run-log path for the `/stats` "Built with Meta" section
+    /// (defaults from env, overridable per state for tests).
+    pub muse_log_path: PathBuf,
 }
 
 /// `store.jsonl` (demo/tests) if present, else the real synced
@@ -133,7 +136,9 @@ impl State {
     /// is never modified. Outcomes are recorded only in the 24h disk cache
     /// in this data dir — never the decision log, never the store.
     /// Non-English posts are kept (translated for display from the on-disk
-    /// cache, never hidden for language).
+    /// cache, never hidden for language). The Muse Code run-log path
+    /// defaults from `stats::muse_log_path_from_env` (a missing file later
+    /// renders as `unavailable`, never an error).
     pub fn open_with_liveness(dir: impl AsRef<Path>, offline: bool) -> Result<Self, String> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| format!("data dir failed: {e}"))?;
@@ -148,6 +153,7 @@ impl State {
             data_dir: dir.clone(),
             bookmarks: bookmarks.clone(),
             all_bookmarks: bookmarks,
+            muse_log_path: bookmarks_agent::stats::muse_log_path_from_env(),
         };
         let live = bookmarks_agent::liveness::filter_live(
             &state.bookmarks,
@@ -159,6 +165,7 @@ impl State {
             data_dir: dir,
             bookmarks: live,
             all_bookmarks: state.all_bookmarks,
+            muse_log_path: state.muse_log_path,
         })
     }
 
@@ -337,6 +344,11 @@ fn pending_count(state: &State) -> usize {
         .unwrap_or(0)
 }
 
+/// Wrap a page `body` in the shared HTML shell: doctype, inline CSS,
+/// nav (Brief, Ideas, Try it, Wiki, Hidden, Approvals with pending badge,
+/// Log, Stats) and the escaped `title`. Args: the page title, the rendered
+/// body HTML, and the serving state (for the approvals badge); returns the
+/// full page; never fails.
 fn layout(title: &str, body: &str, state: &State) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -346,7 +358,7 @@ fn layout(title: &str, body: &str, state: &State) -> String {
          <a href=\"/try\">Try it</a><a href=\"/wiki\">Wiki</a>\
          <a href=\"/hidden-authors\">Hidden</a>\
          <a href=\"/approvals\">Approvals ({})</a>\
-         <a href=\"/log\">Log</a></nav><hr>{body}</body></html>",
+         <a href=\"/log\">Log</a><a href=\"/stats\">Stats</a></nav><hr>{body}</body></html>",
         escape(title),
         pending_count(state),
     )
@@ -1456,8 +1468,259 @@ fn decide_approval(state: &State, body: &[u8], approve_it: bool) -> Response {
     }
 }
 
+/// Render `rows` as a two-column HTML table with escaped cells and a
+/// header row (`head0`, `head1`). Args: the header labels and the
+/// `(name, count)` rows; returns the table HTML; never fails.
+fn kv_table(head0: &str, head1: &str, rows: &[(String, String)]) -> String {
+    let mut out = format!(
+        "<table><tr><th>{}</th><th>{}</th></tr>",
+        escape(head0),
+        escape(head1),
+    );
+    for (k, v) in rows {
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td></tr>",
+            escape(k),
+            escape(v),
+        ));
+    }
+    out.push_str("</table>");
+    out
+}
+
+/// Render one withheld `/stats` section for a broken chain: the heading
+/// plus `withheld (fail closed)`. Args: the section title; returns the
+/// HTML; never fails.
+fn withheld_section(title: &str) -> String {
+    format!("<h2>{}</h2><p>withheld (fail closed)</p>", escape(title))
+}
+
+/// Render verdict counts by category as an inline-SVG horizontal bar chart
+/// (no JS, no external assets): one row per category with an escaped label,
+/// a bar scaled to the top count, and the count. Args: `(category, count)`
+/// pairs in display order; returns the `<svg>` HTML, or an empty string
+/// when there is nothing to chart; never fails.
+fn verdict_svg(items: &[(String, u64)]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    const LABEL_W: u32 = 150;
+    const BAR_MAX: u32 = 280;
+    const ROW_H: u32 = 24;
+    const PAD: u32 = 8;
+    let max = items.iter().map(|(_, n)| *n).max().unwrap_or(1).max(1);
+    let height = items.len() as u32 * ROW_H + PAD;
+    let width = LABEL_W + BAR_MAX + 64;
+    let mut out = format!(
+        "<svg role=\"img\" aria-label=\"verdicts by category\" width=\"{width}\" height=\"{height}\" \
+         viewBox=\"0 0 {width} {height}\" xmlns=\"http://www.w3.org/2000/svg\">",
+    );
+    for (i, (name, n)) in items.iter().enumerate() {
+        let y = i as u32 * ROW_H + PAD / 2;
+        let bar = (*n * u64::from(BAR_MAX) / max).max(u64::from(*n > 0)) as u32;
+        let label: String = name.chars().take(24).collect();
+        out.push_str(&format!(
+            "<text x=\"0\" y=\"{}\" font-size=\"12\">{}</text>\
+             <rect x=\"{LABEL_W}\" y=\"{}\" width=\"{bar}\" height=\"14\" fill=\"#111\"></rect>\
+             <text x=\"{}\" y=\"{}\" font-size=\"12\">{n}</text>",
+            y + 12,
+            escape(&label),
+            y,
+            LABEL_W + bar + 6,
+            y + 12,
+        ));
+    }
+    out.push_str("</svg>");
+    out
+}
+
+/// Render the `/stats` dashboard: decision-log chain status plus entry
+/// counts, approvals, verdicts with an inline-SVG chart, try-it, cascade
+/// stages, daemon ticks and Muse Code runs. Every number comes from
+/// `stats::collect` over local files (no network, no paid calls) and every
+/// dynamic string is HTML-escaped. A broken chain shows `broken at line N`
+/// with every log-derived section withheld (fail closed); a missing run
+/// log shows `unavailable`. Args: the serving state; returns the 200
+/// response; never fails.
+fn page_stats(state: &State) -> Response {
+    let stats =
+        bookmarks_agent::stats::collect(&state.log_path(), &state.muse_log_path, now_secs());
+    let mut body = String::from("<h1>Stats</h1>");
+    if !stats.chain_verified {
+        match stats.broken_at {
+            Some(n) => body.push_str(&format!(
+                "<h2>Decision log</h2><p><span class=\"badge-bad\">broken at line {n}</span></p>\
+                 <p>The hash chain failed verification; every log-derived number below is \
+                 withheld (fail closed).</p>"
+            )),
+            None => body.push_str(
+                "<h2>Decision log</h2><p><span class=\"badge-bad\">unreadable</span></p>\
+                 <p>The decision log cannot be read; every log-derived number below is \
+                 withheld (fail closed).</p>",
+            ),
+        }
+        for title in [
+            "Approvals",
+            "Verdicts",
+            "Try it",
+            "Try-it cascade",
+            "Daemon",
+        ] {
+            body.push_str(&withheld_section(title));
+        }
+    } else {
+        body.push_str(&format!(
+            "<h2>Decision log</h2><p><span class=\"badge-ok\">chain verified</span> {} entries</p>",
+            stats.entry_count
+        ));
+        if stats.kinds_top.is_empty() {
+            body.push_str("<p>No entries yet.</p>");
+        } else {
+            let rows: Vec<(String, String)> = stats
+                .kinds_top
+                .iter()
+                .map(|(k, n)| (k.clone(), n.to_string()))
+                .collect();
+            body.push_str(&kv_table("kind", "entries", &rows));
+        }
+        let a = &stats.approvals;
+        body.push_str("<h2>Approvals</h2>");
+        body.push_str(&kv_table(
+            "status",
+            "count",
+            &[
+                ("pending".to_string(), a.pending.to_string()),
+                ("approved".to_string(), a.approved.to_string()),
+                ("denied".to_string(), a.denied.to_string()),
+                ("expired".to_string(), a.expired.to_string()),
+                ("released".to_string(), a.released.to_string()),
+            ],
+        ));
+        body.push_str("<h2>Verdicts</h2>");
+        if stats.verdicts_by_verdict.is_empty() {
+            body.push_str("<p>No verdicts yet.</p>");
+        } else {
+            let rows: Vec<(String, String)> = stats
+                .verdicts_by_verdict
+                .iter()
+                .map(|(k, n)| (k.clone(), n.to_string()))
+                .collect();
+            body.push_str(&kv_table("verdict", "count", &rows));
+        }
+        if stats.verdicts_by_category.is_empty() {
+            body.push_str("<p>No verdicts by category yet.</p>");
+        } else {
+            let rows: Vec<(String, String)> = stats
+                .verdicts_by_category
+                .iter()
+                .map(|(k, n)| (k.clone(), n.to_string()))
+                .collect();
+            body.push_str(&kv_table("category", "count", &rows));
+            body.push_str(&verdict_svg(&stats.verdicts_by_category));
+        }
+        if stats.auto_approved.is_empty() {
+            body.push_str("<p>Auto-approved categories: none.</p>");
+        } else {
+            body.push_str(&format!(
+                "<p>Auto-approved categories: {}</p>",
+                stats
+                    .auto_approved
+                    .iter()
+                    .map(|c| escape(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let t = &stats.try_it;
+        body.push_str("<h2>Try it</h2>");
+        body.push_str(&kv_table(
+            "metric",
+            "count",
+            &[
+                ("shown".to_string(), t.shown.to_string()),
+                ("yes".to_string(), t.yes.to_string()),
+                ("no".to_string(), t.no.to_string()),
+                ("later".to_string(), t.later.to_string()),
+                ("pending".to_string(), t.pending.to_string()),
+            ],
+        ));
+        body.push_str("<h2>Try-it cascade</h2>");
+        match &stats.cascade {
+            Some(c) => {
+                body.push_str(
+                    "<p>Decisions that failed closed fall back to the rules verdict; \
+                     the Jev and Muse stages only run when paid and the privacy gates allow.</p>",
+                );
+                let rows: Vec<(String, String)> = bookmarks_agent::stats::CASCADE_STAGES
+                    .iter()
+                    .map(|s| (s.to_string(), c.by_stage(s).to_string()))
+                    .collect();
+                body.push_str(&kv_table("stage", "decisions", &rows));
+            }
+            None => body.push_str("<p>no cascade decisions logged</p>"),
+        }
+        body.push_str("<h2>Daemon</h2>");
+        if stats.ticks.is_empty() {
+            body.push_str("<p>No daemon ticks logged.</p>");
+        } else {
+            let mut ticks = String::from("<table><tr><th>agent</th><th>last tick</th></tr>");
+            for tick in &stats.ticks {
+                let status = if tick.ok {
+                    "ok".to_string()
+                } else if let Some(error) = &tick.error {
+                    format!("error: {error}")
+                } else {
+                    "error".to_string()
+                };
+                ticks.push_str(&format!(
+                    "<tr><td>{}</td><td>{} at {}</td></tr>",
+                    escape(&tick.agent),
+                    escape(&status),
+                    tick.at,
+                ));
+            }
+            ticks.push_str("</table>");
+            body.push_str(&ticks);
+        }
+        if stats.deeper_outstanding.is_empty() {
+            body.push_str(&format!(
+                "<p>Queued go-deeper jobs: none outstanding ({} done).</p>",
+                stats.deeper_done
+            ));
+        } else {
+            body.push_str(&format!(
+                "<p>Queued go-deeper jobs: {} outstanding ({} done).</p>",
+                stats.deeper_outstanding.len(),
+                stats.deeper_done
+            ));
+            let rows: Vec<(String, String)> = stats
+                .deeper_outstanding
+                .iter()
+                .map(|j| {
+                    (
+                        j.post_id.clone(),
+                        format!("at {} ({})", j.at, j.status.as_str()),
+                    )
+                })
+                .collect();
+            body.push_str(&kv_table("post", "scheduled", &rows));
+        }
+    }
+    body.push_str("<h2>Built with Meta</h2>");
+    match &stats.muse_log {
+        Some(m) => body.push_str(&format!(
+            "<p>Muse Code runs: {} (est. cost {})</p>",
+            m.runs,
+            escape(&m.formatted_cost())
+        )),
+        None => body.push_str("<p>Muse Code runs: unavailable</p>"),
+    }
+    Response::ok(layout("Stats", &body, state))
+}
+
 /// Route one request. Pure over `(Request, &State)` apart from the file
 /// appends that votes, triage, follow-ups and approval decisions require.
+/// `GET /stats` renders the local stats dashboard (read-only).
 pub fn handle(req: &Request, state: &State) -> Response {
     if req.body.len() > MAX_BODY_BYTES {
         return Response::status(
@@ -1475,6 +1738,7 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("GET", "/hidden-authors") => page_hidden_authors(state),
         ("POST", "/unhide-author") => do_unhide_author(state, &req.body),
         ("GET", "/log") => page_log(state),
+        ("GET", "/stats") => page_stats(state),
         ("GET", "/approvals") => page_approvals(state),
         ("POST", "/approvals/approve") => decide_approval(state, &req.body, true),
         ("POST", "/approvals/deny") => decide_approval(state, &req.body, false),
@@ -3329,5 +3593,325 @@ mod tests {
         let resp = handle(&Request::get("/approvals"), &state);
         assert_eq!(resp.status, 200);
         assert!(resp.body.contains("TAMPERED at row 0"), "{}", resp.body);
+    }
+
+    /// Seed one approval per terminal state for `/stats` tests: pending,
+    /// approved, denied, time-expired and released (distinct payloads so
+    /// the pending dedupe never merges them).
+    fn seed_all_approval_states(now: u64, log_path: &std::path::Path) {
+        use ancientos_core::approvals::{approve, deny, release, request};
+        use ancientos_core::log::DecisionLog;
+        let mut log = DecisionLog::open(log_path).unwrap();
+        let propose = |log: &mut DecisionLog, draft: &str, at: u64, ttl: Option<u64>| {
+            request(
+                log,
+                "bookmarks-agent",
+                "x.post",
+                "synthetic stats proposal",
+                serde_json::json!({"draft": draft}),
+                at,
+                ttl,
+            )
+            .unwrap()
+        };
+        propose(&mut log, "stats-pending", now, None);
+        let approved = propose(&mut log, "stats-approved", now, None);
+        let token = approve(
+            &mut log,
+            &approved.id,
+            &approved.payload_hash,
+            "synthetic-human",
+            now,
+        )
+        .unwrap();
+        drop(token);
+        let denied = propose(&mut log, "stats-denied", now, None);
+        deny(
+            &mut log,
+            &denied.id,
+            &denied.payload_hash,
+            "synthetic-human",
+            "synthetic reason",
+            now,
+        )
+        .unwrap();
+        propose(&mut log, "stats-expired", 1_700_000_000, Some(60));
+        let released = propose(&mut log, "stats-released", now, None);
+        let token = approve(
+            &mut log,
+            &released.id,
+            &released.payload_hash,
+            "synthetic-human",
+            now,
+        )
+        .unwrap();
+        release(
+            &mut log,
+            token,
+            &serde_json::json!({"draft": "stats-released"}),
+        )
+        .unwrap();
+    }
+
+    /// Seed a fully populated synthetic log for `/stats` tests: verdicts
+    /// (one auto-approved category), every approval state, try-it funnel,
+    /// cascade stages, daemon ticks and deeper jobs. Returns the seed `now`.
+    fn seed_stats_log(state: &State) -> u64 {
+        use ancientos_core::feedback::{FeedbackRecord, ThresholdPolicy, Verdict};
+        use ancientos_core::log::DecisionLog;
+        let now = now_secs();
+        seed_all_approval_states(now, &state.log_path());
+        let mut log = DecisionLog::open(state.log_path()).unwrap();
+        for (id, cat, verdict) in [
+            ("s1", "Synthetic Rust", Verdict::Approve),
+            ("s2", "Synthetic Rust", Verdict::Approve),
+            ("s3", "Synthetic Rust", Verdict::Approve),
+            ("s4", "Synthetic Cooking", Verdict::Skip),
+        ] {
+            ancientos_core::feedback::record(
+                &mut log,
+                FeedbackRecord {
+                    pick_id: id.to_string(),
+                    category: cat.to_string(),
+                    verdict,
+                    tags: Vec::new(),
+                },
+                ThresholdPolicy::default(),
+            )
+            .unwrap();
+        }
+        bookmarks_agent::try_it::record_shown(&mut log, "p1", now).unwrap();
+        bookmarks_agent::try_it::record_shown(&mut log, "p2", now).unwrap();
+        bookmarks_agent::try_it::record_followup(
+            &mut log,
+            "p1",
+            bookmarks_agent::try_it::Tried::Yes,
+            None,
+        )
+        .unwrap();
+        bookmarks_agent::try_it::record_followup(
+            &mut log,
+            "p2",
+            bookmarks_agent::try_it::Tried::Later,
+            Some("synthetic note"),
+        )
+        .unwrap();
+        for (i, stage) in [
+            "topic_filter",
+            "rules",
+            "rules",
+            "jev",
+            "muse",
+            "fail_closed",
+        ]
+        .iter()
+        .enumerate()
+        {
+            log.append(
+                "try_it.cascade",
+                serde_json::json!({"stage": stage, "post_id": format!("syn-{i}")}),
+            )
+            .unwrap();
+        }
+        for (agent, ok, at, error) in [
+            ("brief", true, now, None),
+            ("digest", false, now, Some("synthetic boom")),
+            ("brief", true, now + 1, None),
+        ] {
+            let mut payload = serde_json::json!({"agent": agent, "ok": ok, "at": at});
+            if let Some(e) = error {
+                payload["error"] = serde_json::json!(e);
+            }
+            log.append(bookmarks_agent::daemon::DAEMON_TICK_KIND, payload)
+                .unwrap();
+        }
+        bookmarks_agent::deeper::queue_later(&mut log, "demo-9001", now + 3600, now).unwrap();
+        bookmarks_agent::deeper::queue_later(&mut log, "demo-9002", now, now).unwrap();
+        log.append(
+            bookmarks_agent::deeper::DEEPER_QUEUE_DONE_KIND,
+            serde_json::json!({"post_id": "demo-9002", "at": now}),
+        )
+        .unwrap();
+        now
+    }
+
+    /// Synthetic run log: two counted rows ($1.00 + $2.50) plus one `Not
+    /// used` row the `demo.sh` rule excludes.
+    fn write_stats_muse_log(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("muse-code-log.md");
+        std::fs::write(
+            &path,
+            "# Synthetic run log\n\
+             | 1 | 2026-10-26 | synthetic task one | Done; est. cost $1.00. |\n\
+             | 2b | 2026-10-26 | synthetic scaffold | Not used: written directly. |\n\
+             | 3 | 2026-10-26 | synthetic task two | Done; est. cost $2.50. |\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn stats_empty_dir_renders_with_nav_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        state.muse_log_path = dir.path().join("missing.md");
+        let resp = handle(&Request::get("/stats"), &state);
+        assert_eq!(resp.status, 200);
+        for want in [
+            "<a href=\"/stats\">Stats</a>",
+            "chain verified",
+            "0 entries",
+            "no cascade decisions logged",
+            "No daemon ticks logged.",
+            "Muse Code runs: unavailable",
+        ] {
+            assert!(resp.body.contains(want), "missing {want}: {}", resp.body);
+        }
+        assert!(
+            resp.body.contains("<td>pending</td><td>0</td>"),
+            "{}",
+            resp.body
+        );
+        assert!(!resp.body.contains("withheld"), "{}", resp.body);
+    }
+
+    #[test]
+    fn stats_populated_dir_renders_expected_numbers() {
+        let (dir, mut state) = test_state();
+        let now = seed_stats_log(&state);
+        state.muse_log_path = write_stats_muse_log(dir.path());
+        let resp = handle(&Request::get("/stats"), &state);
+        assert_eq!(resp.status, 200);
+        let total = log_entries(&state).len();
+        for want in [
+            "chain verified".to_string(),
+            format!("{total} entries"),
+            "<td>pending</td><td>1</td>".to_string(),
+            "<td>approved</td><td>1</td>".to_string(),
+            "<td>denied</td><td>1</td>".to_string(),
+            "<td>expired</td><td>1</td>".to_string(),
+            "<td>released</td><td>1</td>".to_string(),
+            "<td>approve</td><td>3</td>".to_string(),
+            "<td>skip</td><td>1</td>".to_string(),
+            "<td>Synthetic Rust</td><td>3</td>".to_string(),
+            "Auto-approved categories: Synthetic Rust".to_string(),
+            "<td>shown</td><td>2</td>".to_string(),
+            "<td>yes</td><td>1</td>".to_string(),
+            "<td>no</td><td>0</td>".to_string(),
+            "<td>later</td><td>1</td>".to_string(),
+            "<td>pending</td><td>1</td>".to_string(),
+            "<td>topic_filter</td><td>1</td>".to_string(),
+            "<td>rules</td><td>2</td>".to_string(),
+            "<td>jev</td><td>1</td>".to_string(),
+            "<td>muse</td><td>1</td>".to_string(),
+            "<td>fail_closed</td><td>1</td>".to_string(),
+            format!("brief</td><td>ok at {}", now + 1),
+            "digest</td><td>error: synthetic boom".to_string(),
+            "1 outstanding (1 done)".to_string(),
+            "Muse Code runs: 2 (est. cost $3.50)".to_string(),
+        ] {
+            assert!(resp.body.contains(&want), "missing {want}: {}", resp.body);
+        }
+        assert!(resp.body.contains("<svg"), "{}", resp.body);
+        assert!(resp.body.contains("<rect"), "{}", resp.body);
+        assert!(resp.body.contains("demo-9001"), "{}", resp.body);
+        assert!(
+            !resp.body.contains("demo-9002"),
+            "done job must not list as queued: {}",
+            resp.body
+        );
+        assert!(
+            !resp.body.contains("no cascade decisions logged"),
+            "{}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn stats_broken_chain_shows_broken_and_withholds_rest() {
+        let (dir, mut state) = test_state();
+        seed_feedback(
+            &state,
+            &[
+                (
+                    "p1",
+                    "Synthetic Rust",
+                    ancientos_core::feedback::Verdict::Approve,
+                ),
+                (
+                    "p2",
+                    "Synthetic Rust",
+                    ancientos_core::feedback::Verdict::Skip,
+                ),
+            ],
+        );
+        let body = std::fs::read_to_string(state.log_path()).unwrap();
+        std::fs::write(state.log_path(), body.replacen("approve", "APPROVE", 1)).unwrap();
+        state.muse_log_path = write_stats_muse_log(dir.path());
+        let resp = handle(&Request::get("/stats"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("broken at line 0"), "{}", resp.body);
+        assert_eq!(
+            resp.body.matches("<p>withheld (fail closed)</p>").count(),
+            5,
+            "{}",
+            resp.body
+        );
+        assert!(!resp.body.contains("chain verified"), "{}", resp.body);
+        assert!(!resp.body.contains("No verdicts yet."), "{}", resp.body);
+        // The independent run log still renders.
+        assert!(
+            resp.body.contains("Muse Code runs: 2 (est. cost $3.50)"),
+            "{}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn stats_escapes_dynamic_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        state.muse_log_path = dir.path().join("missing.md");
+        seed_feedback(
+            &state,
+            &[(
+                "p1",
+                "<script>alert('x')</script>",
+                ancientos_core::feedback::Verdict::Approve,
+            )],
+        );
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        log.append(
+            bookmarks_agent::daemon::DAEMON_TICK_KIND,
+            serde_json::json!({"agent": "brief", "ok": false, "at": 1, "error": "<b>bad</b>"}),
+        )
+        .unwrap();
+        drop(log);
+        let resp = handle(&Request::get("/stats"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("&lt;script&gt;"), "{}", resp.body);
+        assert!(
+            resp.body.contains("&lt;b&gt;bad&lt;/b&gt;"),
+            "{}",
+            resp.body
+        );
+        assert!(!resp.body.contains("<script>"), "{}", resp.body);
+        assert!(!resp.body.contains("<b>bad</b>"), "{}", resp.body);
+    }
+
+    #[test]
+    fn stats_missing_muse_log_shows_unavailable() {
+        let (dir, mut state) = test_state();
+        seed_stats_log(&state);
+        state.muse_log_path = dir.path().join("no-such-file.md");
+        let resp = handle(&Request::get("/stats"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(
+            resp.body.contains("Muse Code runs: unavailable"),
+            "{}",
+            resp.body
+        );
+        // Log-derived sections still render.
+        assert!(resp.body.contains("chain verified"), "{}", resp.body);
     }
 }
