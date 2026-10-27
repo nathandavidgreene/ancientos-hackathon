@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Doc-comment coverage check: every Rust fn (except #[test] fns) needs a
-# `///` doc comment, and every shell script and shell function needs a
-# header comment. Prints coverage; exits 1 if anything is undocumented.
+# `///` doc comment, every Python module and function under tools/ needs a
+# docstring, and every shell script and shell function needs a header
+# comment. Prints coverage; exits 1 if anything is undocumented.
 # Usage: scripts/check_docs.sh [--list]   (--list prints every gap)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 LIST="${1:-}"
 python3 - "$LIST" <<'PY'
 """Scan Rust and shell sources and report undocumented functions."""
+import ast
 import pathlib
 import re
 import sys
@@ -51,7 +53,18 @@ for path in sorted(pathlib.Path("crates").rglob("*.rs")):
         if not (prev.startswith("///") or prev.endswith("*/")):
             missing.append(f"{path}:{i + 1}: {line.strip()[:90]}")
 
-for path in sorted(pathlib.Path("scripts").glob("*.sh")):
+for path in sorted(pathlib.Path("tools").glob("*.py")):
+    tree = ast.parse(path.read_text())
+    total += 1
+    if ast.get_docstring(tree) is None:
+        missing.append(f"{path}:1: module has no docstring")
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            total += 1
+            if ast.get_docstring(node) is None:
+                missing.append(f"{path}:{node.lineno}: def {node.name}")
+
+for path in sorted([*pathlib.Path("scripts").glob("*.sh"), *pathlib.Path("tools").glob("*.sh")]):
     lines = path.read_text().splitlines()
     total += 1
     if len(lines) < 2 or not lines[1].startswith("# "):
