@@ -1680,8 +1680,8 @@ mod tests {
             }),
             had_note_tweet: false,
             media: Vec::new(),
-            // Synthetic English posts (one brief-integration test below
-            // flows through the language filter; the classifier ignores lang).
+            // Synthetic English posts (the classifier ignores lang; brief
+            // translations leave English posts unchanged).
             lang: Some("en".to_string()),
         }
     }

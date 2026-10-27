@@ -6,8 +6,10 @@
 //! - brief ranking (`bookmarks_agent::brief::select_candidates` with an empty
 //!   live set, then `bookmarks_agent::brief::local_picks`)
 //!
-//! Non-English bookmarks are never sampled (skipped with an aggregate count
-//! only). Reports carry aggregate numbers only, never post text, ids or urls.
+//! Non-English bookmarks are always sampled (never hidden for language) and
+//! scored on the cached English translation when available, else on the
+//! original. Reports carry aggregate numbers only — translated/untranslated
+//! counts, never post text, ids or urls.
 
 use bookmarks_agent::fixture::Bookmark;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -119,29 +121,66 @@ pub struct EvalReport {
     pub n_labels: usize,
     pub n_matched: usize,
     pub n_unmatched_labels: usize,
-    /// Matched bookmarks skipped as non-English (never sampled for scoring).
+    /// Matched bookmarks that are non-English (always sampled; equals
+    /// `n_translated + n_untranslated`).
     pub n_non_english: usize,
+    /// Non-English matches scored on a cached English translation.
+    pub n_translated: usize,
+    /// Non-English matches with no cached translation (scored on the
+    /// original).
+    pub n_untranslated: usize,
     pub try_it: Confusion,
     pub ranking: RankingEval,
 }
 
+/// Join `labels` to `bookmarks` by `post_id` and score both tasks with no
+/// cached translations (every non-English match counts as untranslated and
+/// scores on the original). See [`evaluate_with_cache`].
+pub fn evaluate(bookmarks: &[Bookmark], labels: &[Label], name: &str) -> EvalReport {
+    evaluate_with_cache(bookmarks, labels, name, &HashMap::new())
+}
+
 /// Join `labels` to `bookmarks` by `post_id` and score both tasks. Labels
 /// without a matching bookmark are counted in `n_unmatched_labels`: never an
-/// error, never a panic. Matched bookmarks that are not English are skipped
-/// silently (counted in `n_non_english` only), mirroring how the brief
-/// drops non-English posts before candidate selection.
-pub fn evaluate(bookmarks: &[Bookmark], labels: &[Label], name: &str) -> EvalReport {
+/// error, never a panic. Non-English matches are always sampled (never
+/// hidden for language): those with a cached English translation score on
+/// the translation (counted in `n_translated`), the rest score on the
+/// original (counted in `n_untranslated`). Reads the cache only; makes no
+/// model calls.
+pub fn evaluate_with_cache(
+    bookmarks: &[Bookmark],
+    labels: &[Label],
+    name: &str,
+    cache: &HashMap<String, bookmarks_agent::translate::CacheEntry>,
+) -> EvalReport {
     let by_id: HashMap<&str, &Bookmark> =
         bookmarks.iter().map(|b| (b.post_id.as_str(), b)).collect();
-    let mut matched: Vec<(&Bookmark, &Label)> = Vec::new();
+    let mut matched: Vec<(Bookmark, &Label)> = Vec::new();
     let mut unmatched = 0usize;
     let mut non_english = 0usize;
+    let mut translated = 0usize;
+    let mut untranslated = 0usize;
     for label in labels {
         match by_id.get(label.post_id.as_str()) {
-            Some(bookmark) if bookmarks_agent::language::is_english(bookmark) => {
-                matched.push((bookmark, label));
+            Some(bookmark) => {
+                if bookmarks_agent::language::is_english(bookmark) {
+                    matched.push(((*bookmark).clone(), label));
+                } else {
+                    non_english += 1;
+                    let t = bookmarks_agent::translate::cached_only(bookmark, cache);
+                    if t.status == bookmarks_agent::translate::TranslationStatus::Translated {
+                        translated += 1;
+                        let mut effective = (*bookmark).clone();
+                        if let Some(english) = t.english {
+                            effective.text = english;
+                        }
+                        matched.push((effective, label));
+                    } else {
+                        untranslated += 1;
+                        matched.push(((*bookmark).clone(), label));
+                    }
+                }
             }
-            Some(_) => non_english += 1,
             None => unmatched += 1,
         }
     }
@@ -157,7 +196,7 @@ pub fn evaluate(bookmarks: &[Bookmark], labels: &[Label], name: &str) -> EvalRep
         }
     }
 
-    let rows: Vec<Bookmark> = matched.iter().map(|(b, _)| (*b).clone()).collect();
+    let rows: Vec<Bookmark> = matched.iter().map(|(b, _)| b.clone()).collect();
     let worthy: HashSet<&str> = matched
         .iter()
         .filter(|(_, l)| l.brief_worthy)
@@ -188,6 +227,8 @@ pub fn evaluate(bookmarks: &[Bookmark], labels: &[Label], name: &str) -> EvalRep
         n_matched: matched.len(),
         n_unmatched_labels: unmatched,
         n_non_english: non_english,
+        n_translated: translated,
+        n_untranslated: untranslated,
         try_it,
         ranking: RankingEval {
             precision_at_5: safe_div(picks_hit, picks.len()),
@@ -203,6 +244,9 @@ pub fn evaluate(bookmarks: &[Bookmark], labels: &[Label], name: &str) -> EvalRep
 }
 
 /// Load bookmarks and labels from JSONL files and score both tasks.
+/// Translations come from `$TRANSLATIONS_CACHE_PATH` when set, else
+/// `translations.json` next to the bookmarks file, else none (every
+/// non-English match counts as untranslated). Reads only; no model calls.
 pub fn run(
     bookmarks_path: impl AsRef<Path>,
     labels_path: impl AsRef<Path>,
@@ -212,7 +256,23 @@ pub fn run(
     let bookmarks = bookmarks_agent::fixture::load(bookmarks_path)
         .map_err(|e| format!("bookmarks {}: {e}", bookmarks_path.display()))?;
     let labels = load_labels(labels_path.as_ref())?;
-    Ok(evaluate(&bookmarks, &labels, name))
+    let cache_path = match std::env::var(bookmarks_agent::translate::CACHE_ENV_VAR)
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        Some(p) => std::path::PathBuf::from(p),
+        None => bookmarks_path
+            .parent()
+            .map(|d| {
+                d.join(bookmarks_agent::translate::CACHE_FILE_NAME)
+                    .to_path_buf()
+            })
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(bookmarks_agent::translate::CACHE_FILE_NAME)
+            }),
+    };
+    let cache = bookmarks_agent::translate::load_cache(&cache_path);
+    Ok(evaluate_with_cache(&bookmarks, &labels, name, &cache))
 }
 
 /// Render the report as markdown. Aggregate numbers only: no post text, ids
@@ -223,7 +283,7 @@ pub fn render_markdown(report: &EvalReport) -> String {
     format!(
         "# Eval report — {name}\n\
          \n\
-         Labels: {n_labels} total, {n_matched} matched, {n_unmatched} unmatched, {n_non_en} non-English skipped.\n\
+         Labels: {n_labels} total, {n_matched} matched, {n_unmatched} unmatched, {n_non_en} non-English ({n_tr} translated, {n_un} untranslated).\n\
          \n\
          | Task | n | TP | FP | FN | TN | Precision | Recall | F1 |\n\
          | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n\
@@ -246,6 +306,8 @@ pub fn render_markdown(report: &EvalReport) -> String {
         n_matched = report.n_matched,
         n_unmatched = report.n_unmatched_labels,
         n_non_en = report.n_non_english,
+        n_tr = report.n_translated,
+        n_un = report.n_untranslated,
         n = t.n(),
         tp = t.tp,
         fp = t.fp,
@@ -363,33 +425,32 @@ mod tests {
     }
 
     #[test]
-    fn non_english_bookmarks_are_never_sampled() {
-        let en = Bookmark {
-            post_id: "syn-en".to_string(),
-            url: "https://x.com/i/status/syn-en".to_string(),
-            text: "[synthetic] The government presented an economic plan to support small local businesses."
-                .to_string(),
-            author_username: None,
-            created_at: None,
-            folders: None,
-            label: None,
-            had_note_tweet: false,
-            media: Vec::new(),
-            lang: None,
-        };
-        let es = Bookmark {
-            post_id: "syn-es".to_string(),
-            url: "https://x.com/i/status/syn-es".to_string(),
-            text: "[synthetic] The government presented an economic plan to support small local businesses."
-                .to_string(),
-            author_username: None,
-            created_at: None,
-            folders: None,
-            label: None,
-            had_note_tweet: false,
-            media: Vec::new(),
-            lang: Some("es".to_string()),
-        };
+    fn non_english_bookmarks_are_sampled_and_scored_on_translation() {
+        fn bm(id: &str, text: &str, lang: Option<&str>) -> Bookmark {
+            Bookmark {
+                post_id: id.to_string(),
+                url: format!("https://x.com/i/status/{id}"),
+                text: text.to_string(),
+                author_username: None,
+                created_at: None,
+                folders: None,
+                label: None,
+                had_note_tweet: false,
+                media: Vec::new(),
+                lang: lang.map(str::to_string),
+            }
+        }
+        let en_text =
+            "[synthetic] The government presented an economic plan to support small local businesses.";
+        let es_text =
+            "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales.";
+        // Hands-on English: the gold try-it label applies to the translation.
+        let es_english = "[synthetic] Try it: 1. Do A 2. Do B";
+        let bookmarks = vec![
+            bm("syn-en", en_text, None),
+            bm("syn-es-yes", es_text, Some("es")),
+            bm("syn-es-no", es_text, Some("es")),
+        ];
         let labels = vec![
             Label {
                 post_id: "syn-en".to_string(),
@@ -397,21 +458,62 @@ mod tests {
                 brief_worthy: true,
             },
             Label {
-                post_id: "syn-es".to_string(),
-                try_it: false,
+                post_id: "syn-es-yes".to_string(),
+                try_it: true,
                 brief_worthy: true,
             },
+            Label {
+                post_id: "syn-es-no".to_string(),
+                try_it: false,
+                brief_worthy: false,
+            },
         ];
-        let report = evaluate(&[en, es], &labels, "synthetic");
-        assert_eq!(report.n_labels, 2);
-        assert_eq!(report.n_matched, 1);
+        // Cached translation for syn-es-yes only; syn-es-no stays untranslated.
+        let mut cache = HashMap::new();
+        cache.insert(
+            bookmarks_agent::translate::cache_key("syn-es-yes", es_text),
+            bookmarks_agent::translate::CacheEntry {
+                english: es_english.to_string(),
+                source_lang: Some("es".to_string()),
+            },
+        );
+        let report = evaluate_with_cache(&bookmarks, &labels, "synthetic", &cache);
+        // Nothing hidden for language: all three sampled.
+        assert_eq!(report.n_labels, 3);
+        assert_eq!(report.n_matched, 3);
         assert_eq!(report.n_unmatched_labels, 0);
-        assert_eq!(report.n_non_english, 1);
-        assert_eq!(report.ranking.n_brief_worthy, 1);
-        assert_eq!(report.ranking.n_candidates, 1);
+        assert_eq!(report.n_non_english, 2);
+        assert_eq!(report.n_translated, 1);
+        assert_eq!(report.n_untranslated, 1);
+        // syn-es-yes scores on its translation (hands-on => predicted yes).
+        assert_eq!(
+            report.try_it,
+            Confusion {
+                tp: 1,
+                fp: 0,
+                r#fn: 0,
+                tn: 2,
+            },
+            "translation must flip the prediction to yes"
+        );
+        assert_eq!(report.ranking.n_brief_worthy, 2);
+        assert_eq!(report.ranking.n_candidates, 3);
         let md = render_markdown(&report);
-        assert!(md.contains("1 non-English skipped"), "{md}");
+        assert!(
+            md.contains("2 non-English (1 translated, 1 untranslated)"),
+            "{md}"
+        );
         assert!(!md.contains("syn-es"), "{md}");
+        assert!(!md.contains(es_text), "leaked original");
+        assert!(!md.contains(es_english), "leaked translation");
+        // Without the cache both non-English posts score on the original
+        // (still sampled, both untranslated): syn-es-yes becomes a miss.
+        let plain = evaluate(&bookmarks, &labels, "synthetic");
+        assert_eq!(plain.n_matched, 3);
+        assert_eq!(plain.n_translated, 0);
+        assert_eq!(plain.n_untranslated, 2);
+        assert_eq!(plain.try_it.tp, 0);
+        assert_eq!(plain.try_it.r#fn, 1);
     }
 
     #[test]

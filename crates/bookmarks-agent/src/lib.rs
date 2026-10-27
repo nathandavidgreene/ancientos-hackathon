@@ -17,6 +17,7 @@ pub mod sanitize;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod token_store;
+pub mod translate;
 pub mod try_it;
 pub mod unroll;
 pub mod vote;

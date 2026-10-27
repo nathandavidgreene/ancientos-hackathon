@@ -48,6 +48,10 @@ pub struct BriefPick {
     pub full_text: String,
     /// Attached media, rendered as links/thumbnails under the full text.
     pub media: Vec<crate::media::Media>,
+    /// Translation for non-English posts (`None` for English, shown
+    /// unchanged). `Translated` renders the English plus the original;
+    /// `Untranslated` renders the original plus a marker.
+    pub translation: Option<crate::translate::Translation>,
 }
 
 #[derive(Debug, Clone)]
@@ -408,6 +412,44 @@ pub fn render_blockquote(text: &str) -> String {
         .join("\n")
 }
 
+/// English text for try-it classification: the translation when a
+/// non-English pick has one, else the full text.
+fn english_for_try_it(p: &BriefPick) -> &str {
+    if let Some(t) = p.translation.as_ref() {
+        if t.status == crate::translate::TranslationStatus::Translated {
+            if let Some(e) = t.english.as_deref() {
+                if !e.trim().is_empty() {
+                    return e;
+                }
+            }
+        }
+    }
+    &p.full_text
+}
+
+/// Render one pick's text: English posts unchanged; non-English posts show
+/// the English translation plus `Translated from <lang>` with the original
+/// below, or the original plus `Untranslated (<lang>)`.
+fn render_pick_text(p: &BriefPick) -> String {
+    let Some(t) = p.translation.as_ref() else {
+        return render_blockquote(&p.full_text);
+    };
+    let lang = crate::translate::display_lang(t.source_lang.as_deref());
+    if t.status == crate::translate::TranslationStatus::Translated {
+        if let Some(e) = t.english.as_deref().filter(|e| !e.trim().is_empty()) {
+            return format!(
+                "{}\n\n*Translated from {lang}*\n\n<details><summary>Original</summary>\n\n{}\n\n</details>",
+                render_blockquote(e),
+                render_blockquote(&p.full_text)
+            );
+        }
+    }
+    format!(
+        "{}\n\n*Untranslated ({lang})*",
+        render_blockquote(&p.full_text)
+    )
+}
+
 pub fn render_markdown(
     date: &str,
     picks: &[BriefPick],
@@ -425,7 +467,7 @@ pub fn render_markdown(
                 .as_deref()
                 .map(|a| format!("@{a}"))
                 .unwrap_or_else(|| "unknown".to_string());
-            let tagged = crate::try_it::classify_text(&p.topic, &p.full_text).is_some();
+            let tagged = crate::try_it::classify_text(&p.topic, english_for_try_it(p)).is_some();
             let marker = if tagged { " [TRY IT]" } else { "" };
             md.push_str(&format!(
                 "## {}. **{}**{marker}\n- Author: {}\n- Topic: {}\n- Link: {}\n\n{}\n\n",
@@ -434,10 +476,10 @@ pub fn render_markdown(
                 author,
                 p.topic,
                 p.url,
-                render_blockquote(&p.full_text)
+                render_pick_text(p)
             ));
             if tagged {
-                let steps = crate::try_it::extract_steps(&p.full_text);
+                let steps = crate::try_it::extract_steps(english_for_try_it(p));
                 if !steps.is_empty() {
                     md.push_str("**Steps**\n");
                     for (n, step) in steps.iter().enumerate() {
@@ -469,10 +511,11 @@ pub fn render_markdown(
     md
 }
 
-/// Run the brief: filter dead/unavailable posts via liveness and
-/// non-English posts via the language filter, select candidates, make at
-/// most one model call, gate every pick, hydrate truncated full text
-/// (display only), expand one thread root (display only), append to the
+/// Run the brief: filter dead/unavailable posts via liveness, select
+/// candidates (non-English posts kept and translated for display, never
+/// skipped), make at most one ranking model call, gate every pick, hydrate
+/// truncated full text (display only), expand one thread root (display
+/// only), translate non-English picks (display only, cached), append to the
 /// decision log, and render markdown.
 pub fn run(
     merged: &MergeOutput,
@@ -555,7 +598,8 @@ pub fn run_full(
 /// real X client. Dead/unknown posts are skipped before candidate selection
 /// (fail closed, excluded from model eval and the approval gate); only a
 /// liveness cache entry is recorded, never a decision-log entry.
-/// Non-English posts are skipped the same way right after (no log entry).
+/// Non-English posts are kept and translated for display (see
+/// [`crate::translate`]); they are never skipped for language.
 #[allow(clippy::too_many_arguments)]
 pub fn run_full_with_liveness(
     merged: &MergeOutput,
@@ -572,7 +616,7 @@ pub fn run_full_with_liveness(
     }
     // Posts hidden by a never_post verdict, and posts by a hidden
     // author, never become candidates. Silent in-memory filtering (like
-    // liveness/language below): no log entry, store never modified.
+    // liveness below): no log entry, store never modified.
     let (hidden, hidden_authors) = {
         let log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
         let records = feedback::records_from_log(&log).map_err(|e| e.to_string())?;
@@ -593,17 +637,14 @@ pub fn run_full_with_liveness(
     }
     // Liveness: confirm posts still exist before surfacing. Dead/unknown are
     // skipped (fail closed); the store is never modified and no log entry is
-    // written for them.
+    // written for them. Non-English posts are kept: they are translated for
+    // display (see below), never skipped for language.
     let cache_path = crate::liveness::cache_path_for_log(log_path)?;
     let now = crate::liveness::now_secs();
     let rows: Vec<Bookmark> = match lookup {
         Some(l) => crate::liveness::filter_with_lookup(&rows, &cache_path, offline, now, l)?,
         None => crate::liveness::filter_live(&rows, &cache_path, offline, now)?,
     };
-    // Language: never surface a non-English post. Skipped silently in
-    // memory only (fail closed), like dead posts above: no log entry, and
-    // the store is never modified.
-    let rows: Vec<Bookmark> = crate::language::english_only(&rows);
     if rows.is_empty() {
         return Err("no bookmarks to brief".to_string());
     }
@@ -657,6 +698,7 @@ pub fn run_full_with_liveness(
             why: why.clone(),
             full_text,
             media,
+            translation: None,
         };
         evaluated.push((pick, verdict, why.clone()));
     }
@@ -734,6 +776,33 @@ pub fn run_full_with_liveness(
         }
     }
 
+    // Translate non-English picks for display (cached on disk beside the
+    // log; failures stay Untranslated and still surface). English picks keep
+    // `translation: None` and render unchanged. A cache-save failure is
+    // ignored (fail open: the brief still renders).
+    if let Ok(tcache_path) = crate::translate::cache_path_for_log(log_path) {
+        let mut tcache = crate::translate::load_cache(&tcache_path);
+        for p in &mut picks {
+            let Some(tmp) = stored.get(p.post_id.as_str()).map(|b| {
+                let mut tmp = (*b).clone();
+                tmp.text = p.full_text.clone();
+                tmp
+            }) else {
+                continue;
+            };
+            if crate::language::is_english(&tmp) {
+                continue;
+            }
+            p.translation = Some(crate::translate::translate_with_env(&tmp, &mut tcache));
+            // Display the translation of the final (hydrated/expanded) text;
+            // the original below stays the pick's full text.
+            if let Some(t) = p.translation.as_mut() {
+                t.original = p.full_text.clone();
+            }
+        }
+        let _ = crate::translate::save_cache(&tcache_path, &tcache);
+    }
+
     if let Some(parent) = log_path.parent() {
         if !parent.as_os_str().is_empty() {
             crate::token_store::ensure_dir_0700(parent)
@@ -781,9 +850,10 @@ pub fn run_full_with_liveness(
     .map_err(|e| e.to_string())?;
     // Tag hands-on picks for follow-up: one `try_it.shown` entry per
     // rendered tagged pick (post id plus timestamp, never text).
+    // Classification scores the English translation when available.
     let shown_at = crate::idea_card::now_secs();
     for p in &picks {
-        if crate::try_it::classify_text(&p.topic, &p.full_text).is_some() {
+        if crate::try_it::classify_text(&p.topic, english_for_try_it(p)).is_some() {
             crate::try_it::record_shown(&mut log, &p.post_id, shown_at)?;
         }
     }
@@ -822,7 +892,7 @@ mod tests {
             had_note_tweet: false,
             media: Vec::new(),
             // Synthetic English posts: a determined code keeps brief tests
-            // hermetic (the language filter is covered by its own tests).
+            // hermetic (translation behavior is covered by its own tests).
             lang: Some("en".to_string()),
         }
     }
@@ -1247,6 +1317,7 @@ mod tests {
                 video_url: None,
                 alt_text: Some("synthetic alt".into()),
             }],
+            translation: None,
         };
         let without_media = BriefPick {
             index: 2,
@@ -1257,6 +1328,7 @@ mod tests {
             why: "synthetic why two".into(),
             full_text: "synthetic plain".into(),
             media: Vec::new(),
+            translation: None,
         };
         let md = render_markdown(
             "2026-10-26",
@@ -1743,9 +1815,11 @@ mod tests {
     }
 
     #[test]
-    fn language_non_english_are_excluded_without_log_or_delete() {
+    fn language_non_english_are_translated_and_surfaced_never_hidden() {
         use std::collections::HashMap;
-        let _env = crate::test_support::EnvHold::paid_on();
+        // Paid off: hermetic (translations come from the pre-populated disk
+        // cache; cache misses stay Untranslated with zero model calls).
+        let _env = crate::test_support::EnvHold::paid_off();
         let mut rows: Vec<Bookmark> = ["en1", "en2", "es1", "fr1", "cjk1", "short1"]
             .into_iter()
             .map(|id| bm(id, None, Some("TopicA"), Some(0.9)))
@@ -1782,7 +1856,21 @@ mod tests {
         let before: Vec<String> = merged.rows.iter().map(|b| b.post_id.clone()).collect();
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("decision_log.jsonl");
-        // Liveness passes everything: only the language filter drops rows.
+        // Pre-populate the translation cache: es1 is Translated, everything
+        // else uncached stays Untranslated (paid off, zero calls).
+        let es1_text = "[synthetic] The government presented an economic plan to support small local businesses.";
+        let es1_english = "[synthetic] Translated English for es1.";
+        let mut tcache = HashMap::new();
+        tcache.insert(
+            crate::translate::cache_key("es1", es1_text),
+            crate::translate::CacheEntry {
+                english: es1_english.to_string(),
+                source_lang: Some("es".to_string()),
+            },
+        );
+        crate::translate::save_cache(&dir.path().join(crate::translate::CACHE_FILE_NAME), &tcache)
+            .unwrap();
+        // Liveness passes everything; with paid off it skips without network.
         let lookup =
             |chunk: &[String]| -> Result<HashMap<String, crate::x_api::PostLiveness>, String> {
                 Ok(chunk
@@ -1790,7 +1878,11 @@ mod tests {
                     .map(|id| (id.clone(), crate::x_api::PostLiveness::Live))
                     .collect())
             };
-        let model = FakeModel::ok(r#"[{"n":1,"why":"ok one"},{"n":2,"why":"ok two"}]"#);
+        // Candidates sort by post_id (single topic, all live): cjk1(1),
+        // en1(2), en2(3), es1(4), fr1(5), short1(6).
+        let model = FakeModel::ok(
+            r#"[{"n":4,"why":"translated pick"},{"n":1,"why":"untranslated pick"},{"n":2,"why":"english pick"}]"#,
+        );
         let res = run_full_with_liveness(
             &merged,
             &model,
@@ -1798,34 +1890,55 @@ mod tests {
             "2026-10-26",
             None,
             None,
-            false,
+            true,
             Some(&lookup),
         )
         .unwrap();
-        // Filtered posts never surface: not candidates (model input), not
-        // picks (gate input), not markdown.
-        for gone in ["es1", "fr1", "cjk1", "short1"] {
+        // Nothing is hidden for language: all six are candidates.
+        assert_eq!(res.candidates.len(), 6);
+        for id in ["en1", "en2", "es1", "fr1", "cjk1", "short1"] {
             assert!(
-                !res.candidates.iter().any(|c| c.post_id == gone),
-                "candidate {gone}"
-            );
-            assert!(!res.picks.iter().any(|p| p.post_id == gone), "pick {gone}");
-            assert!(
-                !res.markdown.contains(gone),
-                "markdown mentions {gone}: {}",
-                res.markdown
-            );
-            assert!(
-                !model.seen.borrow()[0].contains(gone),
-                "model prompt saw {gone}"
+                res.candidates.iter().any(|c| c.post_id == id),
+                "candidate {id}"
             );
         }
-        assert_eq!(res.candidates.len(), 2);
-        assert_eq!(res.picks.len(), 2);
+        assert_eq!(res.picks.len(), 3);
+        // es1 shows the cached translation plus the marker and the original.
+        let es1 = res.picks.iter().find(|p| p.post_id == "es1").unwrap();
+        assert_eq!(
+            es1.translation.as_ref().map(|t| t.status),
+            Some(crate::translate::TranslationStatus::Translated)
+        );
+        assert!(
+            res.markdown.contains("Translated from es"),
+            "translated marker: {}",
+            res.markdown
+        );
+        assert!(res.markdown.contains(es1_english), "{}", res.markdown);
+        assert!(res.markdown.contains(es1_text), "{}", res.markdown);
+        // cjk1 has no translation: original plus the untranslated marker.
+        let cjk1 = res.picks.iter().find(|p| p.post_id == "cjk1").unwrap();
+        assert_eq!(
+            cjk1.translation.as_ref().map(|t| t.status),
+            Some(crate::translate::TranslationStatus::Untranslated)
+        );
+        assert!(
+            res.markdown.contains("Untranslated (und)"),
+            "untranslated marker: {}",
+            res.markdown
+        );
+        assert!(
+            res.markdown.contains("[synthetic] 这是一个中文测试帖子"),
+            "{}",
+            res.markdown
+        );
+        // en1 is English: unchanged, no translation, no marker.
+        let en1 = res.picks.iter().find(|p| p.post_id == "en1").unwrap();
+        assert_eq!(en1.translation, None);
         // Merged input is unchanged: nothing deleted.
         let after: Vec<String> = merged.rows.iter().map(|b| b.post_id.clone()).collect();
         assert_eq!(before, after);
-        // No decision-log entry mentions a filtered post or language.
+        // No language log kind exists.
         let entries = DecisionLog::open(&log_path).unwrap().verify().unwrap();
         for e in &entries {
             assert!(
@@ -1833,10 +1946,6 @@ mod tests {
                 "no language log kind allowed: {}",
                 e.kind
             );
-            let payload = e.payload.to_string();
-            for gone in ["es1", "fr1", "cjk1", "short1"] {
-                assert!(!payload.contains(gone), "log mentions {gone}: {payload}");
-            }
         }
         assert!(entries.iter().any(|e| e.kind == "brief.candidates"));
     }

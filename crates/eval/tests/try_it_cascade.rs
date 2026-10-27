@@ -366,8 +366,12 @@ fn paid_off_runs_rules_only_with_zero_calls() {
 }
 
 #[test]
-fn non_english_bookmarks_are_never_sampled() {
+fn non_english_bookmarks_are_sampled_and_scored_on_translation() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let es_text =
+        "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales.";
+    // Hands-on English: the gold try-it label applies to the translation.
+    let es_english = "[synthetic] Try it: 1. Do A 2. Do B";
     let bookmarks = [
         bookmark_lang(
             "c-en",
@@ -375,18 +379,18 @@ fn non_english_bookmarks_are_never_sampled() {
             "[synthetic] The gallery reopened this week with a new exhibition of local artists.",
             None,
         ),
-        bookmark_lang(
-            "c-es",
-            "Art",
-            "[synthetic] The gallery reopened this week with a new exhibition of local artists.",
-            Some("es"),
-        ),
+        bookmark_lang("c-es", "Art", es_text, Some("es")),
     ]
     .join("\n")
         + "\n";
     let labels =
-        "{\"post_id\":\"c-en\",\"try_it\":false}\n{\"post_id\":\"c-es\",\"try_it\":false}\n";
+        "{\"post_id\":\"c-en\",\"try_it\":false}\n{\"post_id\":\"c-es\",\"try_it\":true}\n";
     let (labels_path, bookmarks_path, out_path) = write_fixtures(dir.path(), labels, &bookmarks);
+    // Cached translation for c-es next to the bookmarks file (read-only).
+    let key = bookmarks_agent::translate::cache_key("c-es", es_text);
+    let tcache = serde_json::json!({ key: {"english": es_english, "source_lang": "es"} });
+    std::fs::write(dir.path().join("translations.json"), tcache.to_string())
+        .expect("write translations");
     let jev_closed = closed_url();
     let muse_closed = closed_url();
 
@@ -406,11 +410,12 @@ fn non_english_bookmarks_are_never_sampled() {
             ("META_API_BASE", &muse_closed),
             ("META_API_KEY", "test-key"),
         ],
-        &["ANCIENTOS_ALLOW_PAID"],
+        &["ANCIENTOS_ALLOW_PAID", "TRANSLATIONS_CACHE_PATH"],
     );
     assert!(ok, "exit ok, stderr: {stderr}");
+    // Both sampled; c-es scores on its translation (rules-confident yes).
     assert!(
-        stdout.contains("1 decided, 0 missing, 0 malformed, 1 non_english"),
+        stdout.contains("2 decided, 0 missing, 0 malformed, 1 translated, 0 untranslated"),
         "{stdout}"
     );
     let out = std::fs::read_to_string(&out_path).expect("read out");
@@ -418,8 +423,19 @@ fn non_english_bookmarks_are_never_sampled() {
         .lines()
         .map(|l| serde_json::from_str(l).expect("out is jsonl"))
         .collect();
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["post_id"], "c-en");
+    assert_eq!(rows[0]["predicted"], false);
+    assert_eq!(rows[1]["post_id"], "c-es");
+    assert_eq!(
+        rows[1]["predicted"],
+        true,
+        "translation must flip the prediction: {row}",
+        row = rows[1]
+    );
+    // Aggregate counts only in stdout: no post text leaks.
+    assert!(!stdout.contains(es_text), "{stdout}");
+    assert!(!stdout.contains(es_english), "{stdout}");
 }
 
 #[test]

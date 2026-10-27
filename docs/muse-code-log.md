@@ -33,6 +33,7 @@ Muse Code CLI 1.4.13, headless (`muse exec --prompt-file`), default model, auth 
 | 25 | 2026-10-26 | try_it cascade: rules confident yes -> Jev noul>=0.5 -> Muse Spark final; fail-closed; eval try_it_cascade bin with per-stage call counts (built with Muse Code) | muse_run.sh: exit 0, ~8 min (502s), `--trust-workspace`; tokens in/cached/out 5,564,623/5,398,915/47,420; est. cost $1.22. |
 | 26 | 2026-10-26 | language filter: non-English posts never surfaced (brief, web-ui, review cards), skipped silently like dead posts; X lang field + offline fail-closed heuristic; mock tests | muse_run.sh: exit 0, ~12 min (729s), `--trust-workspace`; tokens in/cached/out 11,397,200/11,130,447/66,087; est. cost $2.28. |
 | 27 | 2026-10-26 | never_author verdict: hides an author's posts from brief, web-ui and digest; local, undoable (unhide_author); mock tests | muse_run.sh: exit 0, ~9 min (566s), `--trust-workspace`; tokens in/cached/out 12,415,706/12,200,325/50,601; est. cost $2.31. |
+| 28 | 2026-10-26 | translate non-English posts (Muse, paid-gated, cached; private -> local only; untranslated shown, never hidden) in brief, web-ui, digest, review, eval; mock tests | muse_run.sh: exit 0, ~14 min (855s), `--trust-workspace`; tokens in/cached/out 27,045,243/26,746,888/76,505; est. cost $4.71. |
 
 
 Renumbered 2026-10-26 (duplicate #15/#16/#21/#22 rows from parallel branches), old->new in file order: 15->15, 18->16, 15->17, 16->18, 22->19, 16->20, 21->21, 22->22, 20->23, 21->24, 23->25. Commit messages keep the original numbers.

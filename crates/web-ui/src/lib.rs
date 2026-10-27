@@ -3,13 +3,15 @@
 //! [`handle`] is a pure-ish `(Request, &State) -> Response` handler; `main.rs`
 //! owns sockets and HTTP/1.1 parsing. Request handling makes no network or
 //! paid calls: votes reuse `bookmarks_agent::vote`, triage reuses `idea_card`,
-//! try-it follow-ups reuse `try_it`, and everything lands in files under the
+//! try-it follow-ups reuse `try_it`, translations reuse the on-disk cache
+//! only (never live-translate), and everything lands in files under the
 //! data dir plus the append-only decision log. Liveness is checked once at
 //! startup via [`State::open_with_liveness`] (batched X lookup, 24h cache,
 //! `--demo`/paid-off skips with no network); dead posts are filtered in
-//! memory only and the store is never modified. Non-English posts are
-//! filtered the same way right after (offline heuristic, no network).
-//! Posts by a hidden author (`never_author` verdict, undone from
+//! memory only and the store is never modified. Non-English posts are kept
+//! and shown with their cached English translation plus the original (or an
+//! `Untranslated` marker when the cache misses); they are never hidden for
+//! language. Posts by a hidden author (`never_author` verdict, undone from
 //! `/hidden-authors`) are filtered per request the same silent in-memory
 //! way, so a vote takes effect immediately without a restart.
 
@@ -95,11 +97,12 @@ impl Response {
 #[derive(Debug, Clone)]
 pub struct State {
     pub data_dir: PathBuf,
-    /// Surfaced posts: live and English only (see [`State::open_with_liveness`]).
+    /// Surfaced posts: live only (non-English kept with translations, see
+    /// [`State::open_with_liveness`]).
     pub bookmarks: Vec<Bookmark>,
-    /// Every post loaded from the store, before liveness/language filtering.
+    /// Every post loaded from the store, before liveness filtering.
     /// Used only to resolve a pending id or idea-card source to its stored
-    /// post for filtering; never rendered.
+    /// post for filtering; never rendered directly.
     all_bookmarks: Vec<Bookmark>,
 }
 
@@ -127,8 +130,8 @@ impl State {
     /// transient-unknown posts are filtered in memory only; the store file
     /// is never modified. Outcomes are recorded only in the 24h disk cache
     /// in this data dir — never the decision log, never the store.
-    /// Non-English posts are filtered the same way right after (silently,
-    /// in memory only, never logged).
+    /// Non-English posts are kept (translated for display from the on-disk
+    /// cache, never hidden for language).
     pub fn open_with_liveness(dir: impl AsRef<Path>, offline: bool) -> Result<Self, String> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| format!("data dir failed: {e}"))?;
@@ -150,7 +153,6 @@ impl State {
             offline,
             bookmarks_agent::liveness::now_secs(),
         )?;
-        let live = bookmarks_agent::language::english_only(&live);
         Ok(Self {
             data_dir: dir,
             bookmarks: live,
@@ -177,6 +179,19 @@ impl State {
     pub fn liveness_cache_path(&self) -> PathBuf {
         self.data_dir
             .join(bookmarks_agent::liveness::CACHE_FILE_NAME)
+    }
+
+    /// Translation cache path: `$TRANSLATIONS_CACHE_PATH` when set, else
+    /// `translations.json` in this data dir. Pages read it only; the brief
+    /// writes it. Request handling never live-translates (no network).
+    pub fn translations_cache_path(&self) -> PathBuf {
+        if let Ok(p) = std::env::var(bookmarks_agent::translate::CACHE_ENV_VAR) {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        self.data_dir
+            .join(bookmarks_agent::translate::CACHE_FILE_NAME)
     }
 }
 
@@ -416,13 +431,50 @@ fn media_html(media: &[bookmarks_agent::media::Media]) -> String {
     }
 }
 
-/// `[TRY IT]` section via the existing classifier and step extractor.
-fn try_it_html(b: &Bookmark) -> String {
-    let Some(tag) = bookmarks_agent::try_it::classify(b) else {
+/// Post text with translation: English posts render unchanged; non-English
+/// posts render the cached English plus `Translated from <lang>` with the
+/// original in a collapsible, or the original plus `Untranslated (<lang>)`
+/// on a cache miss. Reads the on-disk cache only; never live-translates.
+fn post_text_html(
+    b: &Bookmark,
+    cache: &std::collections::HashMap<String, bookmarks_agent::translate::CacheEntry>,
+) -> String {
+    let t = bookmarks_agent::translate::cached_only(b, cache);
+    let Some(marker) = bookmarks_agent::translate::marker_for(b, &t) else {
+        return format!("<blockquote>{}</blockquote>", escape(&b.text));
+    };
+    if t.status == bookmarks_agent::translate::TranslationStatus::Translated {
+        if let Some(english) = t.english.as_deref().filter(|e| !e.trim().is_empty()) {
+            return format!(
+                "<blockquote>{}</blockquote><p><em>{}</em></p>\
+                 <details><summary>Original</summary><blockquote>{}</blockquote></details>",
+                escape(english),
+                escape(&marker),
+                escape(&t.original),
+            );
+        }
+    }
+    format!(
+        "<blockquote>{}</blockquote><p><em>{}</em></p>",
+        escape(&t.original),
+        escape(&marker),
+    )
+}
+
+/// `[TRY IT]` section via the existing classifier and step extractor,
+/// scoring `text` (the English translation when available) with the media
+/// cue from `b`.
+fn try_it_html(b: &Bookmark, text: &str) -> String {
+    let has_video = b
+        .media
+        .iter()
+        .any(|m| m.kind == "video" || m.kind == "animated_gif");
+    let topic = bookmarks_agent::brief::topic_of(b);
+    let Some(tag) = bookmarks_agent::try_it::classify_with_media(&topic, text, has_video) else {
         return String::new();
     };
     let mut out = format!("<h2>[TRY IT] {}</h2>", escape(&tag.reason));
-    let steps = bookmarks_agent::try_it::extract_steps(&b.text);
+    let steps = bookmarks_agent::try_it::extract_steps(text);
     if steps.is_empty() {
         out.push_str("<p>No explicit steps found.</p>");
     } else {
@@ -503,14 +555,19 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
         .map(thread_post_of)
         .collect();
     let chain = bookmarks_agent::unroll::unroll(&root, &candidates);
-    let try_section = try_it_html(bm);
+    // Translations come from the on-disk cache only; a miss renders the
+    // original with an Untranslated marker (never hidden, never a call).
+    let tcache = bookmarks_agent::translate::load_cache(&state.translations_cache_path());
+    let translation = bookmarks_agent::translate::cached_only(bm, &tcache);
+    let english = bookmarks_agent::translate::english_for(bm, &translation).to_string();
+    let try_section = try_it_html(bm, &english);
     if !try_section.is_empty() {
         // Best-effort: a broken log must not break the brief (see /log).
         mark_shown(state, &bm.post_id);
     }
     let mut body = format!(
         "<h1>Brief — post {} of {}</h1>\
-         <p><strong>{}</strong> {}</p><blockquote>{}</blockquote>",
+         <p><strong>{}</strong> {}</p>{}",
         idx + 1,
         visible.len(),
         escape(&bm.post_id),
@@ -518,7 +575,7 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
             .as_deref()
             .map(|u| format!("by {}", escape(u)))
             .unwrap_or_default(),
-        escape(&bm.text),
+        post_text_html(bm, &tcache),
     );
     body.push_str(&thread_html(&chain));
     body.push_str(&media_html(&bm.media));
@@ -591,16 +648,11 @@ fn page_ideas(state: &State) -> Response {
         Ok(c) => c,
         Err(e) => return Response::status(500, error_page("Ideas failed", &e)),
     };
-    // Cards from a known non-English source post get no UI mention (cards
-    // whose source is unknown are kept: their idea text is locally generated).
-    // Cards by a hidden author get no UI mention either.
+    // Cards by a hidden author get no UI mention. Cards are never hidden
+    // for language: their idea text is locally generated English.
     let hidden = hidden_authors_of(state);
     let cards: Vec<_> = cards
         .into_iter()
-        .filter(|c| {
-            bookmarks_agent::language::source_post_is_english(&c.source_url, &state.all_bookmarks)
-                != Some(false)
-        })
         .filter(|c| {
             bookmarks_agent::author_filter::source_post_is_hidden(
                 &c.source_url,
@@ -675,9 +727,9 @@ fn page_try(state: &State) -> Response {
     };
     // Dead posts get no UI mention: skip pending ids with a fresh
     // `unavailable` liveness-cache entry (read-only reuse, no network).
-    // Non-English posts get no UI mention either: skip pending ids whose
-    // stored post is known non-English (unknown ids are kept: they show no
-    // post text, only "(not in store)"). Hidden authors the same way.
+    // Unknown ids are kept (they show "(not in store)"). Hidden authors the
+    // same way. Pending posts are never hidden for language: non-English
+    // posts show their cached translation plus the original.
     let cache = bookmarks_agent::liveness::load_cache(&state.liveness_cache_path());
     let now = bookmarks_agent::liveness::now_secs();
     let hidden = hidden_authors_of(state);
@@ -689,16 +741,10 @@ fn page_try(state: &State) -> Response {
                 .all_bookmarks
                 .iter()
                 .find(|b| &b.post_id == *id)
-                .is_none_or(bookmarks_agent::language::is_english)
-        })
-        .filter(|id| {
-            state
-                .all_bookmarks
-                .iter()
-                .find(|b| &b.post_id == *id)
                 .is_none_or(|b| !bookmarks_agent::author_filter::is_hidden(b, &hidden))
         })
         .collect();
+    let tcache = bookmarks_agent::translate::load_cache(&state.translations_cache_path());
     let mut body = String::from("<h1>Try it — pending check-ins</h1>");
     if pending.is_empty() {
         body.push_str("<p>No pending try-it follow-ups.</p>");
@@ -708,10 +754,10 @@ fn page_try(state: &State) -> Response {
             .bookmarks
             .iter()
             .find(|b| &b.post_id == id)
-            .map(|b| escape(&b.text))
-            .unwrap_or_else(|| "(not in store)".to_string());
+            .map(|b| post_text_html(b, &tcache))
+            .unwrap_or_else(|| "<blockquote>(not in store)</blockquote>".to_string());
         body.push_str(&format!(
-            "<div class=\"card\"><p><strong>{}</strong></p><blockquote>{}</blockquote>\
+            "<div class=\"card\"><p><strong>{}</strong></p>{}\
              <form method=\"post\" action=\"/try\">\
              <input type=\"hidden\" name=\"post_id\" value=\"{}\">\
              <label><input type=\"radio\" name=\"tried\" value=\"yes\" checked> yes</label> \
@@ -2000,6 +2046,7 @@ mod tests {
                 "ANCIENTOS_ALLOW_PAID",
                 bookmarks_agent::liveness::OFFLINE_ENV_VAR,
                 bookmarks_agent::liveness::CACHE_ENV_VAR,
+                bookmarks_agent::translate::CACHE_ENV_VAR,
                 "X_CLIENT_ID",
             ];
             let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
@@ -2011,6 +2058,7 @@ mod tests {
             std::env::set_var("ANCIENTOS_ALLOW_PAID", "1");
             std::env::remove_var(bookmarks_agent::liveness::OFFLINE_ENV_VAR);
             std::env::remove_var(bookmarks_agent::liveness::CACHE_ENV_VAR);
+            std::env::remove_var(bookmarks_agent::translate::CACHE_ENV_VAR);
             std::env::remove_var("X_CLIENT_ID");
             Self { _lock: lock, saved }
         }
@@ -2020,6 +2068,7 @@ mod tests {
             std::env::remove_var("ANCIENTOS_ALLOW_PAID");
             std::env::remove_var(bookmarks_agent::liveness::OFFLINE_ENV_VAR);
             std::env::remove_var(bookmarks_agent::liveness::CACHE_ENV_VAR);
+            std::env::remove_var(bookmarks_agent::translate::CACHE_ENV_VAR);
             Self { _lock: lock, saved }
         }
     }
@@ -2164,9 +2213,12 @@ mod tests {
     }
 
     #[test]
-    fn open_drops_non_english_without_deleting_or_logging() {
+    fn open_keeps_non_english_with_translations_without_deleting_or_logging() {
         let _env = PaidGuard::paid_off();
         let dir = tempfile::tempdir().unwrap();
+        let es_text =
+            "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales.";
+        let fr_text = "[synthetic] Le gouvernement présente un plan économique pour soutenir les petites entreprises locales.";
         let rows = [
             bookmark_lang(
                 "en1",
@@ -2176,44 +2228,63 @@ mod tests {
                 None,
             ),
             bookmark_lang("en2", "[synthetic] short", None, Vec::new(), Some("en")),
-            bookmark_lang(
-                "es1",
-                "[synthetic] The government presented an economic plan to support small local businesses.",
-                None,
-                Vec::new(),
-                Some("es"),
-            ),
-            bookmark_lang(
-                "fr1",
-                "[synthetic] Le gouvernement présente un plan économique pour soutenir les petites entreprises locales.",
-                None,
-                Vec::new(),
-                None,
-            ),
+            bookmark_lang("es1", es_text, None, Vec::new(), Some("es")),
+            bookmark_lang("fr1", fr_text, None, Vec::new(), None),
         ];
         let body = rows.join("\n") + "\n";
         std::fs::write(dir.path().join("store.jsonl"), &body).unwrap();
+        // Cached translation for es1 only; fr1 misses and stays Untranslated.
+        let es_english = "[synthetic] Translated English for es1.";
+        let mut tcache = std::collections::HashMap::new();
+        tcache.insert(
+            bookmarks_agent::translate::cache_key("es1", es_text),
+            bookmarks_agent::translate::CacheEntry {
+                english: es_english.to_string(),
+                source_lang: Some("es".to_string()),
+            },
+        );
+        let tcache_json = serde_json::to_string(&tcache).unwrap();
+        std::fs::write(
+            dir.path().join(bookmarks_agent::translate::CACHE_FILE_NAME),
+            &tcache_json,
+        )
+        .unwrap();
         let state = State::open(dir.path()).unwrap();
+        // Nothing hidden for language: all four surface (sorted by post_id).
         let ids: Vec<&str> = state.bookmarks.iter().map(|b| b.post_id.as_str()).collect();
-        assert_eq!(ids, vec!["en1", "en2"]);
+        assert_eq!(ids, vec!["en1", "en2", "es1", "fr1"]);
         // The store file is byte-identical: nothing deleted.
         assert_eq!(
             std::fs::read_to_string(dir.path().join("store.jsonl")).unwrap(),
             body
         );
         assert!(!state.log_path().exists());
-        // And the brief page never mentions a filtered post.
+        // en1 renders unchanged with no marker.
         let resp = handle(&Request::get("/"), &state);
         assert_eq!(resp.status, 200);
-        assert!(resp.body.contains("post 1 of 2"), "{}", resp.body);
-        assert!(!resp.body.contains("es1"), "{}", resp.body);
-        assert!(!resp.body.contains("fr1"), "{}", resp.body);
+        assert!(resp.body.contains("post 1 of 4"), "{}", resp.body);
+        assert!(!resp.body.contains("Translated from"), "{}", resp.body);
+        assert!(!resp.body.contains("Untranslated"), "{}", resp.body);
+        // es1 (?i=2) shows the translation plus the marker and the original.
+        let resp = handle(&Request::get("/?i=2"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("Translated from es"), "{}", resp.body);
+        assert!(resp.body.contains(es_english), "{}", resp.body);
+        assert!(resp.body.contains(es_text), "{}", resp.body);
+        assert!(resp.body.contains("<details>"), "{}", resp.body);
+        // fr1 (?i=3) has no cached translation: original plus the marker.
+        let resp = handle(&Request::get("/?i=3"), &state);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("Untranslated (und)"), "{}", resp.body);
+        assert!(resp.body.contains(fr_text), "{}", resp.body);
     }
 
     #[test]
-    fn try_page_skips_non_english_pending_without_ui_mention() {
+    fn try_page_keeps_non_english_pending_with_translation() {
         let _env = PaidGuard::paid_off();
         let dir = tempfile::tempdir().unwrap();
+        let es_text =
+            "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales.";
         let rows = [
             bookmark_lang(
                 "en1",
@@ -2222,17 +2293,25 @@ mod tests {
                 Vec::new(),
                 Some("en"),
             ),
-            bookmark_lang(
-                "es1",
-                "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales.",
-                None,
-                Vec::new(),
-                Some("es"),
-            ),
+            bookmark_lang("es1", es_text, None, Vec::new(), Some("es")),
         ];
         std::fs::write(dir.path().join("store.jsonl"), rows.join("\n") + "\n").unwrap();
+        let es_english = "[synthetic] Translated English for es1.";
+        let mut tcache = std::collections::HashMap::new();
+        tcache.insert(
+            bookmarks_agent::translate::cache_key("es1", es_text),
+            bookmarks_agent::translate::CacheEntry {
+                english: es_english.to_string(),
+                source_lang: Some("es".to_string()),
+            },
+        );
+        std::fs::write(
+            dir.path().join(bookmarks_agent::translate::CACHE_FILE_NAME),
+            serde_json::to_string(&tcache).unwrap(),
+        )
+        .unwrap();
         let state = State::open(dir.path()).unwrap();
-        assert_eq!(state.bookmarks.len(), 1);
+        assert_eq!(state.bookmarks.len(), 2);
         let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
         bookmarks_agent::try_it::record_shown(&mut log, "en1", 1_700_000_000).unwrap();
         bookmarks_agent::try_it::record_shown(&mut log, "es1", 1_700_000_000).unwrap();
@@ -2240,11 +2319,14 @@ mod tests {
         let resp = handle(&Request::get("/try"), &state);
         assert_eq!(resp.status, 200);
         assert!(resp.body.contains("en1"), "{}", resp.body);
-        assert!(!resp.body.contains("es1"), "no UI mention: {}", resp.body);
+        assert!(resp.body.contains("es1"), "{}", resp.body);
+        assert!(resp.body.contains("Translated from es"), "{}", resp.body);
+        assert!(resp.body.contains(es_english), "{}", resp.body);
+        assert!(resp.body.contains(es_text), "{}", resp.body);
     }
 
     #[test]
-    fn ideas_page_skips_non_english_source_cards_without_ui_mention() {
+    fn ideas_page_keeps_non_english_source_cards() {
         let _env = PaidGuard::paid_off();
         let dir = tempfile::tempdir().unwrap();
         let rows = [
@@ -2285,11 +2367,8 @@ mod tests {
             "unknown kept: {}",
             resp.body
         );
-        assert!(
-            !resp.body.contains("card-es"),
-            "no UI mention: {}",
-            resp.body
-        );
+        // Cards are never hidden for language: idea text is English.
+        assert!(resp.body.contains("card-es"), "{}", resp.body);
     }
 
     #[test]

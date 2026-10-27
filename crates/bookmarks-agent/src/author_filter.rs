@@ -44,8 +44,7 @@ pub fn filter_visible(bookmarks: &[Bookmark], hidden: &BTreeSet<String>) -> Vec<
 }
 
 /// Keep ids that are not by a hidden author. Ids missing from `bookmarks`
-/// (unknown author) are kept: id-only surfaces never show post text, so
-/// this mirrors [`crate::language::retain_not_known_non_english`].
+/// (unknown author) are kept: id-only surfaces show no post text for them.
 pub fn retain_not_hidden(
     ids: &[String],
     bookmarks: &[Bookmark],

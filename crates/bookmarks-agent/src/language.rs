@@ -1,9 +1,11 @@
-//! Language filter: never surface a non-English post anywhere.
+//! Language detection: decide whether a post is English.
 //!
-//! Nathan's rule. Non-English posts are skipped silently, exactly like dead
-//! posts in [`crate::liveness`]: dropped in memory only (brief candidates,
-//! web-ui pages, digest/try-it nudges, eval sampling), with no message, no
-//! placeholder, and no decision-log entry. The store is never modified.
+//! Nathan's rule change: non-English posts are translated into English and
+//! surfaced, never skipped (see [`crate::translate`]). This module keeps the
+//! detection only ([`is_english`]): every surface shows every post, with a
+//! `Translated from <lang>` marker plus the original, or an
+//! `Untranslated (<lang>)` marker when no translation is available. The store
+//! is never modified.
 //!
 //! Precedence per bookmark:
 //! - X's stored `lang` field wins when it is a determined code: `en`
@@ -154,15 +156,24 @@ pub fn is_english(b: &Bookmark) -> bool {
     is_english_text(&b.text)
 }
 
-/// Keep only English bookmarks, preserving order. Pure; never touches the
-/// store. Mirrors [`crate::liveness::filter_cached`]'s silent in-memory
-/// filtering (no log entries, no placeholders).
-pub fn english_only(bookmarks: &[Bookmark]) -> Vec<Bookmark> {
-    bookmarks
-        .iter()
-        .filter(|b| is_english(b))
-        .cloned()
-        .collect()
+/// Source language code for display (`Translated from <lang>`): the
+/// determined X `lang` primary code lowercased (`es`, `en`, ...), or `None`
+/// when missing, blank, or undetermined (heuristic case, renders as `und`
+/// via [`crate::translate::display_lang`]).
+pub fn source_lang(b: &Bookmark) -> Option<String> {
+    let raw = b.lang.as_deref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let primary = raw
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if primary.is_empty() || UNDETERMINED.contains(&primary.as_str()) {
+        return None;
+    }
+    Some(primary)
 }
 
 /// Extract the post id from an X status URL (`.../status/<id>`), if present.
@@ -174,30 +185,6 @@ pub fn post_id_from_status_url(url: &str) -> Option<String> {
     } else {
         Some(id.to_string())
     }
-}
-
-/// Language of an idea-card source post: `Some(true/false)` when the source
-/// URL resolves to a bookmark in `bookmarks`, `None` when the source is
-/// unknown (unparseable URL or id not in the store).
-pub fn source_post_is_english(source_url: &str, bookmarks: &[Bookmark]) -> Option<bool> {
-    let id = post_id_from_status_url(source_url)?;
-    bookmarks.iter().find(|b| b.post_id == id).map(is_english)
-}
-
-/// Keep ids that are not known-non-English. Ids missing from `bookmarks`
-/// (unknown language) are kept: id-only surfaces never show post text, so
-/// this mirrors liveness's web-ui rule of dropping only fresh-unavailable
-/// posts while keeping unknown ones.
-pub fn retain_not_known_non_english(ids: &[String], bookmarks: &[Bookmark]) -> Vec<String> {
-    ids.iter()
-        .filter(|id| {
-            bookmarks
-                .iter()
-                .find(|b| &b.post_id == *id)
-                .is_none_or(is_english)
-        })
-        .cloned()
-        .collect()
 }
 
 #[cfg(test)]
@@ -243,11 +230,11 @@ mod tests {
     }
 
     #[test]
-    fn lang_non_english_filtered_even_if_text_looks_english() {
+    fn lang_non_english_detected_even_if_text_looks_english() {
         for code in ["es", "fr", "pt", "de", "it", "ja", "zh", "ar", "ru", "ES"] {
             assert!(
                 !is_english(&bm("x", EN, Some(code))),
-                "lang={code} must filter even English-looking text"
+                "lang={code} must detect non-English even for English-looking text"
             );
         }
     }
@@ -261,7 +248,7 @@ mod tests {
             );
             assert!(
                 !is_english(&bm("h", ES, Some(code))),
-                "lang={code} with Spanish text must filter via heuristic"
+                "lang={code} with Spanish text must detect non-English via heuristic"
             );
         }
         assert!(is_english(&bm("h", EN, None)));
@@ -269,15 +256,15 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_passes_english_and_filters_romance_latin_script() {
+    fn heuristic_passes_english_and_detects_romance_latin_script() {
         assert!(is_english_text(EN));
-        assert!(!is_english_text(ES), "Spanish must filter");
-        assert!(!is_english_text(FR), "French must filter");
-        assert!(!is_english_text(PT), "Portuguese must filter");
+        assert!(!is_english_text(ES), "Spanish must detect non-English");
+        assert!(!is_english_text(FR), "French must detect non-English");
+        assert!(!is_english_text(PT), "Portuguese must detect non-English");
     }
 
     #[test]
-    fn heuristic_filters_non_latin_scripts() {
+    fn heuristic_detects_non_latin_scripts() {
         assert!(!is_english_text("[synthetic] 这是一个中文测试帖子"));
         assert!(!is_english_text("[synthetic] これは日本語のテスト投稿です"));
         assert!(!is_english_text(
@@ -312,24 +299,35 @@ mod tests {
         assert!(is_english_text(
             "[synthetic] The government presented https://t.co/abc123 an economic plan @syn_handle to support #economy small local businesses 🎉"
         ));
-        // Spanish with an English hashtag still filters (hashtag stripped).
+        // Spanish with an English hashtag still detects non-English (hashtag stripped).
         assert!(!is_english_text(
             "[synthetic] El gobierno presentó un plan económico #economy para apoyar pequeñas empresas 🎉"
         ));
     }
 
     #[test]
-    fn english_only_preserves_order_and_drops_silently() {
-        let rows = vec![
-            bm("en1", EN, None),
-            bm("es1", ES, None),
-            bm("en2", EN, Some("en")),
-            bm("es2", EN, Some("es")),
-            bm("cjk", "[synthetic] 这是一个中文测试帖子", None),
-        ];
-        let out = english_only(&rows);
-        let ids: Vec<&str> = out.iter().map(|b| b.post_id.as_str()).collect();
-        assert_eq!(ids, vec!["en1", "en2"]);
+    fn source_lang_reports_determined_code_or_none() {
+        assert_eq!(
+            source_lang(&bm("e1", EN, Some("en"))),
+            Some("en".to_string())
+        );
+        assert_eq!(
+            source_lang(&bm("e2", EN, Some("EN-US"))),
+            Some("en".to_string())
+        );
+        assert_eq!(
+            source_lang(&bm("e3", EN, Some("es"))),
+            Some("es".to_string())
+        );
+        assert_eq!(
+            source_lang(&bm("e4", EN, Some("PT_br"))),
+            Some("pt".to_string())
+        );
+        assert_eq!(source_lang(&bm("e5", EN, None)), None);
+        assert_eq!(source_lang(&bm("e6", EN, Some(""))), None);
+        for und in ["und", "zxx", "qme", "qht", "UND"] {
+            assert_eq!(source_lang(&bm("u", EN, Some(und))), None, "lang={und}");
+        }
     }
 
     #[test]
@@ -349,31 +347,5 @@ mod tests {
         assert_eq!(post_id_from_status_url("https://x.com/home"), None);
         assert_eq!(post_id_from_status_url("https://x.com/i/status/"), None);
         assert_eq!(post_id_from_status_url("not a url"), None);
-    }
-
-    #[test]
-    fn unknown_sources_and_ids_are_kept() {
-        let rows = vec![bm("en1", EN, None), bm("es1", ES, None)];
-        assert_eq!(
-            source_post_is_english("https://x.com/a/status/en1", &rows),
-            Some(true)
-        );
-        assert_eq!(
-            source_post_is_english("https://x.com/a/status/es1", &rows),
-            Some(false)
-        );
-        assert_eq!(
-            source_post_is_english("https://x.com/a/status/ghost", &rows),
-            None
-        );
-        assert_eq!(source_post_is_english("not a url", &rows), None);
-        let ids = ["en1", "es1", "ghost"]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            retain_not_known_non_english(&ids, &rows),
-            vec!["en1".to_string(), "ghost".to_string()]
-        );
     }
 }

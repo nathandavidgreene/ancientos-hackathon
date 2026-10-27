@@ -25,8 +25,8 @@
 //! unless `--dry-run` or `--now` is given.
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    author_filter, brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, language,
-    merge, oauth, token_store, try_it, vote, x_api,
+    author_filter, brief, callback, deeper, delegate, digest, fixture, idea_card, ingest, merge,
+    oauth, token_store, try_it, vote, x_api,
 };
 use std::path::PathBuf;
 
@@ -350,9 +350,10 @@ fn format_idea_line(card: &idea_card::IdeaCard) -> String {
     )
 }
 
-/// Stored bookmarks for language filtering of id/card surfaces. A missing
+/// Stored bookmarks for author filtering of id/card surfaces. A missing
 /// or unreadable store means every source is unknown (kept), so these
-/// read-only listings never fail just because the store is absent.
+/// read-only listings never fail just because the store is absent. Cards are
+/// never hidden for language.
 fn bookmarks_for_filtering() -> Vec<fixture::Bookmark> {
     ingest::Store::load()
         .map(|s| s.by_id.into_values().collect())
@@ -368,11 +369,8 @@ fn cmd_ideas(args: &[String]) -> Result<(), String> {
     let bookmarks = bookmarks_for_filtering();
     let hidden = vote::list_hidden_authors(&brief::decision_log_path()?)?;
     for card in &cards {
-        // Cards from a known non-English source post are skipped silently.
-        if language::source_post_is_english(&card.source_url, &bookmarks) == Some(false) {
-            continue;
-        }
-        // Cards by a hidden author are skipped silently too.
+        // Cards by a hidden author are skipped silently. Cards are never
+        // hidden for language.
         if author_filter::source_post_is_hidden(&card.source_url, &bookmarks, &hidden) == Some(true)
         {
             continue;
@@ -462,9 +460,8 @@ fn cmd_try_pending(args: &[String]) -> Result<(), String> {
     let records = ancientos_core::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
     let hidden = ancientos_core::feedback::hidden_authors(&records);
     let bookmarks = bookmarks_for_filtering();
-    // Known non-English posts are skipped silently (unknown ids are kept).
-    let pending = language::retain_not_known_non_english(&pending, &bookmarks);
-    // Posts by a hidden author are skipped silently too.
+    // Posts by a hidden author are skipped silently. Pending posts are never
+    // hidden for language.
     for id in author_filter::retain_not_hidden(&pending, &bookmarks, &hidden) {
         println!("{id}");
     }

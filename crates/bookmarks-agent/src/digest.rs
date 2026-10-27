@@ -200,13 +200,13 @@ fn hidden_authors_from_entries(entries: &[Entry]) -> BTreeSet<String> {
     ancientos_core::feedback::hidden_authors(&records)
 }
 
-/// Assemble the digest like [`weekly_digest`], skipping cards from a known
-/// non-English source post and nudges for known non-English posts (see
-/// [`crate::language`]), plus cards and nudges by a hidden author (see
-/// [`crate::author_filter`]). Skipped silently: no message, no
-/// placeholder. Cards and nudges whose source post is unknown (not in
-/// `bookmarks`) are kept: these surfaces show ids and locally generated
-/// idea text, never post text.
+/// Assemble the digest like [`weekly_digest`], skipping cards and nudges
+/// by a hidden author (see [`crate::author_filter`]). Skipped silently: no
+/// message, no placeholder. Cards and nudges are never hidden for language
+/// (see [`crate::translate`]): these surfaces show ids and locally generated
+/// idea text, never post text, so every card and nudge is kept and the
+/// translation (with its `Translated from` / `Untranslated` marker plus the
+/// original) renders wherever the post text itself is shown.
 pub fn weekly_digest_for_bookmarks(
     cards: &[IdeaCard],
     pending: &[String],
@@ -218,16 +218,12 @@ pub fn weekly_digest_for_bookmarks(
     let cards: Vec<IdeaCard> = cards
         .iter()
         .filter(|c| {
-            crate::language::source_post_is_english(&c.source_url, bookmarks) != Some(false)
-        })
-        .filter(|c| {
             crate::author_filter::source_post_is_hidden(&c.source_url, bookmarks, &hidden)
                 != Some(true)
         })
         .cloned()
         .collect();
-    let pending = crate::language::retain_not_known_non_english(pending, bookmarks);
-    let pending = crate::author_filter::retain_not_hidden(&pending, bookmarks, &hidden);
+    let pending = crate::author_filter::retain_not_hidden(pending, bookmarks, &hidden);
     weekly_digest(&cards, &pending, entries, now)
 }
 
@@ -704,18 +700,16 @@ mod tests {
     }
 
     #[test]
-    fn digest_for_bookmarks_skips_non_english_and_keeps_unknown() {
+    fn digest_for_bookmarks_keeps_non_english_and_shows_translation() {
+        let es_text =
+            "[synthetic] El gobierno presentó un plan económico para apoyar pequeñas empresas locales.";
         let bookmarks = vec![
             stored_post(
                 "en1",
                 "[synthetic] The government presented an economic plan to support small local businesses.",
                 None,
             ),
-            stored_post(
-                "es1",
-                "[synthetic] The government presented an economic plan to support small local businesses.",
-                Some("es"),
-            ),
+            stored_post("es1", es_text, Some("es")),
         ];
         let cards = vec![
             sourced_card("card-en", "en1"),
@@ -732,14 +726,40 @@ mod tests {
         );
         let pending = pending_of(&entries);
         assert_eq!(pending.len(), 3);
+        // Nothing is hidden for language: all cards and nudges are kept.
         let d = weekly_digest_for_bookmarks(&cards, &pending, &entries, NOW, &bookmarks);
         let card_ids: Vec<&str> = d.cards.iter().map(|c| c.card.id.as_str()).collect();
-        assert_eq!(card_ids, vec!["card-en", "card-ghost"]);
+        assert_eq!(card_ids, vec!["card-en", "card-es", "card-ghost"]);
         let nudge_ids: Vec<&str> = d.nudges.iter().map(|n| n.post_id.as_str()).collect();
-        assert_eq!(nudge_ids, vec!["en1", "ghost"]);
-        // Rendered digest never mentions the filtered post.
+        assert_eq!(nudge_ids, vec!["en1", "es1", "ghost"]);
         let text = render(&d);
-        assert!(!text.contains("es1"), "{text}");
-        assert!(!text.contains("card-es"), "{text}");
+        assert!(text.contains("es1"), "{text}");
+        assert!(text.contains("card-es"), "{text}");
+        // Wherever the post text renders, it shows the marker plus both
+        // texts: cached translation plus the original...
+        let es_english = "[synthetic] Translated English for es1.";
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            crate::translate::cache_key("es1", es_text),
+            crate::translate::CacheEntry {
+                english: es_english.to_string(),
+                source_lang: Some("es".to_string()),
+            },
+        );
+        let es = bookmarks.iter().find(|b| b.post_id == "es1").unwrap();
+        let t = crate::translate::cached_only(es, &cache);
+        assert_eq!(
+            crate::translate::marker_for(es, &t).as_deref(),
+            Some("Translated from es")
+        );
+        assert_eq!(crate::translate::english_for(es, &t), es_english);
+        assert_eq!(t.original, es_text);
+        // ...or the original plus the untranslated marker on a cache miss.
+        let t = crate::translate::cached_only(es, &std::collections::HashMap::new());
+        assert_eq!(
+            crate::translate::marker_for(es, &t).as_deref(),
+            Some("Untranslated (es)")
+        );
+        assert_eq!(crate::translate::english_for(es, &t), es_text);
     }
 }

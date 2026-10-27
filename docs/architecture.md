@@ -66,7 +66,8 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `x_api` | bookmarks-agent | Read-only X client: bookmarks, hydrate, threads, quotes |
 | `ingest`, `merge`, `fixture` | bookmarks-agent | Incremental sync. Bookmarks are never removed. |
 | `sanitize` | bookmarks-agent | Strips PII before anything is sent to a hosted model |
-| `language` | bookmarks-agent | English-only filter: X `lang` wins, else offline script + stopword heuristic; non-English skipped silently, fail closed |
+| `language` | bookmarks-agent | English detection: X `lang` wins, else offline script + stopword heuristic; undetermined counts as non-English (fail closed) |
+| `translate` | bookmarks-agent | Non-English posts translated to English and surfaced, never skipped: Muse for sanitized text (paid switch), local LLM for sensitive, on-disk cache, fail open on visibility |
 | `brief` | bookmarks-agent | Candidate selection, one model call, local fallback |
 | `media` | bookmarks-agent | Photos and video under the full text, capped at 1080p |
 | `vote` | bookmarks-agent | Records verdicts |

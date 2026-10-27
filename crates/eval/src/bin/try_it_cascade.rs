@@ -3,8 +3,9 @@
 //! Usage: `try_it_cascade --labels <jsonl> --bookmarks <jsonl> [--out <jsonl>]`.
 //! Labels lines carry an id (`post_id`, or `n`) plus a boolean `try_it`;
 //! bookmarks lines are [`Bookmark`] JSON joined by id. Labels without a
-//! bookmark are skipped with a count, as are malformed lines and
-//! non-English bookmarks (never sampled).
+//! bookmark are skipped with a count, as are malformed lines. Non-English
+//! bookmarks are always sampled (never hidden for language) and scored on
+//! the cached English translation when available, else on the original.
 //!
 //! Items run through the cascade sequentially from env
 //! ([`JevClient::from_env`] with `JEV_BACKEND`, [`MuseClient::from_env`]
@@ -227,31 +228,60 @@ fn run(args: &Args) -> Result<(), String> {
         .with_max_completion_tokens(200);
     let cascade = Cascade::new(jev.as_ref(), Some(&muse));
 
+    // Translations come from $TRANSLATIONS_CACHE_PATH when set, else
+    // translations.json next to the bookmarks file, else none. Read-only.
+    let tcache_path = match std::env::var(bookmarks_agent::translate::CACHE_ENV_VAR)
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        Some(p) => PathBuf::from(p),
+        None => args
+            .bookmarks
+            .parent()
+            .map(|d| d.join(bookmarks_agent::translate::CACHE_FILE_NAME))
+            .unwrap_or_else(|| PathBuf::from(bookmarks_agent::translate::CACHE_FILE_NAME)),
+    };
+    let tcache = bookmarks_agent::translate::load_cache(&tcache_path);
+
     let mut stats = CascadeStats::default();
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut cascade_pairs: Vec<(bool, bool)> = Vec::new();
     let mut rules_pairs: Vec<(bool, bool)> = Vec::new();
     let mut missing = 0usize;
-    let mut non_english = 0usize;
+    let mut translated = 0usize;
+    let mut untranslated = 0usize;
     let mut stopped_early = false;
     for label in &labels {
         let Some(bookmark) = bookmarks.get(&label.id) else {
             missing += 1;
             continue;
         };
-        // Never sample a non-English post: skipped silently (aggregate
-        // count only), like labels without a bookmark.
-        if !bookmarks_agent::language::is_english(bookmark) {
-            non_english += 1;
-            continue;
-        }
-        let confident = rules_confident(&topic_of(bookmark), &bookmark.text);
+        // Non-English posts are always sampled: score the cached English
+        // translation when available, else the original. Aggregate counts
+        // only (translated/untranslated), never text or ids in the report.
+        let scoring_text: std::borrow::Cow<'_, str> =
+            if bookmarks_agent::language::is_english(bookmark) {
+                std::borrow::Cow::Borrowed(bookmark.text.as_str())
+            } else {
+                let t = bookmarks_agent::translate::cached_only(bookmark, &tcache);
+                if t.status == bookmarks_agent::translate::TranslationStatus::Translated {
+                    translated += 1;
+                    match t.english {
+                        Some(english) => std::borrow::Cow::Owned(english),
+                        None => std::borrow::Cow::Borrowed(bookmark.text.as_str()),
+                    }
+                } else {
+                    untranslated += 1;
+                    std::borrow::Cow::Borrowed(bookmark.text.as_str())
+                }
+            };
+        let confident = rules_confident(&topic_of(bookmark), &scoring_text);
         let verdict = if confident {
             RulesVerdict::ConfidentYes
         } else {
             RulesVerdict::Unsure
         };
-        let decision = cascade.decide(&bookmark.text, Sensitivity::Sanitized, verdict, &mut stats);
+        let decision = cascade.decide(&scoring_text, Sensitivity::Sanitized, verdict, &mut stats);
         cascade_pairs.push((label.try_it, decision.try_it));
         rules_pairs.push((label.try_it, confident));
         rows.push(serde_json::json!({
@@ -279,7 +309,7 @@ fn run(args: &Args) -> Result<(), String> {
 
     let decided = rows.len();
     println!(
-        "try_it_cascade: {decided} decided, {missing} missing, {} malformed, {non_english} non_english",
+        "try_it_cascade: {decided} decided, {missing} missing, {} malformed, {translated} translated, {untranslated} untranslated",
         labels_bad + bookmarks_bad
     );
     if stopped_early {
