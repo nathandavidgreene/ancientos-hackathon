@@ -148,6 +148,8 @@ fn run(args: &[String]) -> Result<(), String> {
                 local: &local,
                 muse_spark: &spark,
                 muse_wonder: &wonder,
+                jev_typesafe: None,
+                jev_local: None,
             };
             let sens = if sensitive {
                 Sensitivity::Sensitive

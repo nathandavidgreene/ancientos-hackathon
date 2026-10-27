@@ -1,6 +1,6 @@
 # Evaluation
 
-Offline harness: `cargo run -p eval -- --bookmarks <jsonl> --labels <jsonl> [--out <md>] [--name <name>]`. It uses no network and makes no paid calls. The output holds aggregate numbers only, with no post text, ids or urls.
+Offline harness: `cargo run -p ancientos-eval -- --bookmarks <jsonl> --labels <jsonl> [--out <md>] [--name <name>]`. It uses no network and makes no paid calls. The output holds aggregate numbers only, with no post text, ids or urls.
 
 - **Try it**: precision and recall of `try_it::classify` against a reference label for "a hands-on practice you could physically try".
 - **Brief ranking**: `brief::select_candidates` plus `brief::local_picks` (the deterministic path used when paid calls are off) against a reference label for "worth resurfacing". This scores the local fallback, not Muse Spark's picks.

@@ -283,12 +283,12 @@ fn map_ureq_error(e: ureq::Error) -> RouterError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
-    /// Serialise tests that mutate process env vars.
+    /// Serialise tests that mutate process env vars (crate-wide guard:
+    /// `ANCIENTOS_ALLOW_PAID` is shared with the jev_client tests).
     fn env_lock() -> MutexGuard<'static, ()> {
-        static ENV_MUTEX: Mutex<()> = Mutex::new(());
-        ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_env_lock()
     }
 
     fn test_client(allow_paid: bool) -> MuseClient {

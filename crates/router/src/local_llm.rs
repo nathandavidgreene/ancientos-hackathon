@@ -560,6 +560,8 @@ mod tests {
             local: &local,
             muse_spark: &spark,
             muse_wonder: &wonder,
+            jev_typesafe: None,
+            jev_local: None,
         };
         // Sensitive and unknown both route local; local down is an error,
         // never a silent fallback to Muse.

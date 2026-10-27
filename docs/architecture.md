@@ -98,3 +98,54 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | never_post hides one post, not its category | [`feedback::never_post_is_excluded_from_stats_and_blocking`](../crates/core/src/feedback.rs) |
 | Demo contains no private data | [`demo_runs_all_shots_deterministically_without_private_data`](../crates/demo-runner/tests/demo_script.rs) |
 | Eval output contains no ids, urls or text | [`eval` tests](../crates/eval) |
+
+## Jev (TypeSafe) backend
+
+Opt-in backend in `crates/router/src/jev_client.rs`, selected with
+discord-luna's env names. `JEV_BACKEND=auto` (default) reads
+`LUNA_MODEL_MODE`: `frontier` selects the hosted TypeSafe API,
+`local` selects a local Jev server. Explicit `JEV_BACKEND=typesafe` or
+`localjev` overrides the mode. Any other value, or an unset mode under
+`auto`, is an error (fail closed).
+
+- **typesafe (frontier):** `TYPESAFE_BASE_URL` (default
+  `https://api.typesafe.ai`), `TYPESAFE_API_KEY` (required, env only,
+  never logged/stored), `TYPESAFE_DEFAULT_MODEL` (default
+  `jev-preview`). Paid-gated by `ANCIENTOS_ALLOW_PAID=1`. Accepts
+  sanitized/public content only; sensitive or unknown content is refused
+  with an error, and `route_with_jev` never routes it to TypeSafe.
+- **localjev:** `LOCALJEV_BASE_URL` (default
+  `http://127.0.0.1:8080`), `LOCALJEV_DEFAULT_MODEL` (default
+  `localjev-default`), optional `LOCALJEV_API_KEY` Bearer token. Not
+  paid-gated. Data stays on the device, so any sensitivity is allowed.
+
+Both backends share one request/response implementation
+(`post_chat_completions`).
+
+Jev is OFF by default and is only used where it beats the alternatives on
+accuracy. Routing never picks `Destination::Jev` unless the calling task is
+explicitly opted in via the per-task set `JevTasks` (`RouterConfig.jev_tasks`,
+`route_for_task` / `dispatch_for_task`), read from `ANCIENTOS_JEV_TASKS` as a
+comma list: `intent` enables `JevTask::IntentRouting`, `bookmarks` enables
+`JevTask::BookmarkClassification`. Unset or empty means off; any unknown value
+is an error (fail closed). When a task is opted in, sanitized content routes
+to TypeSafe (`Destination::Jev`) while sensitive or unknown content routes
+only to the local Jev server (`Destination::LocalJev`) — sensitive content
+still never reaches TypeSafe.
+
+The eval hook lives in `crates/eval` (package `ancientos-eval`): `evaluate`
+scores any classifier backend (a `ClassifierBackend` trait object or an
+`Fn(&str) -> Result<String, _>` closure) against labeled `(text, label)`
+examples, returning accuracy, per-label precision/recall/F1, and macro F1,
+with a `JevClassifier` adapter wrapping `jev_client`. Once live TypeSafe or
+localjev access exists, compare Jev against the current backend on real labels
+and opt a task in only if Jev wins. Caveats:
+
+- The chat shape (OpenAI-compatible `POST /v1/chat/completions`, Bearer
+  auth) is **UNVERIFIED** against the real TypeSafe API.
+- No real localjev server has been verified yet; the backend is tested
+  against a mock HTTP server only.
+- No pricing or rate-limit info is known for either backend; demo only
+  what the tests cover.
+
+The offline try_it / brief-ranking harness from the docs-eval branch is the `harness` module of the same crate (`cargo run -p ancientos-eval`).

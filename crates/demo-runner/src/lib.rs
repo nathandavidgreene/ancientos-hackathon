@@ -139,6 +139,8 @@ impl Workspace {
             local: &local,
             muse_spark: &spark,
             muse_wonder: &wonder,
+            jev_typesafe: None,
+            jev_local: None,
         };
         let mut log = self.log()?;
         let mut picks = Vec::new();
@@ -531,6 +533,8 @@ pub fn routing_demo() -> Result<Vec<(String, Destination)>, String> {
         local: &local,
         muse_spark: &spark,
         muse_wonder: &wonder,
+        jev_typesafe: None,
+        jev_local: None,
     };
     let mut out = Vec::new();
     for (cat, sens) in [

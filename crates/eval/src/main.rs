@@ -61,8 +61,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 fn real_main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = parse_args(&args)?;
-    let report = eval::run(&cfg.bookmarks, &cfg.labels, &cfg.name)?;
-    let markdown = eval::render_markdown(&report);
+    let report = ancientos_eval::run(&cfg.bookmarks, &cfg.labels, &cfg.name)?;
+    let markdown = ancientos_eval::render_markdown(&report);
     if let Some(path) = &cfg.out {
         std::fs::write(path, &markdown).map_err(|e| format!("write {path}: {e}"))?;
     }
