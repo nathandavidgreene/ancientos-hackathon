@@ -30,12 +30,6 @@ pub struct Media {
     /// [`crate::link_context`]; fetching it never calls the X API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption_url: Option<String>,
-    /// Lowest-bitrate mp4 variant (`<=1080p`) for local transcription.
-    /// [`crate::link_context`] prefers this over [`Self::video_url`] (which
-    /// prefers 720p at the highest bitrate) so transcription downloads the
-    /// smallest file. `None` for old stores, fixtures, and photos.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcription_url: Option<String>,
 }
 
 /// Accept only https URLs on X's media hosts, with no userinfo or port.
@@ -195,15 +189,6 @@ fn pick_best_mp4(candidates: &[(u64, Option<u32>, String)]) -> Option<String> {
         .map(|(_, _, u)| u.clone())
 }
 
-/// Smallest mp4 for transcription: the lowest bitrate at `<=1080p` (ties
-/// break toward the lower resolution, then the first listed).
-fn pick_low_mp4(candidates: &[(u64, Option<u32>, String)]) -> Option<String> {
-    candidates
-        .iter()
-        .min_by_key(|(br, p, _)| (*br, p.unwrap_or(u32::MAX)))
-        .map(|(_, _, u)| u.clone())
-}
-
 fn parse_one(m: &serde_json::Value) -> Option<Media> {
     let kind = clean_kind(m.get("type")?.as_str()?);
     let get = |k: &str| m.get(k).and_then(|v| v.as_str()).and_then(safe_media_url);
@@ -213,7 +198,6 @@ fn parse_one(m: &serde_json::Value) -> Option<Media> {
         .map(|vs| mp4_candidates(vs))
         .unwrap_or_default();
     let video_url = pick_best_mp4(&candidates);
-    let transcription_url = pick_low_mp4(&candidates);
     let media = Media {
         kind,
         url: get("url"),
@@ -227,7 +211,6 @@ fn parse_one(m: &serde_json::Value) -> Option<Media> {
             .get("caption_url")
             .and_then(|v| v.as_str())
             .and_then(clean_caption_url),
-        transcription_url,
     };
     (media.url.is_some() || media.preview_url.is_some() || media.video_url.is_some())
         .then_some(media)
@@ -388,7 +371,6 @@ mod tests {
             video_url: None,
             alt_text: None,
             caption_url: None,
-            transcription_url: None,
         }];
         assert_eq!(render_markdown(&tampered), "");
         assert_eq!(render_markdown(&[]), "");
@@ -401,15 +383,13 @@ mod tests {
                 .unwrap();
         assert!(m.video_url.is_none());
         assert!(m.caption_url.is_none());
-        assert!(m.transcription_url.is_none());
         let s = serde_json::to_string(&m).unwrap();
         assert!(!s.contains("video_url"));
         assert!(!s.contains("caption_url"));
-        assert!(!s.contains("transcription_url"));
     }
 
     #[test]
-    fn transcription_url_prefers_lowest_bitrate() {
+    fn video_url_prefers_720p_and_excludes_above_1080p() {
         let v = json!({
             "type": "video",
             "preview_image_url": "https://pbs.twimg.com/thumb/b.jpg",
@@ -420,16 +400,12 @@ mod tests {
             ]
         });
         let m = parse_one(&v).unwrap();
-        // Viewing still prefers 720p; transcription takes the smallest.
+        // Viewing prefers 720p.
         assert_eq!(
             m.video_url.as_deref(),
             Some("https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/1280x720/b720.mp4")
         );
-        assert_eq!(
-            m.transcription_url.as_deref(),
-            Some("https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/640x480/b480.mp4")
-        );
-        // Above-1080p variants are excluded from both picks.
+        // Above-1080p variants are excluded.
         let only_high = json!({
             "type": "video",
             "preview_image_url": "https://pbs.twimg.com/thumb/b.jpg",
@@ -439,7 +415,6 @@ mod tests {
         });
         let m = parse_one(&only_high).unwrap();
         assert!(m.video_url.is_none());
-        assert!(m.transcription_url.is_none());
     }
 
     #[test]
@@ -522,7 +497,6 @@ mod tests {
             video_url: None,
             alt_text: None,
             caption_url: None,
-            transcription_url: None,
         }];
         let md = render_markdown(&video_like);
         assert!(md.contains("- Media (video):"), "{md}");

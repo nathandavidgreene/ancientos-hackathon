@@ -1790,7 +1790,6 @@ mod tests {
             video_url: Some("https://video.twimg.com/synthetic.mp4".into()),
             alt_text: Some("a person stretching".into()),
             caption_url: Some(format!("{base}/track.vtt")),
-            transcription_url: None,
         }];
         let mut cache = HashMap::new();
         let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
@@ -1831,7 +1830,6 @@ mod tests {
             video_url: None,
             alt_text: Some("stored alt".into()),
             caption_url: None,
-            transcription_url: None,
         }];
         let mut cache = HashMap::new();
         let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
@@ -1884,7 +1882,6 @@ mod tests {
             video_url: Some("https://video.twimg.com/synthetic.mp4".into()),
             alt_text: None,
             caption_url: None,
-            transcription_url: None,
         }];
         let mut cache = HashMap::new();
         let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
@@ -1900,7 +1897,6 @@ mod tests {
             video_url: None,
             alt_text: None,
             caption_url: None,
-            transcription_url: None,
         }];
         let e = enrich_at(&b, &mut cache, 5_000_000, Duration::from_secs(5));
         assert!(e.notes.is_empty(), "{:?}", e.notes);
@@ -1918,7 +1914,6 @@ mod tests {
             video_url: Some("https://video.twimg.com/synthetic.mp4".into()),
             alt_text: None,
             caption_url: Some("https://api.x.com/2/synthetic/track".into()),
-            transcription_url: None,
         }];
         let mut cache = HashMap::new();
         // No mock server at all: the paid host is skipped before any fetch.

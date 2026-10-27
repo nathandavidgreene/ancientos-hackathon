@@ -372,7 +372,6 @@ mod tests {
             video_url: None,
             alt_text: Some("synthetic".into()),
             caption_url: None,
-            transcription_url: None,
         }];
         let out = merge(std::slice::from_ref(&live), std::slice::from_ref(&fixture));
         assert_eq!(out.rows.len(), 1);
@@ -386,7 +385,6 @@ mod tests {
             video_url: None,
             alt_text: None,
             caption_url: None,
-            transcription_url: None,
         }];
         let out = merge(
             std::slice::from_ref(&live_with),
