@@ -304,22 +304,6 @@ pub fn is_fresh_unavailable(cache: &HashMap<String, CacheEntry>, id: &str, now: 
     matches!(cache.get(id), Some(e) if is_fresh(e, now) && e.to_liveness().is_unavailable())
 }
 
-/// Filter `bookmarks` using only fresh cache entries: drops posts with a
-/// fresh `unavailable` entry and keeps everything else (fresh live,
-/// missing, expired, or corrupt cache). No network, no cache writes;
-/// synthetic `demo-` ids are always kept. Used by web-ui, which makes no
-/// network calls by design: the brief (via the X client) writes the cache
-/// and web-ui only reuses it. Stale entries are treated as live here —
-/// re-verification is the brief's job.
-pub fn filter_cached(bookmarks: &[Bookmark], cache_path: &Path, now: u64) -> Vec<Bookmark> {
-    let cache = load_cache(cache_path);
-    bookmarks
-        .iter()
-        .filter(|b| !is_fresh_unavailable(&cache, &b.post_id, now))
-        .cloned()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,56 +686,5 @@ mod tests {
             cached_status(&cache, "c1"),
             Some(("live".into(), None, 75_000_000))
         );
-    }
-
-    #[test]
-    fn filter_cached_drops_only_fresh_unavailable() {
-        // No env needed: cache-only reuse never reads env or network.
-        let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join(CACHE_FILE_NAME);
-        let now = 80_000_000;
-        let mut entries = HashMap::new();
-        entries.insert(
-            "fresh-dead".to_string(),
-            CacheEntry::for_status(PostLiveness::Deleted, now - 100),
-        );
-        entries.insert(
-            "fresh-live".to_string(),
-            CacheEntry::for_status(PostLiveness::Live, now - 100),
-        );
-        entries.insert(
-            "stale-dead".to_string(),
-            CacheEntry::for_status(PostLiveness::Suspended, now - CACHE_TTL_SECS - 1),
-        );
-        entries.insert(
-            "demo-9999".to_string(),
-            CacheEntry::for_status(PostLiveness::Deleted, now - 100),
-        );
-        save_cache(&cache, &entries).unwrap();
-        let rows = vec![
-            bm("fresh-dead"),
-            bm("fresh-live"),
-            bm("stale-dead"),
-            bm("uncached"),
-            bm("demo-9999"),
-        ];
-        let out = filter_cached(&rows, &cache, now);
-        let ids: Vec<&str> = out.iter().map(|b| b.post_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["fresh-live", "stale-dead", "uncached", "demo-9999"]
-        );
-        // Read-only: the cache file is untouched.
-        assert_eq!(load_cache(&cache).len(), 4);
-    }
-
-    #[test]
-    fn filter_cached_with_missing_cache_keeps_everything() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join(CACHE_FILE_NAME);
-        let rows = vec![bm("a"), bm("b")];
-        let out = filter_cached(&rows, &cache, 90_000_000);
-        assert_eq!(out.len(), 2);
-        assert!(!cache.exists(), "cache-only reuse must not write");
     }
 }
