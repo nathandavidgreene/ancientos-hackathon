@@ -139,17 +139,17 @@ shot11() {
   ./target/debug/bookmarks-agent approve "$APPROVAL_ID" --now "2030-01-01T00:00:02Z" 2>&1 || true
 }
 
-# Shot 12: print the "Try it, decided in stages" beat.
+# Shot 12: print the "Try it in stages, measured" beat.
 shot12() {
-  echo "==== Shot 12/14: Try it, decided in stages ===="
+  echo "==== Shot 12/14: Try it in stages, measured ===="
   run cascade-demo
   # web-ui's /accuracy page, rendered offline from the synthetic eval set.
   run accuracy-demo
 }
 
-# Shot 13: print the "Built with Meta" beat.
+# Shot 13: print the "Built with Meta, gated by the core" beat.
 shot13() {
-  echo "==== Shot 13/14: Built with Meta ===="
+  echo "==== Shot 13/14: Built with Meta, gated by the core ===="
   RUNS=$(grep -E '^\| [0-9]+[a-z]? ' docs/muse-code-log.md | grep -vc 'Not used')
   echo "Muse Code runs: $RUNS (from docs/muse-code-log.md)"
   echo "Muse Spark writes the briefs; tokens per brief: ~1.6k"
