@@ -92,6 +92,12 @@ impl MuseClient {
         }
     }
 
+    /// Override the model id.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
     /// Override the completion-token cap.
     pub fn with_max_completion_tokens(mut self, n: u32) -> Self {
         self.max_completion_tokens = n;

@@ -78,6 +78,22 @@ pub fn classify(b: &Bookmark) -> Option<TryItTag> {
     classify_with_media(&crate::brief::topic_of(b), &b.text, has_video)
 }
 
+/// Very confident rules verdict: a strict subset of [`classify_text`].
+/// True only when at least two distinct cue types fire AND either the text
+/// carries an explicit try-it cue ("try it", "try this", ...) or the topic is
+/// hands-on (health, fitness, yoga, recipe, ...). Single-cue posts and
+/// two-cue posts with a neutral topic stay unsure, so the cascade's paid
+/// stages decide them. Maps to the cascade's `ConfidentYes`.
+pub fn rules_confident(topic: &str, text: &str) -> bool {
+    let det = detect(text);
+    let mut distinct = det.labels.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    distinct.len() >= 2
+        && (det.explicit || topic_is_hands_on(topic))
+        && classify_text(topic, text).is_some()
+}
+
 /// Classify from a topic and full text (used by the brief, which renders
 /// hydrated/expanded text rather than the stored excerpt).
 pub fn classify_text(topic: &str, text: &str) -> Option<TryItTag> {
@@ -2129,5 +2145,97 @@ mod tests {
                 "should not tag negative {i}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn rules_confident_needs_two_cues_plus_explicit_or_hands_on() {
+        // Confident: explicit cue + 2+ cues, even with a neutral topic.
+        assert!(rules_confident(
+            "AI Agents",
+            "[synthetic] Try it: 1) roll shoulders 10x 2) neck tilt 20s each side."
+        ));
+        // Confident: hands-on topic + 2+ cues, no explicit cue.
+        assert!(rules_confident(
+            "Health & Wellness",
+            "[synthetic] Box breathing: inhale 4s, hold 4s, exhale 4s, hold 4s. Repeat 4 rounds."
+        ));
+        // Unsure: explicit cue alone (one cue) is never confident.
+        let solo_explicit = "[synthetic] An interesting read, you should try it.";
+        assert!(!rules_confident("AI Agents", solo_explicit));
+        // Unsure: 2 cues with a neutral topic and no explicit cue still tags.
+        let two_neutral = "[synthetic] A tip. Roll your shoulders and hold for a moment.";
+        assert!(classify_text("AI Agents", two_neutral).is_some());
+        assert!(!rules_confident("AI Agents", two_neutral));
+        // Unsure: tagged tool-install posts with a neutral topic and no explicit cue.
+        let install =
+            "[synthetic] One-line install: curl -fsSL https://example.invalid/i.sh | bash";
+        assert!(classify_text("Tech & Tools", install).is_some());
+        assert!(!rules_confident("Tech & Tools", install));
+        // Unsure: no cues at all.
+        assert!(!rules_confident(
+            "Health & Wellness",
+            "[synthetic] Interesting study on meditation and sleep quality."
+        ));
+    }
+
+    #[test]
+    fn rules_confident_is_a_strict_subset_of_classify() {
+        // Confidence must imply tagging; the reverse must fail somewhere.
+        let cases = [
+            (
+                "AI Agents",
+                "[synthetic] Try it: 1) roll shoulders 10x 2) neck tilt 20s.",
+            ),
+            (
+                "Health & Wellness",
+                "[synthetic] Box breathing: inhale 4s, hold 4s, exhale 4s. Repeat 4 rounds.",
+            ),
+            (
+                "Recipes",
+                "[synthetic] Ingredients:\n- rolled oats\n- milk\nMix and refrigerate overnight.",
+            ),
+            (
+                "AI Agents",
+                "[synthetic] An interesting read, you should try it.",
+            ),
+            (
+                "AI Agents",
+                "[synthetic] A tip. Roll your shoulders and hold for a moment.",
+            ),
+            (
+                "Stretching",
+                "[synthetic] The hold for this stretch matters.",
+            ),
+            (
+                "Health & Wellness",
+                "[synthetic] Interesting study on meditation and sleep quality.",
+            ),
+            (
+                "AI Agents",
+                "[synthetic] Open source kanban board. Take a tour of the demo.",
+            ),
+            (
+                "Tech & Tools",
+                "[synthetic] One-line install: curl -fsSL https://example.invalid/i.sh | bash",
+            ),
+            (
+                "Tech & Tools",
+                "[synthetic] Type a city name. Save the draft. Download the poster.",
+            ),
+        ];
+        let mut tagged_not_confident = 0;
+        for (topic, text) in cases {
+            let confident = rules_confident(topic, text);
+            let tagged = classify_text(topic, text).is_some();
+            assert!(
+                !confident || tagged,
+                "confident must imply tagged: {topic} / {text}"
+            );
+            tagged_not_confident += usize::from(tagged && !confident);
+        }
+        assert!(
+            tagged_not_confident >= 2,
+            "confidence must be strictly narrower than tagging"
+        );
     }
 }

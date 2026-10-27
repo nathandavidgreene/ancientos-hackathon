@@ -73,8 +73,10 @@ Each entry stores `sha256(seq, prev, kind, payload)`. `verify()` recomputes the 
 | `delegate`, `idea_card` | bookmarks-agent | Hand-off to the agent, and idea cards (adopt / park / drop) |
 | `try_it` | bookmarks-agent | Hands-on classifier, tried yes/no/later follow-ups |
 | `deeper` | bookmarks-agent | "Go deeper" walkthroughs |
+| `try_it_cascade` | router | Try-it cascade: confident rules, else Jev `noul >= 0.5`, else Muse Spark; paid-gated, sanitized-only, fail-closed; scored by `crates/eval/src/bin/try_it_cascade.rs` |
+| `jev_client` | router | Jev (TypeSafe / localjev) classifier client, off by default |
 | `demo-runner` | demo-runner | Deterministic 12-shot demo on synthetic data |
-| `eval` | eval | Offline precision/recall harness ([eval.md](eval.md)) |
+| `eval` | eval (package `ancientos-eval`) | Offline precision/recall harness plus classifier-backend scoring ([eval.md](eval.md)) |
 
 ## Guarantees and the tests that prove them
 

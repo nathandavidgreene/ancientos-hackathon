@@ -677,6 +677,18 @@ mod tests {
     }
 
     #[test]
+    fn bookmark_try_it_wording_matches_cascade() {
+        // The router cannot depend on this crate, so the cascade's Jev
+        // question duplicates this wording; the two must stay identical.
+        let q = bookmark_questions();
+        assert_eq!(q["try_it"]["type"], "noul");
+        assert_eq!(
+            q["try_it"]["instructions"].as_str().unwrap(),
+            ancientos_router::try_it_cascade::TRY_IT_INSTRUCTIONS
+        );
+    }
+
+    #[test]
     fn jev_typesafe_refusal_counts_as_error_without_network() {
         // TypeSafe + sensitive fixtures: refused before any network use, and
         // the eval counts each refusal as an error (incorrect), not a crash.
