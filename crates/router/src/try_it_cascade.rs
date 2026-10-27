@@ -97,7 +97,39 @@ impl CascadeDecision {
 /// True when a backend error message reports HTTP 429 (ureq surfaces it as
 /// `http status 429: ...` via both clients' mappers).
 pub fn is_rate_limit_error(message: &str) -> bool {
-    message.contains("429")
+    http_status_of(message) == Some(429)
+}
+
+/// The HTTP status code from a mapped error (`http status <code>: ...`,
+/// optionally wrapped as `http error: http status <code>: ...`), or `None`.
+/// A "429" anywhere else (body, token counts, post text) does not count.
+pub fn http_status_of(message: &str) -> Option<u16> {
+    let rest = message
+        .strip_prefix("http error: ")
+        .unwrap_or(message)
+        .strip_prefix("http status ")?;
+    let (code, _) = rest.split_once(':')?;
+    if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok()
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_matches_http_status_only() {
+        assert!(is_rate_limit_error("http status 429: slow down"));
+        assert!(is_rate_limit_error("http error: http status 429: {}"));
+        assert!(!is_rate_limit_error("http status 500: used 429 tokens"));
+        assert!(!is_rate_limit_error("bad response: 429 in body"));
+        assert!(!is_rate_limit_error("http status 4290: x"));
+        assert!(!is_rate_limit_error("timeout after 429ms"));
+        assert_eq!(http_status_of("http status 503: down"), Some(503));
+        assert_eq!(http_status_of("refused: no"), None);
+    }
 }
 
 /// Run counters. Call counts record attempts (including ones that errored);
