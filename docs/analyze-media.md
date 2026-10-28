@@ -24,3 +24,28 @@ refused before any call.
 returns the findings only after a human approves that exact payload, once.
 
 No segmentation model (SAM) is used.
+
+## Runner
+
+```
+cargo run -q -p bookmarks-agent --bin analyze-media -- --rows FILE.jsonl [--log PATH] [--live]
+```
+
+Reads `x_bookmark_media`-shaped JSONL and builds one request per post. The
+default is a **dry run**: it prints items to send and keys it would skip,
+with no model call and no log write. `--live` first checks
+`ANCIENTOS_ALLOW_PAID=1` and `ANCIENTOS_MEDIA_MAX_ITEMS` (cap applies to the
+whole run), then the live backend env. It then runs `analyze` and
+`propose_store` per post on the shared decision log. Decide the resulting
+`media.findings.store` approvals with the usual approve/deny tools.
+
+## Live backend
+
+`analyze_media_live::LiveBackend` reuses the Muse client (key read from
+`META_API_KEY` per call, never stored). It requires `ANCIENTOS_MEDIA_MODEL`
+and an https `ANCIENTOS_MEDIA_API_BASE`, with no defaults, and fails closed
+when either is missing. It sends one chat call per item with the image URL
+attached. The reply must be JSON only, `{"findings":[{kind,text,quote?,region?}]}`,
+with no unknown fields and at most 20 findings. Anything else skips the item
+with a logged reason. Evidence is then enforced by the same quote-or-region check.
+Tested only with synthetic replies.
