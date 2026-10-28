@@ -34,9 +34,18 @@ fi
 # The "bookmarks" ANCIENTOS_JEV_TASKS env value is kept for config
 # compatibility, so the bare word is not denied; identifiers are.
 deny='[Dd]iscord|web[-_ ][Uu][Ii]|bookmarks_agent|BookmarkClassification|SENSITIVE_CATEGORIES|class_of_category|Health & Personal|BRIEF_PAID|DEEPER_PAID|WIKI_EDIT|brief\.paid|deeper\.paid|wiki\.edit|default_gate|try_it_cascade|topic_filter|feedback::|muse_runs|muse-runs'
-if hits=$(rg -n -e "$deny" crates/core/src crates/router/src); then
+# grep, not rg: rg is absent on the GitHub runner and ser6buzz. Exit 1 means
+# no match; anything else (2 = error, 127 = missing) must fail closed.
+set +e
+hits=$(grep -rnE -e "$deny" crates/core/src crates/router/src)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
   echo "boundary: app specifics in core/router:" >&2
   echo "$hits" >&2
+  fail=1
+elif [ "$rc" -ne 1 ]; then
+  echo "boundary: deny-list scan failed (grep exit $rc)" >&2
   fail=1
 fi
 
