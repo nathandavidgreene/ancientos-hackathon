@@ -721,6 +721,7 @@ mod tests {
     }
 }
 
-/// Offline try_it / brief-ranking harness (formerly the docs-eval `eval` crate).
 pub mod harness;
+/// Offline try_it / brief-ranking harness (formerly the docs-eval `eval` crate).
+pub mod query_relevance;
 pub use harness::{render_markdown, run};
