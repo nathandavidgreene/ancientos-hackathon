@@ -34,6 +34,7 @@ pub fn requests_from_rows(rows: &[MediaRow]) -> Vec<MediaRequest> {
 struct Args {
     rows: String,
     log: Option<String>,
+    out: Option<String>,
     live: bool,
 }
 
@@ -41,21 +42,44 @@ struct Args {
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut rows = None;
     let mut log = None;
+    let mut out = None;
     let mut live = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--rows" => rows = it.next().cloned(),
             "--log" => log = it.next().cloned(),
+            "--out" => out = it.next().cloned(),
             "--live" => live = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
     Ok(Args {
-        rows: rows.ok_or("usage: analyze-media --rows FILE [--log PATH] [--live]")?,
+        rows: rows.ok_or("usage: analyze-media --rows FILE [--log PATH] [--out FILE] [--live]")?,
         log,
+        out,
         live,
     })
+}
+
+/// Append a post's accepted and rejected findings to `path` as JSONL
+/// (`{"status":"accepted"|"rejected", ...}`), so a run's output survives
+/// even when no store request is made.
+fn append_findings(path: &str, rep: &analyze_media::Report) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("{path}: {e}"))?;
+    let mut put = |v: serde_json::Value| writeln!(f, "{v}").map_err(|e| e.to_string());
+    for x in &rep.accepted {
+        put(serde_json::json!({"status": "accepted", "finding": x}))?;
+    }
+    for x in &rep.rejected {
+        put(serde_json::json!({"status": "rejected", "finding": x}))?;
+    }
+    Ok(())
 }
 
 /// Decision log path: `--log`, else `$DECISION_LOG_PATH`, else
@@ -130,6 +154,9 @@ pub fn run(
     let gate = analyze_media::store_gate();
     for q in &reqs {
         let rep = analyze_media::analyze(&mut log, q, &rows, backend.as_ref(), paid)?;
+        if let Some(path) = &a.out {
+            append_findings(path, &rep)?;
+        }
         let line = match analyze_media::propose_store(&mut log, &gate, &rep.accepted, now) {
             Ok(r) => format!("approval {}", r.id),
             Err(e) => format!("no store request ({e})"),

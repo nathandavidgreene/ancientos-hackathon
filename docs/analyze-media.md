@@ -28,7 +28,7 @@ No segmentation model (SAM) is used.
 ## Runner
 
 ```
-cargo run -q -p bookmarks-agent --bin analyze-media -- --rows FILE.jsonl [--log PATH] [--live]
+cargo run -q -p bookmarks-agent --bin analyze-media -- --rows FILE.jsonl [--log PATH] [--out FINDINGS.jsonl] [--live]
 ```
 
 Reads `x_bookmark_media`-shaped JSONL and builds one request per post. The

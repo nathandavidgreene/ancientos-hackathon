@@ -1,12 +1,22 @@
 //! `analyze-media` binary; see [`bookmarks_agent::analyze_media_cli`].
 use bookmarks_agent::analyze_media::{MediaBackend, PaidConfig};
 
-/// Build the live backend from the process env.
+/// Build the live backend from the process env: `muse_exec` (default) or
+/// `http` per `ANCIENTOS_MEDIA_BACKEND`; anything else is refused.
 fn live(paid: PaidConfig) -> Result<Box<dyn MediaBackend>, String> {
     let env = |k: &str| std::env::var(k).ok();
-    Ok(Box::new(bookmarks_agent::analyze_media_live::live_backend(
-        &env, paid,
-    )?))
+    match env("ANCIENTOS_MEDIA_BACKEND")
+        .as_deref()
+        .unwrap_or("muse_exec")
+    {
+        "muse_exec" => Ok(Box::new(bookmarks_agent::analyze_media_muse::muse_backend(
+            &env, paid,
+        )?)),
+        "http" => Ok(Box::new(bookmarks_agent::analyze_media_live::live_backend(
+            &env, paid,
+        )?)),
+        other => Err(format!("unknown ANCIENTOS_MEDIA_BACKEND '{other}'")),
+    }
 }
 
 /// Entry point: run and print, exit 1 on error.

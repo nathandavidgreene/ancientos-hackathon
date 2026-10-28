@@ -107,13 +107,14 @@ pub struct ResolvedMedia {
     pub alt_text: Option<String>,
 }
 
-/// Region box in normalized image coordinates (0..=1).
+/// Region box in normalized image coordinates (0..=1). `f64` so values
+/// round-trip exactly through the hash-chained log (f32 did not).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Region {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
 }
 
 impl Region {
@@ -611,6 +612,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("cap"));
+    }
+
+    #[test]
+    fn region_findings_survive_log_reopen() {
+        let (d, mut log) = open_log();
+        let rows = parse_rows(FIXTURE).unwrap();
+        let r = Region {
+            x: 0.355,
+            y: 0.433,
+            w: 0.385,
+            h: 0.22,
+        };
+        let b = MockBackend {
+            findings: vec![
+                raw(FindingKind::Text, None, Some(r)),
+                raw(FindingKind::Text, Some("q"), Some(r)),
+            ],
+        };
+        let rep = analyze(
+            &mut log,
+            &req("demo-9001", &["3_demo_photo"]),
+            &rows,
+            &b,
+            paid(5),
+        )
+        .unwrap();
+        propose_store(&mut log, &store_gate(), &rep.accepted, NOW).unwrap();
+        propose_store(&mut log, &store_gate(), &rep.accepted[..1], NOW).unwrap();
+        let again = DecisionLog::open(d.path().join("log.jsonl")).unwrap();
+        assert_eq!(again.verify().unwrap().len(), 2);
     }
 
     #[test]
