@@ -3,6 +3,7 @@
 //! 3-5 picks, votes and feedback, a personal ranker, the try-it cascade,
 //! go-deeper walkthroughs, idea cards, the wiki, and the scheduler daemon.
 //! Risky actions go through [`app_gate`] and the core approvals queue.
+pub mod analyze_media;
 pub mod author_filter;
 pub mod brief;
 pub mod callback;
