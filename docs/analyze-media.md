@@ -62,3 +62,15 @@ into a fresh temp dir as `image.<ext>`, with no URL in the prompt. It then runs
 an error. Usage from `run.usage` adds to a running total. Once the total reaches
 `ANCIENTOS_MEDIA_MAX_TOKENS` (required), later items fail before any call.
 `ANCIENTOS_MUSE_BIN` overrides the binary path.
+
+## Baseten backend
+
+`ANCIENTOS_MEDIA_BACKEND=baseten` calls Muse Spark Open
+(`meta-models/muse-spark-open-1026`) on Baseten's OpenAI-compatible API. It
+needs `ANCIENTOS_ALLOW_PAID=1`, `BASETEN_API_KEY` (sent as `Api-Key`, never
+logged), `ANCIENTOS_MEDIA_MODEL`, an https `ANCIENTOS_MEDIA_API_BASE`
+(`https://inference.baseten.co/v1`) and `ANCIENTOS_MEDIA_MAX_TOKENS`; any
+missing value fails closed. It sends `reasoning_effort: low`, reads
+`message.content` (not the reasoning), and treats a reply cut off at the token
+limit as an error. In a live one-image test it returned the same letter
+findings as Muse with about 1.6K input tokens (Muse: about 29K) in about 5s.

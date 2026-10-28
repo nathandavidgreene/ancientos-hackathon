@@ -4,6 +4,7 @@
 //! go-deeper walkthroughs, idea cards, the wiki, and the scheduler daemon.
 //! Risky actions go through [`app_gate`] and the core approvals queue.
 pub mod analyze_media;
+pub mod analyze_media_baseten;
 pub mod analyze_media_cli;
 pub mod analyze_media_live;
 pub mod analyze_media_muse;
