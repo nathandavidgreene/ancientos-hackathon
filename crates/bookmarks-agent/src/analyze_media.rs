@@ -59,7 +59,8 @@ pub struct MediaRow {
     pub url: Option<String>,
     #[serde(default)]
     pub preview_image_url: Option<String>,
-    #[serde(default)]
+    /// `null` in the table for photos; read as empty.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub variants: Vec<Variant>,
     #[serde(default)]
     pub width: Option<u32>,
@@ -69,6 +70,15 @@ pub struct MediaRow {
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub alt_text: Option<String>,
+}
+
+/// Deserialize a JSON `null` (or absent field) as an empty list.
+fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
 /// What to analyze: a post and its `attachments.media_keys`.
@@ -471,6 +481,16 @@ mod tests {
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[1].variants[0].bit_rate, Some(832000));
         assert_eq!(rows[1].duration_ms, Some(15000));
+    }
+
+    #[test]
+    fn null_optional_fields_parse() {
+        let line = r#"{"post_id":"demo-1","media_key":"3_k","type":"photo","url":"https://pbs.twimg.com/media/demo.jpg","preview_image_url":null,"variants":null,"width":null,"height":null,"duration_ms":null,"alt_text":null}"#;
+        let rows = parse_rows(line).unwrap();
+        assert!(rows[0].variants.is_empty());
+        assert_eq!(rows[0].duration_ms, None);
+        let (ok, sk) = resolve(&req("demo-1", &["3_k"]), &rows);
+        assert_eq!((ok.len(), sk.len()), (1, 0));
     }
 
     #[test]
