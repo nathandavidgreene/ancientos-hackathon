@@ -70,6 +70,7 @@ nav:
       - Python build tools: reference/python-tools.md
   - CLI reference: reference/cli.md
   - API reference: api.md
+  - analyze_media: analyze-media.md
   - Evaluation: eval.md
   - Muse Code log: muse-code-log.md
   - Project:
