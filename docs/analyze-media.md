@@ -49,3 +49,16 @@ attached. The reply must be JSON only, `{"findings":[{kind,text,quote?,region?}]
 with no unknown fields and at most 20 findings. Anything else skips the item
 with a logged reason. Evidence is then enforced by the same quote-or-region check.
 Tested only with synthetic replies.
+
+## muse exec backend (default)
+
+The Meta key works only through the Muse Code CLI, so the runner's default
+backend (`ANCIENTOS_MEDIA_BACKEND=muse_exec`, or `http` for the HTTP client)
+is `analyze_media_muse::MuseExecBackend`. For each item it downloads the image
+into a fresh temp dir as `image.<ext>`, with no URL in the prompt. It then runs
+`muse exec --json --reasoning-effort low --contributor-mode off --workspace
+<tmp> --trust-workspace --image <file> <prompt>` and takes the reply from the
+`run.terminal.completed` event. A run that uses tools or does not complete is
+an error. Usage from `run.usage` adds to a running total. Once the total reaches
+`ANCIENTOS_MEDIA_MAX_TOKENS` (required), later items fail before any call.
+`ANCIENTOS_MUSE_BIN` overrides the binary path.

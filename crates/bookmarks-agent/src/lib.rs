@@ -6,6 +6,7 @@
 pub mod analyze_media;
 pub mod analyze_media_cli;
 pub mod analyze_media_live;
+pub mod analyze_media_muse;
 pub mod author_filter;
 pub mod brief;
 pub mod callback;

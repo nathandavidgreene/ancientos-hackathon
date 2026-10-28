@@ -142,6 +142,9 @@ pub fn run(
             rep.skipped.len()
         ));
     }
+    if let Some(u) = backend.usage_summary() {
+        out.push_str(&format!("usage: {u}\n"));
+    }
     Ok(out)
 }
 

@@ -169,6 +169,11 @@ pub struct Finding {
 pub trait MediaBackend {
     /// Analyze one media item; returns unchecked findings.
     fn analyze(&self, item: &ResolvedMedia) -> Result<Vec<RawFinding>, String>;
+
+    /// Optional usage line (calls, tokens) for run reports.
+    fn usage_summary(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Test/offline backend returning fixed findings for every item.
