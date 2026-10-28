@@ -46,8 +46,8 @@ whole run), then the live backend env. It then runs `analyze` and
 and an https `ANCIENTOS_MEDIA_API_BASE`, with no defaults, and fails closed
 when either is missing. It sends one chat call per item with the image URL
 attached. The reply must be JSON only, `{"findings":[{kind,text,quote?,region?}]}`,
-with no unknown fields and at most 20 findings. Anything else skips the item
-with a logged reason. Evidence is then enforced by the same quote-or-region check.
+with no unknown fields. More than 20 findings keeps the first 20 in the model's
+order. Anything else skips the item with a logged reason. Evidence is then enforced by the same quote-or-region check.
 Tested only with synthetic replies.
 
 ## muse exec backend (default)

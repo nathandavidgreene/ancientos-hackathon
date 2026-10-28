@@ -87,8 +87,10 @@ struct Envelope {
 }
 
 /// Parse the model's reply into raw findings. Accepts a bare JSON object or
-/// one wrapped in a ```json fence; rejects prose, unknown fields, and more
-/// than [`MAX_FINDINGS`] findings.
+/// one wrapped in a ```json fence; rejects prose and unknown fields. A reply
+/// with more than [`MAX_FINDINGS`] findings keeps the first `MAX_FINDINGS`
+/// in the model's order (models list the most salient first; there is no
+/// confidence field) instead of dropping the whole item.
 pub fn parse_findings(content: &str) -> Result<Vec<RawFinding>, String> {
     let mut s = content.trim();
     if let Some(rest) = s.strip_prefix("```") {
@@ -100,10 +102,9 @@ pub fn parse_findings(content: &str) -> Result<Vec<RawFinding>, String> {
     }
     let env: Envelope =
         serde_json::from_str(s).map_err(|e| format!("response is not findings JSON: {e}"))?;
-    if env.findings.len() > MAX_FINDINGS {
-        return Err(format!("more than {MAX_FINDINGS} findings"));
-    }
-    Ok(env.findings)
+    let mut findings = env.findings;
+    findings.truncate(MAX_FINDINGS);
+    Ok(findings)
 }
 
 impl MediaBackend for LiveBackend {
@@ -197,15 +198,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_prose_unknown_fields_and_floods() {
+    /// Prose, unknown fields and open fences fail; floods are cut to the top 20.
+    fn rejects_prose_unknown_fields_and_caps_floods() {
         assert!(parse_findings("Sure! Here are the findings.").is_err());
         assert!(parse_findings("{\"findings\":[],\"extra\":1}").is_err());
         assert!(parse_findings("```json\n{\"findings\":[]}").is_err());
-        let many = format!(
-            "{{\"findings\":[{}]}}",
-            vec!["{\"kind\":\"description\",\"text\":\"x\"}"; MAX_FINDINGS + 1].join(",")
-        );
-        assert!(parse_findings(&many).is_err());
+        let items: Vec<String> = (0..MAX_FINDINGS + 5)
+            .map(|i| format!("{{\"kind\":\"description\",\"text\":\"f{i}\"}}"))
+            .collect();
+        let many = format!("{{\"findings\":[{}]}}", items.join(","));
+        let kept = parse_findings(&many).unwrap();
+        assert_eq!(kept.len(), MAX_FINDINGS);
+        assert_eq!(kept[0].text, "f0");
+        assert_eq!(kept[MAX_FINDINGS - 1].text, format!("f{}", MAX_FINDINGS - 1));
         assert!(parse_findings("{\"findings\":[]}").unwrap().is_empty());
     }
 }
