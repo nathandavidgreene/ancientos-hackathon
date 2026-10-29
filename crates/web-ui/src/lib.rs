@@ -36,6 +36,8 @@ pub struct Request {
     pub path: String,
     pub query: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    /// Raw `Cookie` header, if the client sent one.
+    pub cookie: Option<String>,
 }
 
 impl Request {
@@ -47,6 +49,7 @@ impl Request {
             path,
             query,
             body: Vec::new(),
+            cookie: None,
         }
     }
 
@@ -57,7 +60,14 @@ impl Request {
             path: path.to_string(),
             query: BTreeMap::new(),
             body: body.as_bytes().to_vec(),
+            cookie: None,
         }
+    }
+
+    /// Test helper: the same request carrying a raw `Cookie` header.
+    pub fn with_cookie(mut self, cookie: &str) -> Self {
+        self.cookie = Some(cookie.to_string());
+        self
     }
 }
 
@@ -66,6 +76,8 @@ impl Request {
 pub struct Response {
     pub status: u16,
     pub location: Option<String>,
+    /// Value for one `Set-Cookie` header, if any.
+    pub set_cookie: Option<String>,
     pub body: String,
 }
 
@@ -75,6 +87,7 @@ impl Response {
         Self {
             status: 200,
             location: None,
+            set_cookie: None,
             body,
         }
     }
@@ -84,6 +97,7 @@ impl Response {
         Self {
             status: 303,
             location: Some(to),
+            set_cookie: None,
             body: String::new(),
         }
     }
@@ -93,6 +107,7 @@ impl Response {
         Self {
             status,
             location: None,
+            set_cookie: None,
             body,
         }
     }
@@ -1883,7 +1898,7 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("POST", "/approvals/approve") => decide_approval(state, &req.body, true),
         ("POST", "/approvals/deny") => decide_approval(state, &req.body, false),
         ("GET", "/m") => phone::page_list(req, state),
-        ("POST", "/m/decide") => phone::do_decide(&req.body, state),
+        ("POST", "/m/decide") => phone::do_decide(req, state),
         ("GET", "/wiki") => page_wiki_index(state),
         ("GET", path) if path.starts_with("/wiki/") => {
             page_wiki_show(state, &path["/wiki/".len()..])
@@ -1954,6 +1969,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Response> {
         return Err(bad_request("bad target"));
     }
     let mut content_length: usize = 0;
+    let mut cookie: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -1966,6 +1982,8 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Response> {
                 .trim()
                 .parse::<usize>()
                 .map_err(|_| bad_request("bad content-length"))?;
+        } else if name.trim().eq_ignore_ascii_case("cookie") {
+            cookie = Some(value.trim().to_string());
         }
     }
     if content_length > MAX_BODY_BYTES {
@@ -1994,6 +2012,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Response> {
         path,
         query,
         body,
+        cookie,
     })
 }
 
@@ -2027,6 +2046,9 @@ fn serve_one(stream: &mut std::net::TcpStream, state: &State) {
     );
     if let Some(loc) = &resp.location {
         head.push_str(&format!("Location: {loc}\r\n"));
+    }
+    if let Some(c) = &resp.set_cookie {
+        head.push_str(&format!("Set-Cookie: {c}\r\n"));
     }
     head.push_str("Connection: close\r\n\r\n");
     let _ = stream.write_all(head.as_bytes());
@@ -2894,6 +2916,7 @@ mod tests {
             path: "/".to_string(),
             query: BTreeMap::new(),
             body: Vec::new(),
+            cookie: None,
         };
         assert_eq!(handle(&req, &state).status, 405);
     }
@@ -2906,6 +2929,7 @@ mod tests {
             path: "/vote".to_string(),
             query: BTreeMap::new(),
             body: vec![b'x'; MAX_BODY_BYTES + 1],
+            cookie: None,
         };
         assert_eq!(handle(&req, &state).status, 413);
     }
