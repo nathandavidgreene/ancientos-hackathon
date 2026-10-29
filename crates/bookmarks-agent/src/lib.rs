@@ -31,6 +31,7 @@ pub mod semantic;
 pub mod stats;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod thumbs;
 pub mod token_store;
 pub mod topic_mute;
 pub mod translate;
