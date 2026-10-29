@@ -62,10 +62,33 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     })
 }
 
+/// Short run-line suffix for the post-model mute check: counts only, never
+/// terms or finding text. Empty when the post was not muted.
+fn mute_note(rep: &analyze_media::Report) -> String {
+    match (rep.muted, rep.mute_check_failed) {
+        (_, true) => ", muted (mute check failed; findings withheld)".to_string(),
+        (true, false) => format!(", muted ({} dropped)", rep.muted_findings),
+        _ => String::new(),
+    }
+}
+
+/// Per-post mute record for `--out`: flags and counts only, never terms
+/// or finding text.
+fn mute_record(post_id: &str, rep: &analyze_media::Report) -> serde_json::Value {
+    serde_json::json!({
+        "status": "mute_check",
+        "post_id": post_id,
+        "muted": rep.muted,
+        "muted_findings": rep.muted_findings,
+        "mute_check_failed": rep.mute_check_failed,
+    })
+}
+
 /// Append a post's accepted and rejected findings to `path` as JSONL
-/// (`{"status":"accepted"|"rejected", ...}`), so a run's output survives
-/// even when no store request is made.
-fn append_findings(path: &str, rep: &analyze_media::Report) -> Result<(), String> {
+/// (`{"status":"accepted"|"rejected", ...}`), then one `mute_check` record
+/// ([`mute_record`]) for the post, so a run's output survives even when no
+/// store request is made.
+fn append_findings(path: &str, post_id: &str, rep: &analyze_media::Report) -> Result<(), String> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -79,6 +102,7 @@ fn append_findings(path: &str, rep: &analyze_media::Report) -> Result<(), String
     for x in &rep.rejected {
         put(serde_json::json!({"status": "rejected", "finding": x}))?;
     }
+    put(mute_record(post_id, rep))?;
     Ok(())
 }
 
@@ -155,18 +179,19 @@ pub fn run(
     for q in &reqs {
         let rep = analyze_media::analyze(&mut log, q, &rows, backend.as_ref(), paid)?;
         if let Some(path) = &a.out {
-            append_findings(path, &rep)?;
+            append_findings(path, &q.post_id, &rep)?;
         }
         let line = match analyze_media::propose_store(&mut log, &gate, &rep.accepted, now) {
             Ok(r) => format!("approval {}", r.id),
             Err(e) => format!("no store request ({e})"),
         };
         out.push_str(&format!(
-            "{}: {} accepted, {} rejected, {} skipped; {line}\n",
+            "{}: {} accepted, {} rejected, {} skipped{}; {line}\n",
             q.post_id,
             rep.accepted.len(),
             rep.rejected.len(),
-            rep.skipped.len()
+            rep.skipped.len(),
+            mute_note(&rep)
         ));
     }
     if let Some(u) = backend.usage_summary() {
@@ -237,6 +262,9 @@ mod tests {
 
     #[test]
     fn live_with_mock_proposes_store_per_post() {
+        // Post-model mute check fails closed without config; set a
+        // synthetic non-matching list so findings pass through.
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new(["zorblax"]));
         let d = tempfile::tempdir().unwrap();
         let log = d.path().join("log.jsonl").to_string_lossy().to_string();
         let env = |k: &str| match k {
@@ -253,6 +281,50 @@ mod tests {
         .unwrap();
         assert_eq!(out.matches("approval ").count(), 2, "{out}");
         assert!(out.contains("demo-9003: 0 accepted"), "{out}");
+    }
+
+    /// `--out` gets one mute_check record per post with flags and counts
+    /// only. A synthetic term matching every mock finding drops them all:
+    /// no accepted rows, records show muted with counts, and the term never
+    /// appears in the file. Synthetic fixture.
+    #[test]
+    fn out_jsonl_records_mute_status_without_text() {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("log.jsonl").to_string_lossy().to_string();
+        let out = d.path().join("out.jsonl").to_string_lossy().to_string();
+        let env = |k: &str| match k {
+            "ANCIENTOS_ALLOW_PAID" => Some("1".into()),
+            "ANCIENTOS_MEDIA_MAX_ITEMS" => Some("10".into()),
+            _ => None,
+        };
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new(["10K"]));
+        run(
+            &argv(&["--rows", FIXTURE, "--live", "--log", &log, "--out", &out]),
+            &env,
+            &mock,
+            1_800_000_000,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        let recs: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(recs.iter().all(|r| r["status"] != "accepted"));
+        let mutes: Vec<&serde_json::Value> = recs
+            .iter()
+            .filter(|r| r["status"] == "mute_check")
+            .collect();
+        assert!(!mutes.is_empty());
+        for m in &mutes {
+            let keys: Vec<&String> = m.as_object().unwrap().keys().collect();
+            assert_eq!(keys.len(), 5, "{m}");
+            assert_eq!(m["mute_check_failed"], false);
+        }
+        assert!(mutes
+            .iter()
+            .any(|m| m["muted"] == true && m["muted_findings"] == 1));
+        assert!(!text.contains("10k") && !text.contains("10K"));
     }
 
     #[test]

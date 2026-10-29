@@ -55,6 +55,24 @@ pub fn current() -> Result<MuteList, String> {
     MuteList::from_env()
 }
 
+/// Read-only: the active mute config, or `Ok(None)` when none is
+/// configured. A [`with_terms`] override counts as configured. Otherwise
+/// configured means `ANCIENTOS_MUTED_TERMS` is set (even to zero terms) or
+/// `ANCIENTOS_MUTED_TERMS_FILE` names a file; an unreadable or missing file
+/// is `Err`. Unlike [`current`], "not configured" is distinguishable from
+/// "configured with zero terms". Changes nothing for existing callers.
+pub fn configured() -> Result<Option<MuteList>, String> {
+    if let Some(l) = OVERRIDE.with(|o| o.borrow().clone()) {
+        return Ok(Some(l));
+    }
+    let env_set = std::env::var_os(TERMS_ENV_VAR).is_some();
+    let file_set = std::env::var(TERMS_FILE_ENV_VAR).is_ok_and(|p| !p.trim().is_empty());
+    if !env_set && !file_set {
+        return Ok(None);
+    }
+    MuteList::from_env().map(Some)
+}
+
 /// Id returned by [`excluded_topic`] when the config cannot be read.
 pub const CONFIG_ERROR_ID: &str = "mute config unreadable";
 
@@ -335,6 +353,13 @@ mod tests {
         let miss = with_terms(MuteList::new(["zorblax"]), || excluded_topic("plain"));
         assert_eq!(miss, None);
         assert!(OVERRIDE.with(|o| o.borrow().is_none()));
+    }
+
+    /// `configured` reports an override (even an empty one) as configured.
+    #[test]
+    fn configured_treats_override_as_configured() {
+        let got = with_terms(MuteList::default(), configured);
+        assert_eq!(got, Ok(Some(MuteList::default())));
     }
 
     #[test]

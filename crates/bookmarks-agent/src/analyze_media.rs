@@ -14,6 +14,15 @@
 //! records a `media.findings.store` approval on the hash-chained log, and
 //! [`release_store`] hands them back only after a human approved it.
 //!
+//! Post-model mute check: after the backend runs, every accepted finding's
+//! text and quote are screened against the topic-mute list
+//! ([`crate::topic_mute::current`], the single P9 list). A match drops the
+//! finding and flags the post [`Report::muted`]. Fails closed: if the list
+//! cannot be read, no findings are emitted for the post and it is flagged
+//! muted with [`Report::mute_check_failed`]. A missing config (neither
+//! `ANCIENTOS_MUTED_TERMS` nor `ANCIENTOS_MUTED_TERMS_FILE` set) also fails
+//! closed here; a configured list with zero terms mutes nothing. Logged as counts only.
+//!
 //! The model call is behind `ANCIENTOS_ALLOW_PAID=1` plus a per-run item cap
 //! (`ANCIENTOS_MEDIA_MAX_ITEMS`); without both, [`PaidConfig::from_env`]
 //! refuses. No live backend ships yet; tests use [`MockBackend`].
@@ -36,6 +45,8 @@ pub const HARD_MAX_ITEMS: usize = 200;
 pub const SKIPPED_KIND: &str = "media.skipped";
 /// Log kind for a finding rejected by the evidence check.
 pub const REJECTED_KIND: &str = "media.finding_rejected";
+/// Log kind for a post whose findings hit the post-model mute check.
+pub const MUTED_KIND: &str = "media.findings_muted";
 
 /// One `variants[]` entry of an `x_bookmark_media` row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -246,6 +257,80 @@ pub struct Report {
     pub accepted: Vec<Finding>,
     pub rejected: Vec<Rejected>,
     pub skipped: Vec<Skipped>,
+    /// True when the post-model mute check dropped at least one finding,
+    /// or could not run (then `accepted` is empty). Same meaning as the
+    /// topic-mute "muted" skip: the post does not surface these findings.
+    pub muted: bool,
+    /// Number of findings dropped by the mute check.
+    pub muted_findings: usize,
+    /// True when the mute list could not be read, so every finding for the
+    /// post was withheld (fail closed).
+    pub mute_check_failed: bool,
+}
+
+/// Result of [`screen_muted`]: kept findings and how many were dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MuteScreen {
+    /// Findings that mention no muted term.
+    pub kept: Vec<Finding>,
+    /// Findings dropped for mentioning a muted term.
+    pub dropped: usize,
+}
+
+/// Post-model check: drop every finding whose `text` or `quote` contains a
+/// term from `mute` (case-insensitive, via [`crate::topic_mute::MuteList`]).
+/// Pure and deterministic; order of kept findings is preserved.
+pub fn screen_muted(findings: Vec<Finding>, mute: &crate::topic_mute::MuteList) -> MuteScreen {
+    let before = findings.len();
+    let kept: Vec<Finding> = findings
+        .into_iter()
+        .filter(|f| {
+            let mut texts = vec![f.text.as_str()];
+            if let Some(q) = f.quote.as_deref() {
+                texts.push(q);
+            }
+            !mute.matches_any(&texts)
+        })
+        .collect();
+    MuteScreen {
+        dropped: before - kept.len(),
+        kept,
+    }
+}
+
+/// Apply [`screen_muted`] to `report` using `mute` (the active topic-mute
+/// config from [`crate::topic_mute::configured`]). Fails closed: no config
+/// (`Ok(None)`) or an unreadable/missing terms file (`Err`) withholds every
+/// accepted finding and marks the report muted and `mute_check_failed`. A
+/// configured list with zero terms passes findings through unflagged. Returns the counts-only log
+/// payload when the post was flagged, else `None`.
+pub fn apply_mute_check(
+    report: &mut Report,
+    post_id: &str,
+    mute: Result<Option<crate::topic_mute::MuteList>, String>,
+) -> Option<serde_json::Value> {
+    let accepted = std::mem::take(&mut report.accepted);
+    match mute {
+        Ok(Some(list)) => {
+            let s = screen_muted(accepted, &list);
+            report.accepted = s.kept;
+            report.muted_findings = s.dropped;
+            report.muted = s.dropped > 0;
+        }
+        // Not configured, or the terms file is missing/unreadable.
+        Ok(None) | Err(_) => {
+            report.muted_findings = accepted.len();
+            report.muted = true;
+            report.mute_check_failed = true;
+        }
+    }
+    report.muted.then(|| {
+        serde_json::json!({
+            "post_id": post_id,
+            "dropped": report.muted_findings,
+            "check_failed": report.mute_check_failed,
+        })
+    })
 }
 
 /// Parse `x_bookmark_media` rows from JSONL; any bad line is an error.
@@ -326,8 +411,10 @@ pub fn check(f: &RawFinding) -> Result<(), String> {
 }
 
 /// Run `analyze_media`: resolve keys, enforce the per-run cap, call the
-/// backend, check every finding, and log skips and rejections. Paid
-/// permission is the caller's [`PaidConfig`]; nothing is stored here.
+/// backend, check every finding, screen accepted findings against the
+/// topic-mute list (fail closed, see [`apply_mute_check`]), and log skips,
+/// rejections, and mutes. Paid permission is the caller's [`PaidConfig`];
+/// nothing is stored here.
 pub fn analyze(
     log: &mut DecisionLog,
     req: &MediaRequest,
@@ -389,6 +476,9 @@ pub fn analyze(
         .map_err(|e| e.to_string())?;
     }
     report.skipped = skipped;
+    if let Some(p) = apply_mute_check(&mut report, &req.post_id, crate::topic_mute::configured()) {
+        log.append(MUTED_KIND, p).map_err(|e| e.to_string())?;
+    }
     Ok(report)
 }
 
@@ -568,6 +658,9 @@ mod tests {
 
     #[test]
     fn analyze_logs_rejections_and_skips_with_provenance() {
+        // Post-model mute check fails closed without config; set a
+        // synthetic non-matching list so findings pass through.
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new(["zorblax"]));
         let (_d, mut log) = open_log();
         let rows = parse_rows(FIXTURE).unwrap();
         let b = MockBackend {
@@ -616,6 +709,9 @@ mod tests {
 
     #[test]
     fn region_findings_survive_log_reopen() {
+        // Post-model mute check fails closed without config; set a
+        // synthetic non-matching list so findings pass through.
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new(["zorblax"]));
         let (d, mut log) = open_log();
         let rows = parse_rows(FIXTURE).unwrap();
         let r = Region {
@@ -646,6 +742,9 @@ mod tests {
 
     #[test]
     fn store_needs_human_approval_then_releases_once() {
+        // Post-model mute check fails closed without config; set a
+        // synthetic non-matching list so findings pass through.
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new(["zorblax"]));
         let (_d, mut log) = open_log();
         let rows = parse_rows(FIXTURE).unwrap();
         let b = MockBackend {
@@ -683,5 +782,132 @@ mod tests {
             propose_store(&mut log, &Gate::new(), &rep.accepted, NOW).is_err(),
             "empty gate denies"
         );
+    }
+
+    /// Test helper: accepted finding with synthetic provenance.
+    fn fnd(text: &str, quote: Option<&str>) -> Finding {
+        Finding {
+            kind: FindingKind::Description,
+            text: text.into(),
+            quote: quote.map(String::from),
+            region: None,
+            provenance: Provenance {
+                post_id: "demo-9001".into(),
+                media_key: "3_demo_photo".into(),
+                media_url: "https://pbs.twimg.com/media/demo.jpg".into(),
+                frame_idx: None,
+            },
+        }
+    }
+
+    /// Text and quote are both screened, case-insensitively; order is kept.
+    #[test]
+    fn screen_muted_drops_text_and_quote_matches() {
+        let m = crate::topic_mute::MuteList::new(["Zorblax", "quuxwidget"]);
+        let s = screen_muted(
+            vec![
+                fnd("keep one", None),
+                fnd("a ZORBLAX chart", None),
+                fnd("plain", Some("Quoting QuuxWidget")),
+                fnd("keep two", Some("fine")),
+            ],
+            &m,
+        );
+        let texts: Vec<&str> = s.kept.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(texts, vec!["keep one", "keep two"]);
+        assert_eq!(s.dropped, 2);
+    }
+
+    /// Missing config (`Ok(None)`: neither env var set) fails closed:
+    /// every finding is withheld and the post is flagged.
+    #[test]
+    fn mute_check_fails_closed_on_missing_config() {
+        let mut r = Report {
+            accepted: vec![fnd("harmless synthetic", None)],
+            ..Report::default()
+        };
+        let p = apply_mute_check(&mut r, "demo-9001", Ok(None)).unwrap();
+        assert!(r.accepted.is_empty());
+        assert!(r.muted && r.mute_check_failed);
+        assert_eq!(p["check_failed"], true);
+    }
+
+    /// A configured list with zero terms (only comments/blanks) lets
+    /// findings through and does not flag the post.
+    #[test]
+    fn mute_check_zero_terms_passes_through_unflagged() {
+        let mut r = Report {
+            accepted: vec![fnd("harmless synthetic", None)],
+            ..Report::default()
+        };
+        let parsed = crate::topic_mute::MuteList::parse("# only a comment\n , \n");
+        assert!(apply_mute_check(&mut r, "demo-9001", Ok(Some(parsed))).is_none());
+        assert_eq!(r.accepted.len(), 1);
+        assert!(!r.muted && !r.mute_check_failed);
+    }
+
+    /// A non-empty list with no matches keeps every finding unflagged.
+    #[test]
+    fn mute_check_no_match_passes_through_unflagged() {
+        let mut r = Report {
+            accepted: vec![fnd("plain synthetic", None)],
+            ..Report::default()
+        };
+        let list = crate::topic_mute::MuteList::new(["zorblax"]);
+        assert!(apply_mute_check(&mut r, "demo-9001", Ok(Some(list))).is_none());
+        assert_eq!(r.accepted.len(), 1);
+        assert!(!r.muted && !r.mute_check_failed);
+    }
+
+    /// An unreadable list withholds every finding and flags the post.
+    #[test]
+    fn mute_check_fails_closed_on_config_error() {
+        let mut r = Report {
+            accepted: vec![fnd("harmless", None), fnd("also harmless", None)],
+            ..Report::default()
+        };
+        let p = apply_mute_check(&mut r, "demo-9001", Err("unreadable".into())).unwrap();
+        assert!(r.accepted.is_empty());
+        assert!(r.muted && r.mute_check_failed);
+        assert_eq!(r.muted_findings, 2);
+        assert_eq!(p["check_failed"], true);
+        assert_eq!(p["dropped"], 2);
+    }
+
+    /// End to end through `analyze` with a mock model: muted findings are
+    /// dropped, the post is flagged, and the log gets a counts-only entry
+    /// with no finding text or terms.
+    #[test]
+    fn analyze_screens_model_findings_against_mute_list() {
+        let (d, mut log) = open_log();
+        let rows = parse_rows(FIXTURE).unwrap();
+        let backend = MockBackend {
+            findings: vec![
+                RawFinding {
+                    kind: FindingKind::Description,
+                    text: "[synthetic] Zorblax logo".into(),
+                    quote: None,
+                    region: None,
+                },
+                raw(FindingKind::Text, Some("10k"), None),
+            ],
+        };
+        let rep =
+            crate::topic_mute::with_terms(crate::topic_mute::MuteList::new(["zorblax"]), || {
+                analyze(
+                    &mut log,
+                    &req("demo-9001", &["3_demo_photo"]),
+                    &rows,
+                    &backend,
+                    paid(5),
+                )
+            })
+            .unwrap();
+        assert_eq!(rep.accepted.len(), 1);
+        assert!(rep.muted && !rep.mute_check_failed);
+        assert_eq!(rep.muted_findings, 1);
+        let text = std::fs::read_to_string(d.path().join("log.jsonl")).unwrap();
+        assert!(text.contains(MUTED_KIND));
+        assert!(!text.to_lowercase().contains("zorblax"));
     }
 }
