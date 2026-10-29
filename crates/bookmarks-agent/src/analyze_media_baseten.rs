@@ -226,7 +226,13 @@ mod tests {
             assert!(e.contains("fail closed"), "{k}: {e}");
         }
         let e = BasetenBackend::with_post(
-            &|x: &str| if x == BASE_ENV_VAR { Some("http://x".into()) } else { env(x) },
+            &|x: &str| {
+                if x == BASE_ENV_VAR {
+                    Some("http://x".into())
+                } else {
+                    env(x)
+                }
+            },
             paid(),
             Box::new(|_, _, _| panic!("no call")),
         )
@@ -260,7 +266,13 @@ mod tests {
         assert_eq!(body["model"], "meta-models/muse-spark-open-1026");
         assert_eq!(body["reasoning_effort"], "low");
         assert!(body.to_string().contains("pbs.twimg.com/media/a.jpg"));
-        assert_eq!(b.used(), Usage { input: 1590, output: 1149 });
+        assert_eq!(
+            b.used(),
+            Usage {
+                input: 1590,
+                output: 1149
+            }
+        );
     }
 
     #[test]

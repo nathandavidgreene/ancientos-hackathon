@@ -210,7 +210,10 @@ mod tests {
         let kept = parse_findings(&many).unwrap();
         assert_eq!(kept.len(), MAX_FINDINGS);
         assert_eq!(kept[0].text, "f0");
-        assert_eq!(kept[MAX_FINDINGS - 1].text, format!("f{}", MAX_FINDINGS - 1));
+        assert_eq!(
+            kept[MAX_FINDINGS - 1].text,
+            format!("f{}", MAX_FINDINGS - 1)
+        );
         assert!(parse_findings("{\"findings\":[]}").unwrap().is_empty());
     }
 }
