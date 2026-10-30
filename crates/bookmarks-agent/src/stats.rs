@@ -330,12 +330,14 @@ fn read_verified_entries(log_path: &Path) -> (Vec<Entry>, bool, Option<usize>) {
             return (Vec::new(), true, None)
         }
         Err(LogError::Io(_)) => return (Vec::new(), false, None),
+        Err(LogError::Lock(_)) => return (Vec::new(), false, None),
     };
     match log.verify_or_empty() {
         Ok(entries) => (entries, true, None),
         Err(LogError::Chain(n)) => (Vec::new(), false, Some(n)),
         Err(LogError::Json(_)) => (Vec::new(), false, first_bad_line(log_path)),
         Err(LogError::Io(_)) => (Vec::new(), false, None),
+        Err(LogError::Lock(_)) => (Vec::new(), false, None),
     }
 }
 

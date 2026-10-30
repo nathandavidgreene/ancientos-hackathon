@@ -2122,6 +2122,11 @@ mod tests {
 
     #[test]
     fn muse_explanation_uses_sanitized_capped_reason() {
+        // Pre-existing fix (not the locking change): the Muse stage needs a
+        // key set even for mocks, or it fails closed pre-HTTP, the one-shot
+        // mock starves, and join() hangs forever. Same guard as siblings.
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
         // With a model reason: surfaced, one line.
         let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
         let (muse_url, _, muse_handle) = mock_server(
