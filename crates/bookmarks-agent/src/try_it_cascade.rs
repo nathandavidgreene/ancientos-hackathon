@@ -2122,6 +2122,9 @@ mod tests {
 
     #[test]
     fn muse_explanation_uses_sanitized_capped_reason() {
+        // The Muse stage reads its key from env at call time; without it the
+        // call never reaches the mock server and the join below hangs.
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
         // With a model reason: surfaced, one line.
         let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
         let (muse_url, _, muse_handle) = mock_server(

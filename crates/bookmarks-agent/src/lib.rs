@@ -11,6 +11,7 @@ pub mod analyze_media_muse;
 pub mod author_filter;
 pub mod brief;
 pub mod callback;
+pub mod classify;
 pub mod daemon;
 pub mod deeper;
 pub mod delegate;
