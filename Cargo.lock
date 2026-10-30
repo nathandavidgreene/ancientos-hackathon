@@ -43,6 +43,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "ureq",
+ "url",
 ]
 
 [[package]]

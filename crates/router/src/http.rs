@@ -129,10 +129,47 @@ pub fn get_bytes(
     max_redirects: Option<u32>,
     max_bytes: u64,
 ) -> Result<FetchedBytes, HttpError> {
-    let response = agent(timeout, max_redirects)
-        .get(url)
-        .call()
-        .map_err(map_err)?;
+    let mut target = url::Url::parse(url).map_err(|_| HttpError::Body("invalid URL".into()))?;
+    let limit = max_redirects.unwrap_or(0).min(1);
+    let mut followed = 0;
+    let response = loop {
+        if !matches!(target.scheme(), "http" | "https")
+            || !target.username().is_empty()
+            || target.password().is_some()
+        {
+            return Err(HttpError::Body("unsafe URL".into()));
+        }
+        let response = ureq::AgentBuilder::new()
+            .timeout(timeout)
+            .try_proxy_from_env(false)
+            .redirects(0)
+            .resolver(public_addresses)
+            .build()
+            .get(target.as_str())
+            .call()
+            .map_err(map_err)?;
+        if (300..400).contains(&response.status()) {
+            if followed >= limit {
+                return Err(HttpError::Transport {
+                    kind: TransportKind::TooManyRedirects,
+                    message: "redirect refused".into(),
+                });
+            }
+            target = target
+                .join(
+                    response
+                        .header("location")
+                        .ok_or_else(|| HttpError::Body("missing redirect location".into()))?,
+                )
+                .map_err(|_| HttpError::Body("invalid redirect".into()))?;
+            followed += 1;
+            continue;
+        }
+        if response.get_url() != target.as_str() {
+            return Err(HttpError::Body("unexpected final URL".into()));
+        }
+        break response;
+    };
     let final_url = response.get_url().to_string();
     let content_type = response.header("content-type").map(str::to_string);
     let mut bytes = Vec::new();
@@ -147,6 +184,52 @@ pub fn get_bytes(
         content_type,
         bytes,
     })
+}
+
+/// Reject non-public DNS answers in the resolver used for the actual connection.
+/// The existing fixture opt-in permits loopback only, never metadata addresses.
+fn public_addresses(address: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let addresses: Vec<_> = address.to_socket_addrs()?.collect();
+    let fixture = std::env::var("LINK_CONTEXT_ALLOW_PRIVATE_HOSTS").is_ok_and(|v| v == "1");
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|a| !(public_ip(a.ip()) || fixture && a.ip().is_loopback()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "non-public address refused",
+        ));
+    }
+    Ok(addresses)
+}
+
+/// True only for public unicast addresses, including IPv4-mapped IPv6 checks.
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v) => {
+            let [a, b, _, _] = v.octets();
+            !v.is_private()
+                && !v.is_loopback()
+                && !v.is_link_local()
+                && !v.is_unspecified()
+                && !v.is_multicast()
+                && !v.is_broadcast()
+                && a != 0
+                && a < 240
+                && !(a == 100 && (64..=127).contains(&b))
+                && !v.is_documentation()
+                && !(a == 198 && (b == 18 || b == 19))
+        }
+        std::net::IpAddr::V6(v) => match v.to_ipv4_mapped() {
+            Some(v) => public_ip(std::net::IpAddr::V4(v)),
+            None => {
+                v.segments()[0] & 0xe000 == 0x2000
+                    && !(v.segments()[0] == 0x2001 && v.segments()[1] == 0x0db8)
+            }
+        },
+    }
 }
 
 /// One-request agent: the caller's timeout plus its redirect limit, if any.

@@ -73,7 +73,7 @@ pub const MAX_BODY_BYTES: usize = 512 * 1024;
 /// Whole-request timeout, in seconds.
 pub const TIMEOUT_SECS: u64 = 8;
 /// Max redirects followed per fetch.
-pub const MAX_REDIRECTS: u32 = 3;
+pub const MAX_REDIRECTS: u32 = 1;
 /// Header separating post text from enrichment in cascade input.
 pub const CONTEXT_HEADER: &str = "Linked/Media context:";
 /// Test-only bypass for the non-public-host refusal: must equal `"1"` to
@@ -490,6 +490,7 @@ fn fetch_body(url: &str, timeout: Duration) -> Result<(String, String), String> 
         MAX_BODY_BYTES as u64,
     )
     .map_err(map_fetch_error)?;
+    normalize_public_url(&fetched.final_url)?;
     let media_type = fetched
         .content_type
         .as_deref()
@@ -1668,6 +1669,7 @@ mod tests {
         let (base, _) = mock_server(
             vec![
                 redirect("/short", "/final"),
+                redirect("/metadata", "http://169.254.169.254/latest/meta-data/"),
                 page_route("/final", "<title>Final</title><p>reached</p>"),
                 redirect("/l1", "/l2"),
                 redirect("/l2", "/l3"),
@@ -1676,11 +1678,12 @@ mod tests {
             ],
             20,
         );
+        assert!(fetch_body(&format!("{base}/metadata"), Duration::from_secs(5)).is_err());
         // One redirect is followed.
         let ok = fetch_page(&format!("{base}/short"), Duration::from_secs(5)).unwrap();
         assert!(ok.contains("Final"), "{ok}");
         // Four redirects exceed the cap of three: skipped, not followed.
-        assert_eq!(MAX_REDIRECTS, 3);
+        assert_eq!(MAX_REDIRECTS, 1);
         assert_eq!(
             fetch_page(&format!("{base}/l1"), Duration::from_secs(5)),
             Err("too many redirects".to_string())

@@ -216,7 +216,7 @@ fn http_fetch(url: &str, path: &Path) -> Result<(), String> {
     let fetched = ancientos_router::http::get_bytes(
         &url,
         std::time::Duration::from_secs(30),
-        None,
+        Some(0),
         MAX_IMAGE_BYTES + 1,
     )
     .map_err(|e| match e {
@@ -224,6 +224,7 @@ fn http_fetch(url: &str, path: &Path) -> Result<(), String> {
         HttpError::Transport { message, .. } => format!("download failed: {message}"),
         HttpError::Body(e) => e.to_string(),
     })?;
+    crate::media::safe_media_url(&fetched.final_url).ok_or("unsafe final media URL")?;
     if fetched.bytes.len() as u64 > MAX_IMAGE_BYTES {
         return Err("image too large".into());
     }
@@ -345,6 +346,14 @@ mod tests {
             r#"{"payload_type":"run.terminal.completed","payload":{"terminal":"completed","text":"I think it shows a chart"}}"#,
         );
         assert!(b.analyze(&item()).is_err());
+    }
+
+    #[test]
+    fn metadata_download_is_refused_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image");
+        assert!(http_fetch("http://169.254.169.254/latest/meta-data/", &path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]
