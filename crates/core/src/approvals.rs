@@ -545,6 +545,7 @@ pub fn request(
     now: u64,
     ttl: Option<u64>,
 ) -> Result<ApprovalRequest, ApprovalError> {
+    let guard = log.acquire_lock()?;
     match gate.evaluate(&Proposal {
         agent: agent.to_string(),
         action: action.to_string(),
@@ -564,7 +565,7 @@ pub fn request(
             return Ok(a.request);
         }
     }
-    log.append(REQUESTED_KIND, req.to_entry_payload())?;
+    log.append_locked(REQUESTED_KIND, req.to_entry_payload(), &guard)?;
     Ok(req)
 }
 
@@ -612,6 +613,7 @@ pub fn approve(
     decided_by: &str,
     now: u64,
 ) -> Result<ReleaseToken, ApprovalError> {
+    let guard = log.acquire_lock()?;
     if decided_by.is_empty() {
         return Err(ApprovalError::EmptyDecider);
     }
@@ -629,7 +631,7 @@ pub fn approve(
     if a.request.payload_hash != expected_payload_hash {
         return Err(ApprovalError::HashMismatch(id.to_string()));
     }
-    log.append(
+    log.append_locked(
         APPROVED_KIND,
         serde_json::json!({
             "id": id,
@@ -637,6 +639,7 @@ pub fn approve(
             "decided_by": decided_by,
             "decided_at": now,
         }),
+        &guard,
     )?;
     Ok(ReleaseToken {
         approval_id: id.to_string(),
@@ -654,6 +657,7 @@ pub fn deny(
     reason: &str,
     now: u64,
 ) -> Result<(), ApprovalError> {
+    let guard = log.acquire_lock()?;
     if decided_by.is_empty() {
         return Err(ApprovalError::EmptyDecider);
     }
@@ -671,7 +675,7 @@ pub fn deny(
     if a.request.payload_hash != expected_payload_hash {
         return Err(ApprovalError::HashMismatch(id.to_string()));
     }
-    log.append(
+    log.append_locked(
         DENIED_KIND,
         serde_json::json!({
             "id": id,
@@ -680,6 +684,7 @@ pub fn deny(
             "reason": reason,
             "decided_at": now,
         }),
+        &guard,
     )?;
     Ok(())
 }
@@ -835,6 +840,48 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn concurrent_approval_decisions_have_exactly_one_winner() {
+        for deny_second in [false, true] {
+            let (_dir, mut log, path) = open_log();
+            let req = propose(&mut log, NOW, json!({"target": "synthetic"}));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|index| {
+                    let path = path.clone();
+                    let req = req.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let mut log = DecisionLog::open(path).unwrap();
+                        barrier.wait();
+                        if index == 1 && deny_second {
+                            deny(&mut log, &req.id, &req.payload_hash, "human", "no", NOW + 1)
+                                .is_ok()
+                        } else {
+                            approve(&mut log, &req.id, &req.payload_hash, "human", NOW + 1).is_ok()
+                        }
+                    })
+                })
+                .collect();
+            assert_eq!(
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .filter(|won| *won)
+                    .count(),
+                1
+            );
+            let entries = log.verify().unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|e| e.kind == APPROVED_KIND || e.kind == DENIED_KIND)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
