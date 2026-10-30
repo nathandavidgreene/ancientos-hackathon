@@ -31,7 +31,7 @@
 
 use crate::{BRIEF_PAID_ACTION, DEEPER_PAID_ACTION};
 use ancientos_core::approvals;
-use ancientos_core::log::DecisionLog;
+use ancientos_core::log::{DecisionLog, Entry};
 use ancientos_core::loop_guard::{self, Budgets, LoopGuard};
 use ancientos_core::scheduler::{Agent, Scheduler};
 use std::path::{Path, PathBuf};
@@ -45,6 +45,12 @@ pub use crate::brief::AGENT_NAME as DAEMON_AGENT_NAME;
 pub const DAEMON_TICK_KIND: &str = "daemon.tick";
 /// Log kind appended by the try-followup agent: `{count, post_ids, at}`.
 pub const TRY_FOLLOWUP_KIND: &str = "daemon.try_followup";
+/// Log kind appended before a released paid job executes:
+/// `{approval_id, payload_hash, post_id, at, started_at}`.
+pub const JOB_STARTED_KIND: &str = "job.started";
+/// Log kind appended after a released paid job completes:
+/// `{approval_id, payload_hash, post_id, at, done_at}`.
+pub const JOB_DONE_KIND: &str = "job.done";
 
 /// Env switches for intervals (seconds), loop sleep and the test tick cap.
 pub const BRIEF_SECS_ENV: &str = "DAEMON_BRIEF_SECS";
@@ -329,6 +335,18 @@ pub fn wiki_lint_tick(ctx: &AgentCtx, now: u64) -> Result<crate::wiki::LintRepor
     crate::wiki::lint_and_propose(&wiki, &ctx.log_path, now)
 }
 
+/// A paid job whose approval was released but whose completion was never
+/// recorded (`job.started` without `job.done` for the approval id). The side
+/// effect may or may not have run, so the daemon never retries it silently;
+/// a human must resolve it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedNotDone {
+    /// Queued job the release belonged to.
+    pub post_id: String,
+    /// Approval id that was released but never completed.
+    pub approval_id: String,
+}
+
 /// Outcome of one deeper-queue tick: post ids per path taken.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeeperQueueTick {
@@ -337,6 +355,8 @@ pub struct DeeperQueueTick {
     pub executed_paid: Vec<String>,
     pub waiting: Vec<String>,
     pub skipped_denied: Vec<String>,
+    /// Jobs released but never recorded done (see [`ReleasedNotDone`]).
+    pub released_not_done: Vec<ReleasedNotDone>,
     /// Resume approval proposed when this tick's loop guard tripped; the
     /// remaining paid jobs wait for the next tick (fail closed).
     pub guard_resume: Option<String>,
@@ -344,6 +364,75 @@ pub struct DeeperQueueTick {
 
 /// Loop-guard name for the paid deeper-queue loop.
 pub const DEEPER_LOOP_NAME: &str = "deeper_queue";
+
+/// Payload for a [`JOB_STARTED_KIND`] entry: the approval id and payload
+/// hash key the event; post id, queue time and start time are metadata.
+pub fn job_started_payload(
+    approval_id: &str,
+    payload_hash: &str,
+    post_id: &str,
+    at: u64,
+    now: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "approval_id": approval_id, "payload_hash": payload_hash,
+        "post_id": post_id, "at": at, "started_at": now,
+    })
+}
+
+/// Payload for a [`JOB_DONE_KIND`] entry: same keys as
+/// [`job_started_payload`], with the completion time instead of the start.
+pub fn job_done_payload(
+    approval_id: &str,
+    payload_hash: &str,
+    post_id: &str,
+    at: u64,
+    now: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "approval_id": approval_id, "payload_hash": payload_hash,
+        "post_id": post_id, "at": at, "done_at": now,
+    })
+}
+
+/// Lifecycle of one released paid job, folded from [`JOB_STARTED_KIND`] /
+/// [`JOB_DONE_KIND`] entries keyed by approval id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRunState {
+    /// No `job.started` for this approval id: the side effect never ran.
+    NotStarted,
+    /// `job.started` without a matching `job.done`: the side effect may or
+    /// may not have run (crash or failure mid-execution) — never retry it
+    /// silently.
+    StartedNotDone,
+    /// `job.done` for this approval id: the side effect already ran.
+    Done,
+}
+
+/// Fold [`JOB_STARTED_KIND`] / [`JOB_DONE_KIND`] entries into the run state
+/// for one approval id. Only entries whose `approval_id` AND `payload_hash`
+/// both match count: anything else proves nothing about this job (fail
+/// closed — a mismatched hash never marks the job done or started).
+pub fn job_run_state(entries: &[Entry], approval_id: &str, payload_hash: &str) -> JobRunState {
+    let mut started = false;
+    for e in entries {
+        let keyed = e.payload.get("approval_id").and_then(|v| v.as_str()) == Some(approval_id)
+            && e.payload.get("payload_hash").and_then(|v| v.as_str()) == Some(payload_hash);
+        if !keyed {
+            continue;
+        }
+        match e.kind.as_str() {
+            JOB_STARTED_KIND => started = true,
+            JOB_DONE_KIND => return JobRunState::Done,
+            _ => {}
+        }
+    }
+    if started {
+        JobRunState::StartedNotDone
+    } else {
+        JobRunState::NotStarted
+    }
+}
 
 /// True when a daemon approval matches the job's exact payload.
 fn is_job_approval(a: &approvals::Approval, action: &str, payload_hash: &str) -> bool {
@@ -366,12 +455,15 @@ fn is_job_approval(a: &approvals::Approval, action: &str, payload_hash: &str) ->
 ///   executes only later, when an approved request for that exact payload
 ///   exists: the daemon claims the [`ReleaseToken`](approvals::ReleaseToken)
 ///   from the human decision and moves it into the paid executor, which
-///   calls [`release`](approvals::release) (exactly once per approval)
-///   before running the existing deeper paid path (which still requires
-///   `ANCIENTOS_ALLOW_PAID=1`). A request that is already released never
-///   executes again: a job whose release happened but which never finished
-///   gets one fresh proposal, like an expired one. Denied proposals are
-///   skipped forever.
+///   calls [`release`](approvals::release) (exactly once per approval),
+///   logs `job.started` keyed by approval id, runs the existing deeper paid
+///   path (which still requires `ANCIENTOS_ALLOW_PAID=1`) and logs
+///   `job.done`. A request that is already released never executes again:
+///   a release with `job.started` but no `job.done` is surfaced as
+///   released-not-done (never re-executed silently); a release with
+///   `job.done` but no queue marker only gets the marker; a release that
+///   never started needs a fresh approval (and a fresh release token), like
+///   an expired one. Denied proposals are skipped forever.
 ///
 /// Every due job is attempted; failures are collected and returned as one
 /// `Err` listing the failed post ids (other jobs and agents still run).
@@ -443,6 +535,10 @@ pub fn deeper_queue_tick_with(
             PaidStep::Executed => out.executed_paid.push(job.post_id.clone()),
             PaidStep::Waiting => out.waiting.push(job.post_id.clone()),
             PaidStep::SkippedDenied => out.skipped_denied.push(job.post_id.clone()),
+            PaidStep::ReleasedNotDone(approval_id) => out.released_not_done.push(ReleasedNotDone {
+                post_id: job.post_id.clone(),
+                approval_id,
+            }),
             PaidStep::Failed(e) => errors.push(format!("{}: {e}", job.post_id)),
         }
     }
@@ -453,18 +549,30 @@ pub fn deeper_queue_tick_with(
     }
 }
 
+/// One paid job's path through a tick: propose, wait, claim+release+execute,
+/// skip, surface released-not-done, or fail.
 #[derive(Debug, PartialEq, Eq)]
 enum PaidStep {
+    /// A fresh approval was proposed for the job.
     Proposed,
+    /// The paid walkthrough completed (or was already done and only the
+    /// queue marker was still missing); the side effect ran at most once.
     Executed,
+    /// An approval is still pending a human decision.
     Waiting,
+    /// A human denied the job: never execute, never re-propose.
     SkippedDenied,
+    /// The approval was released but no `job.done` exists for its id
+    /// (carries the approval id); surfaced for a human, never retried
+    /// silently.
+    ReleasedNotDone(String),
+    /// The step failed with the given reason; other jobs still run.
     Failed(String),
 }
 
-/// One paid job: propose, wait, claim+release+execute, or skip. `Ok` always
-/// (failures come back as [`PaidStep::Failed`]); `Err` only when the log
-/// itself cannot be read.
+/// One paid job: propose, wait, claim+release+execute, skip, or surface
+/// released-not-done. `Ok` always (failures come back as
+/// [`PaidStep::Failed`]); `Err` only when the log itself cannot be read.
 #[allow(clippy::too_many_arguments)]
 fn paid_job_step(
     ctx: &AgentCtx,
@@ -490,9 +598,32 @@ fn paid_job_step(
     let approved = decided
         .iter()
         .find(|a| a.status == approvals::Status::Approved);
+    let released = decided
+        .iter()
+        .find(|a| a.status == approvals::Status::Released);
     let denied = decided
         .iter()
         .any(|a| a.status == approvals::Status::Denied);
+    if let Some(a) = released {
+        // Already released: a previous tick released then crashed before
+        // executing, or executed then crashed before marking done. The
+        // job.started/job.done events keyed by approval id tell which: a
+        // job started but not done is surfaced for a human (never silently
+        // re-executed); a job done but missing its queue marker gets the
+        // marker without re-running the side effect; a job never
+        // started needs a fresh approval.
+        let id = a.request.id.clone();
+        let hash = a.request.payload_hash.clone();
+        let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
+        match job_run_state(&entries, &id, &hash) {
+            JobRunState::Done => return mark_paid_done(ctx, job, now),
+            JobRunState::StartedNotDone => return Ok(PaidStep::ReleasedNotDone(id)),
+            // Released but never started: the release token is spent and a
+            // side effect needs a token by value, so fall through and
+            // propose a fresh approval instead of executing.
+            JobRunState::NotStarted => {}
+        }
+    }
     if let Some(a) = approved {
         let id = a.request.id.clone();
         let hash = a.request.payload_hash.clone();
@@ -506,6 +637,8 @@ fn paid_job_step(
             ctx,
             job,
             payload,
+            &id,
+            &hash,
             now,
             fetch_thread,
             fetch_post,
@@ -565,12 +698,40 @@ fn ensure_proposed(
     Ok(())
 }
 
+/// Record a paid job as done without running the side effect: the log
+/// already shows `job.done` for the approval id, so a previous tick ran the
+/// walkthrough but crashed before marking the queue done. Appends only the
+/// `deeper.done` queue marker; never touches fetchers or the model.
+/// Returns [`PaidStep::Executed`] or [`PaidStep::Failed`].
+fn mark_paid_done(
+    ctx: &AgentCtx,
+    job: &crate::deeper::QueuedJob,
+    now: u64,
+) -> Result<PaidStep, String> {
+    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    if let Err(e) = log.append(
+        crate::deeper::DEEPER_QUEUE_DONE_KIND,
+        serde_json::json!({
+            "post_id": job.post_id, "at": job.at,
+            "mode": "paid", "done_at": now,
+        }),
+    ) {
+        return Ok(PaidStep::Failed(format!("done marker failed: {e}")));
+    }
+    Ok(PaidStep::Executed)
+}
+
 /// Run the paid walkthrough for one approved job and mark the job done.
 /// Consumes the job approval's [`ReleaseToken`](approvals::ReleaseToken) by
 /// value together with the exact approved `payload`: the token is released
 /// first (exactly once per approval, so a second execution with another
 /// token fails here), and only then does the paid path run. Without a token
-/// this function cannot be called. Returns [`PaidStep::Executed`] or
+/// this function cannot be called. Logs [`JOB_STARTED_KIND`] before the
+/// side effect and [`JOB_DONE_KIND`] after it (both keyed by approval id and
+/// payload hash), so a crash in between surfaces as released-not-done
+/// instead of silently re-executing. Fails closed: when the release or the
+/// started event cannot be logged the side effect never runs. Returns
+/// [`PaidStep::Executed`] or
 /// [`PaidStep::Failed`].
 #[allow(clippy::too_many_arguments)]
 fn execute_paid(
@@ -578,6 +739,8 @@ fn execute_paid(
     ctx: &AgentCtx,
     job: &crate::deeper::QueuedJob,
     payload: &serde_json::Value,
+    approval_id: &str,
+    payload_hash: &str,
     now: u64,
     fetch_thread: &crate::delegate::ThreadFetcher<'_>,
     fetch_post: &crate::deeper::PostFetcher<'_>,
@@ -587,7 +750,13 @@ fn execute_paid(
     if let Err(e) = approvals::release(&mut log, token, payload) {
         return Ok(PaidStep::Failed(format!("release failed: {e}")));
     }
-    match crate::deeper::run_with(
+    if let Err(e) = log.append(
+        JOB_STARTED_KIND,
+        job_started_payload(approval_id, payload_hash, &job.post_id, job.at, now),
+    ) {
+        return Ok(PaidStep::Failed(format!("job.started failed: {e}")));
+    }
+    if let Err(e) = crate::deeper::run_with(
         &job.post_id,
         true,
         None,
@@ -598,20 +767,19 @@ fn execute_paid(
         &ctx.deeper_dir,
         None,
     ) {
-        Ok(_) => {
-            let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
-            log.append(
-                crate::deeper::DEEPER_QUEUE_DONE_KIND,
-                serde_json::json!({
-                    "post_id": job.post_id, "at": job.at,
-                    "mode": "paid", "done_at": now,
-                }),
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(PaidStep::Executed)
-        }
-        Err(e) => Ok(PaidStep::Failed(format!("paid run failed: {e}"))),
+        return Ok(PaidStep::Failed(format!("paid run failed: {e}")));
     }
+    // run_with appended through its own handle; reopen before marking done
+    // so the chain stays contiguous. job.done first: a crash before the
+    // queue marker still heals without re-running the side effect.
+    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    if let Err(e) = log.append(
+        JOB_DONE_KIND,
+        job_done_payload(approval_id, payload_hash, &job.post_id, job.at, now),
+    ) {
+        return Ok(PaidStep::Failed(format!("job.done failed: {e}")));
+    }
+    mark_paid_done(ctx, job, now)
 }
 
 /// Production deeper-queue tick: real thread/post fetchers and a real Muse
@@ -776,12 +944,13 @@ impl Agent for DeeperQueueAgent {
         let now = self.ctx.now_secs();
         let summary = deeper_queue_tick(&self.ctx, now, allow_paid())?;
         println!(
-            "deeper_queue: local={} proposed={} paid={} waiting={} denied={}",
+            "deeper_queue: local={} proposed={} paid={} waiting={} denied={} released_not_done={}",
             summary.ran_local.len(),
             summary.proposed.len(),
             summary.executed_paid.len(),
             summary.waiting.len(),
-            summary.skipped_denied.len()
+            summary.skipped_denied.len(),
+            summary.released_not_done.len()
         );
         Ok(())
     }
@@ -1319,11 +1488,86 @@ mod tests {
             &AgentCtx,
             &crate::deeper::QueuedJob,
             &serde_json::Value,
+            &str,
+            &str,
             u64,
             &crate::delegate::ThreadFetcher<'a>,
             &crate::deeper::PostFetcher<'b>,
             &crate::deeper::DeeperMuseCaller<'c>,
         ) -> Result<PaidStep, String> = execute_paid;
+    }
+
+    /// Test helper: approve (without releasing) the job's single pending
+    /// proposal, returning approval id and payload hash; the executor claims
+    /// and releases the token itself.
+    fn approve_only_for(ctx: &AgentCtx, now: u64) -> (String, String) {
+        let mut log = DecisionLog::open(&ctx.log_path).unwrap();
+        let pending = approvals::pending(&log, now).unwrap();
+        assert_eq!(pending.len(), 1);
+        let id = pending[0].request.id.clone();
+        let hash = pending[0].request.payload_hash.clone();
+        approvals::approve(&mut log, &id, &hash, "human", now).unwrap();
+        (id, hash)
+    }
+
+    /// Test helper: approve and release the job's pending proposal, returning approval id and payload hash.
+    fn approve_and_release_for(
+        ctx: &AgentCtx,
+        post_id: &str,
+        at: u64,
+        now: u64,
+    ) -> (String, String) {
+        let mut log = DecisionLog::open(&ctx.log_path).unwrap();
+        let pending = approvals::pending(&log, now).unwrap();
+        assert_eq!(pending.len(), 1);
+        let id = pending[0].request.id.clone();
+        let hash = pending[0].request.payload_hash.clone();
+        approvals::approve(&mut log, &id, &hash, "human", now).unwrap();
+        let token = approvals::claim_release_token(&log, &id, &hash).unwrap();
+        approvals::release(&mut log, token, &deeper_paid_payload(post_id, at)).unwrap();
+        (id, hash)
+    }
+
+    /// Paid execution logs job.started then job.done keyed by approval id.
+    #[test]
+    fn paid_execution_logs_started_then_done_for_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir, false);
+        queue_job(&ctx, "100", NOW, NOW);
+        let fetch_thread = |id: &str| Ok(mock_thread(id));
+        let fetch_post = |id: &str| Ok(mock_thread(id).posts[0].clone());
+        let call = |_: &str, _: Option<&str>| {
+            Ok((
+                "1. Install WordCraft now\n".to_string(),
+                "mock".to_string(),
+                None,
+                None,
+            ))
+        };
+        let t1 =
+            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert_eq!(t1.proposed, vec!["100".to_string()]);
+        let (id, hash) = approve_only_for(&ctx, NOW);
+        let t2 =
+            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert_eq!(t2.executed_paid, vec!["100".to_string()]);
+        assert!(t2.released_not_done.is_empty());
+        let entries = entries_of(&ctx.log_path);
+        let started = entries
+            .iter()
+            .position(|e| e.kind == JOB_STARTED_KIND)
+            .expect("job.started logged");
+        let done = entries
+            .iter()
+            .position(|e| e.kind == JOB_DONE_KIND)
+            .expect("job.done logged");
+        assert!(started < done, "started precedes done");
+        for e in [&entries[started], &entries[done]] {
+            assert_eq!(e.payload["approval_id"], id);
+            assert_eq!(e.payload["payload_hash"], hash);
+            assert_eq!(e.payload["post_id"], "100");
+        }
+        assert_eq!(job_run_state(&entries, &id, &hash), JobRunState::Done);
     }
 
     /// A released-but-unfinished job needs a fresh approval to execute.
@@ -1397,6 +1641,107 @@ mod tests {
         assert_eq!(t3.executed_paid, vec!["100".to_string()]);
         assert_eq!(calls.get(), 1);
         assert!(ctx.deeper_dir.join("100.md").exists());
+    }
+
+    /// A release with job.started but no job.done surfaces as
+    /// released-not-done and never retries silently.
+    #[test]
+    fn crash_between_release_and_done_surfaces_released_not_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir, false);
+        queue_job(&ctx, "100", NOW, NOW);
+        let calls = Cell::new(0usize);
+        let fetch_thread = |id: &str| Ok(mock_thread(id));
+        let fetch_post = |id: &str| Ok(mock_thread(id).posts[0].clone());
+        let call = |_: &str, _: Option<&str>| {
+            calls.set(calls.get() + 1);
+            Ok((
+                "1. Install WordCraft now\n".to_string(),
+                "mock".to_string(),
+                None,
+                None,
+            ))
+        };
+        let t1 =
+            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert_eq!(t1.proposed, vec!["100".to_string()]);
+        assert_eq!(calls.get(), 0);
+        let (id, hash) = approve_and_release_for(&ctx, "100", NOW, NOW);
+        // Simulate a crash after the started event: execution began (or
+        // never did) but completion was never recorded.
+        let mut log = DecisionLog::open(&ctx.log_path).unwrap();
+        log.append(
+            JOB_STARTED_KIND,
+            job_started_payload(&id, &hash, "100", NOW, NOW),
+        )
+        .unwrap();
+        drop(log);
+        for _ in 0..2 {
+            let tick =
+                deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+            assert_eq!(
+                tick.released_not_done,
+                vec![ReleasedNotDone {
+                    post_id: "100".to_string(),
+                    approval_id: id.clone(),
+                }]
+            );
+            assert!(tick.executed_paid.is_empty());
+        }
+        assert_eq!(calls.get(), 0, "released-not-done job never re-executes");
+        assert!(!entries_of(&ctx.log_path)
+            .iter()
+            .any(|e| e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND));
+    }
+
+    /// A job.done without the queue marker completes bookkeeping without
+    /// re-running the side effect.
+    #[test]
+    fn done_job_without_queue_marker_never_executes_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir, false);
+        queue_job(&ctx, "100", NOW, NOW);
+        let calls = Cell::new(0usize);
+        let fetch_thread = |id: &str| Ok(mock_thread(id));
+        let fetch_post = |id: &str| Ok(mock_thread(id).posts[0].clone());
+        let call = |_: &str, _: Option<&str>| {
+            calls.set(calls.get() + 1);
+            Ok((
+                "1. Install WordCraft now\n".to_string(),
+                "mock".to_string(),
+                None,
+                None,
+            ))
+        };
+        let t1 =
+            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert_eq!(t1.proposed, vec!["100".to_string()]);
+        let (id, hash) = approve_and_release_for(&ctx, "100", NOW, NOW);
+        // Simulate a crash after the side effect completed but before the
+        // queue marker was written: started and done exist, deeper.done
+        // does not.
+        let mut log = DecisionLog::open(&ctx.log_path).unwrap();
+        log.append(
+            JOB_STARTED_KIND,
+            job_started_payload(&id, &hash, "100", NOW, NOW),
+        )
+        .unwrap();
+        log.append(JOB_DONE_KIND, job_done_payload(&id, &hash, "100", NOW, NOW))
+            .unwrap();
+        drop(log);
+        let tick =
+            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert_eq!(tick.executed_paid, vec!["100".to_string()]);
+        assert!(tick.released_not_done.is_empty());
+        assert_eq!(calls.get(), 0, "side effect already ran: no second run");
+        assert!(entries_of(&ctx.log_path).iter().any(|e| {
+            e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND && e.payload["mode"] == "paid"
+        }));
+        // The healed job leaves the queue: the next tick is a no-op.
+        let again =
+            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert_eq!(again, DeeperQueueTick::default());
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]

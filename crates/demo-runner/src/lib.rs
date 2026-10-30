@@ -1313,6 +1313,7 @@ mod tests {
         );
     }
 
+    /// Approvals demo proposes, releases exactly once, and logs the job lifecycle.
     #[test]
     fn approvals_demo_proposes_releases_once_with_mock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1361,7 +1362,20 @@ mod tests {
             .kinds
             .iter()
             .all(|(_, id)| id == &proposed.approval_id));
-        assert_eq!(chain.total, 7);
+        // 7 pre-existing entries plus job.started and job.done for the
+        // released approval.
+        assert_eq!(chain.total, 9);
+        let all = DecisionLog::open(ws.log_path()).unwrap().verify().unwrap();
+        let jobs: Vec<&str> = all
+            .iter()
+            .filter(|e| e.kind == daemon::JOB_STARTED_KIND || e.kind == daemon::JOB_DONE_KIND)
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(jobs, vec![daemon::JOB_STARTED_KIND, daemon::JOB_DONE_KIND]);
+        assert!(all
+            .iter()
+            .filter(|e| e.kind == daemon::JOB_STARTED_KIND || e.kind == daemon::JOB_DONE_KIND)
+            .all(|e| e.payload["approval_id"] == proposed.approval_id));
         // Exactly once: the job is done, so a second release tick finds
         // nothing due and appends nothing (never a second release entry).
         assert!(ws.approvals_release().is_err());
