@@ -13,6 +13,7 @@ ancientos-core = { path = "../core" }
 bookmarks-agent = { path = "../bookmarks-agent" }
 ancientos-eval = { path = "../eval" }
 serde_json.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 muse-runs = { path = "../muse-runs" }
