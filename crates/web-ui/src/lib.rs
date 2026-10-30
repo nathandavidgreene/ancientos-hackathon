@@ -422,15 +422,15 @@ fn now_secs() -> u64 {
 /// Pending approvals for the nav badge. Best-effort like
 /// `hidden_authors_of`: a missing or unreadable log reads as zero
 /// (tampering is surfaced on `/approvals` and `/log` instead).
-fn pending_count(state: &State) -> usize {
+fn pending_count(state: &State) -> String {
     let Ok(log) = ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
         std::env::var(key).ok()
     }) else {
-        return 0;
+        return "unavailable".into();
     };
     ancientos_core::approvals::pending(&log, now_secs())
-        .map(|v| v.len())
-        .unwrap_or(0)
+        .map(|items| items.len().to_string())
+        .unwrap_or_else(|_| "unavailable".into())
 }
 
 /// Wrap a page `body` in the shared HTML shell: doctype, inline CSS,
@@ -663,46 +663,59 @@ fn rank_reasons_html(state: &State, bm: &Bookmark) -> Option<String> {
     Some(format!("<h2>Why this is here</h2><ul>{items}</ul>"))
 }
 
-/// Currently hidden authors from this data dir's decision log.
-/// Best-effort like `mark_shown` below: a missing or unreadable log means
-/// no hides (tampering is still surfaced on `/log`).
-fn hidden_authors_of(state: &State) -> BTreeSet<String> {
-    let Ok(log) = ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
+/// Currently hidden authors; unreadable governance state is an error.
+fn hidden_authors_of(state: &State) -> Result<BTreeSet<String>, String> {
+    let log = ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
         std::env::var(key).ok()
-    }) else {
-        return BTreeSet::new();
-    };
-    let Ok(records) = bookmarks_agent::feedback::records_from_log(&log) else {
-        return BTreeSet::new();
-    };
-    bookmarks_agent::feedback::hidden_authors(&records)
+    })
+    .map_err(|_| "log unreadable, hides not applied".to_string())?;
+    let records = bookmarks_agent::feedback::records_from_log(&log)
+        .map_err(|_| "log unreadable, hides not applied".to_string())?;
+    Ok(bookmarks_agent::feedback::hidden_authors(&records))
 }
 
-/// Surfaced posts minus hidden authors (silent, in-memory, per request).
-fn visible_bookmarks(state: &State) -> Vec<Bookmark> {
-    bookmarks_agent::author_filter::filter_visible(&state.bookmarks, &hidden_authors_of(state))
+/// Surfaced posts minus verified hidden authors.
+fn visible_bookmarks(state: &State) -> Result<Vec<Bookmark>, String> {
+    Ok(bookmarks_agent::author_filter::filter_visible(
+        &state.bookmarks,
+        &hidden_authors_of(state)?,
+    ))
 }
 
-/// Mark a rendered tagged pick as shown (metadata only), once: entries
-/// already in the log are never duplicated.
-fn mark_shown(state: &State, post_id: &str) {
-    let Ok(mut log) =
-        ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
-            std::env::var(key).ok()
-        })
-    else {
-        return;
-    };
-    let shown: bool = log.verify_or_empty().unwrap_or_default().iter().any(|e| {
-        e.kind == bookmarks_agent::try_it::SHOWN_KIND
-            && e.payload.get("post_id").and_then(|v| v.as_str()) == Some(post_id)
-    });
+/// Explicit outage response: no content is surfaced without verified hides.
+fn log_unreadable(state: &State) -> Response {
+    Response::status(
+        500,
+        error_page(
+            "Content withheld",
+            "log unreadable, hides not applied; content withheld",
+            state,
+        ),
+    )
+}
+
+/// Mark a tagged pick as shown once; failures are propagated to the page.
+fn mark_shown(state: &State, post_id: &str) -> Result<(), String> {
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|_| "log unreadable".to_string())?;
+    let shown = log
+        .verify_or_empty()
+        .map_err(|_| "log unreadable".to_string())?
+        .iter()
+        .any(|e| {
+            e.kind == bookmarks_agent::try_it::SHOWN_KIND
+                && e.payload["post_id"].as_str() == Some(post_id)
+        });
     if !shown {
-        let _ = log.append(
+        log.append(
             bookmarks_agent::try_it::SHOWN_KIND,
-            serde_json::json!({"post_id": post_id}),
-        );
+            serde_json::json!({"post_id":post_id}),
+        )
+        .map_err(|_| "shown decision could not be recorded".to_string())?;
     }
+    Ok(())
 }
 
 /// `/brief` page.
@@ -724,7 +737,10 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
             state,
         ));
     }
-    let visible = visible_bookmarks(state);
+    let visible = match visible_bookmarks(state) {
+        Ok(items) => items,
+        Err(_) => return log_unreadable(state),
+    };
     if visible.is_empty() {
         return Response::ok(layout(
             "Brief",
@@ -754,7 +770,9 @@ fn page_brief(state: &State, query: &BTreeMap<String, String>) -> Response {
     let try_section = try_it_html(bm, &english);
     if !try_section.is_empty() {
         // Best-effort: a broken log must not break the brief (see /log).
-        mark_shown(state, &bm.post_id);
+        if mark_shown(state, &bm.post_id).is_err() {
+            return log_unreadable(state);
+        }
     }
     let mut body = format!(
         "<h1>Brief — post {} of {}</h1>\
@@ -834,7 +852,10 @@ fn do_vote(state: &State, body: &[u8]) -> Response {
     }
     // Redirect within the still-visible posts (a never_author vote may have
     // just shrunk the list); when nothing is visible, offer the undo page.
-    let visible = visible_bookmarks(state).len();
+    let visible = match visible_bookmarks(state) {
+        Ok(items) => items.len(),
+        Err(_) => return log_unreadable(state),
+    };
     if visible == 0 {
         return Response::redirect("/hidden-authors".to_string());
     }
@@ -851,7 +872,10 @@ fn page_ideas(state: &State) -> Response {
     };
     // Cards by a hidden author get no UI mention. Cards are never hidden
     // for language: their idea text is locally generated English.
-    let hidden = hidden_authors_of(state);
+    let hidden = match hidden_authors_of(state) {
+        Ok(hidden) => hidden,
+        Err(_) => return log_unreadable(state),
+    };
     let cards: Vec<_> = cards
         .into_iter()
         .filter(|c| {
@@ -953,7 +977,7 @@ fn page_try(state: &State) -> Response {
             std::env::var(key).ok()
         }) {
             Ok(log) => bookmarks_agent::try_it::pending_followups(&log),
-            Err(_) => Vec::new(),
+            Err(_) => return log_unreadable(state),
         };
     // Dead posts get no UI mention: skip pending ids with a fresh
     // `unavailable` liveness-cache entry (read-only reuse, no network).
@@ -962,7 +986,10 @@ fn page_try(state: &State) -> Response {
     // posts show their cached translation plus the original.
     let cache = bookmarks_agent::liveness::load_cache(&state.liveness_cache_path());
     let now = now_secs();
-    let hidden = hidden_authors_of(state);
+    let hidden = match hidden_authors_of(state) {
+        Ok(hidden) => hidden,
+        Err(_) => return log_unreadable(state),
+    };
     let pending: Vec<&String> = pending
         .iter()
         .filter(|id| !bookmarks_agent::liveness::is_fresh_unavailable(&cache, id, now))
@@ -1943,6 +1970,10 @@ fn page_stats(state: &State) -> Response {
 /// appends that votes, triage, follow-ups and approval decisions require.
 /// `GET /stats` renders the local stats dashboard (read-only).
 pub fn handle(req: &Request, state: &State) -> Response {
+    if matches!(req.path.as_str(), "/" | "/ideas" | "/try") && hidden_authors_of(state).is_err() {
+        return log_unreadable(state);
+    }
+
     if req.body.len() > MAX_BODY_BYTES {
         return Response::status(
             413,
@@ -2315,6 +2346,19 @@ mod tests {
             .unwrap()
             .verify()
             .unwrap()
+    }
+
+    #[test]
+    fn unreadable_log_withholds_desktop_content_and_pending_counts() {
+        let (_dir, state) = test_state();
+        std::fs::write(state.log_path(), "corrupt decision log\n").unwrap();
+        for path in ["/", "/ideas", "/try"] {
+            let response = handle(&Request::get(path), &state);
+            assert_eq!(response.status, 500);
+            assert!(response.body.contains("log unreadable, hides not applied"));
+            assert!(!response.body.contains("Try this stretch"));
+            assert!(response.body.contains("Approvals (unavailable)"));
+        }
     }
 
     #[test]
