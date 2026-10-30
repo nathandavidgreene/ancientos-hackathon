@@ -31,7 +31,7 @@
 
 use crate::fixture::Bookmark;
 use crate::media::Media;
-use std::io::Read as _;
+use ancientos_router::http::{HttpError, TransportKind};
 use std::path::{Path, PathBuf};
 
 /// Long edge of every thumbnail, in pixels.
@@ -405,44 +405,20 @@ fn make_thumbnail(bytes: &[u8]) -> Result<EncodedThumb, String> {
     }
 }
 
-/// True when a transport error was caused by a timeout: ureq wraps the
-/// deadline expiry as an `io::Error` of kind `TimedOut` in the source chain.
-fn is_timeout(t: &ureq::Transport) -> bool {
-    use std::error::Error;
-    let mut next = t.source();
-    while let Some(e) = next {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if io.kind() == std::io::ErrorKind::TimedOut {
-                return true;
-            }
-        }
-        next = e.source();
-    }
-    t.message().is_some_and(|m| {
-        let m = m.to_ascii_lowercase();
-        m.contains("timed out") || m.contains("timeout")
-    })
-}
-
 /// Map a download error to a short skip reason: static strings plus the HTTP
 /// status only, never URLs or hostnames.
-fn map_fetch_error(e: ureq::Error) -> String {
+fn map_fetch_error(e: HttpError) -> String {
     match e {
-        ureq::Error::Status(code, _) => format!("http status {code}"),
-        ureq::Error::Transport(t) => {
-            if is_timeout(&t) {
-                return "timeout".to_string();
-            }
-            match t.kind() {
-                ureq::ErrorKind::TooManyRedirects => "too many redirects".to_string(),
-                ureq::ErrorKind::Dns => "dns failed".to_string(),
-                ureq::ErrorKind::ConnectionFailed => "connection failed".to_string(),
-                ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme => {
-                    "invalid url".to_string()
-                }
-                _ => "request failed".to_string(),
-            }
-        }
+        HttpError::Status { code, .. } => format!("http status {code}"),
+        HttpError::Transport { kind, .. } => match kind {
+            TransportKind::Timeout => "timeout".to_string(),
+            TransportKind::TooManyRedirects => "too many redirects".to_string(),
+            TransportKind::Dns => "dns failed".to_string(),
+            TransportKind::ConnectionFailed => "connection failed".to_string(),
+            TransportKind::InvalidUrl => "invalid url".to_string(),
+            TransportKind::Other => "request failed".to_string(),
+        },
+        HttpError::Body(_) => "unreadable body".to_string(),
     }
 }
 
@@ -451,25 +427,22 @@ fn map_fetch_error(e: ureq::Error) -> String {
 /// after redirects (fail closed on anything else).
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let safe = crate::media::safe_media_url(url).ok_or_else(|| "unsafe media URL".to_string())?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .redirects(MAX_REDIRECTS)
-        .build();
-    let resp = agent.get(&safe).call().map_err(map_fetch_error)?;
-    crate::media::safe_media_url(resp.get_url())
+    let fetched = ancientos_router::http::get_bytes(
+        &safe,
+        std::time::Duration::from_secs(FETCH_TIMEOUT_SECS),
+        Some(MAX_REDIRECTS),
+        MAX_DOWNLOAD_BYTES as u64 + 1,
+    )
+    .map_err(map_fetch_error)?;
+    crate::media::safe_media_url(&fetched.final_url)
         .ok_or_else(|| "redirect left X media hosts".to_string())?;
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take(MAX_DOWNLOAD_BYTES as u64 + 1)
-        .read_to_end(&mut buf)
-        .map_err(|_| "unreadable body".to_string())?;
-    if buf.len() > MAX_DOWNLOAD_BYTES {
+    if fetched.bytes.len() > MAX_DOWNLOAD_BYTES {
         return Err("media exceeds size cap".to_string());
     }
-    if buf.is_empty() {
+    if fetched.bytes.is_empty() {
         return Err("empty download".to_string());
     }
-    Ok(buf)
+    Ok(fetched.bytes)
 }
 
 /// Extract the first frame of downloaded video bytes as PNG bytes using the

@@ -5,7 +5,7 @@
 //! I/O ([`check_egress`]). Local routes ([`Route::LocalLlama`],
 //! [`Route::LocalJev`]) may see everything; hosted routes
 //! ([`Route::MuseSpark`], [`Route::MuseWonder`], [`Route::Jev`],
-//! [`Route::Modal`]) accept [`DataClass::Public`] only.
+//! [`Route::Modal`], [`Route::Baseten`]) accept [`DataClass::Public`] only.
 //!
 //! Fail closed everywhere: unclassified or unknown input classifies as
 //! [`DataClass::Restricted`], which no hosted route may receive.
@@ -121,6 +121,9 @@ pub enum Route {
     Jev,
     /// Modal-hosted Llama (hosted, paid).
     Modal,
+    /// Baseten-hosted Muse model (hosted, paid). Like [`Route::Modal`], its
+    /// callers must name it directly: it has no dispatch destination.
+    Baseten,
 }
 
 impl Route {
@@ -133,6 +136,7 @@ impl Route {
             Route::MuseWonder => "muse_wonder",
             Route::Jev => "jev",
             Route::Modal => "modal",
+            Route::Baseten => "baseten",
         }
     }
 
@@ -170,7 +174,9 @@ impl std::fmt::Display for Route {
 pub fn ceiling(route: Route) -> DataClass {
     match route {
         Route::LocalLlama | Route::LocalJev => DataClass::Restricted,
-        Route::MuseSpark | Route::MuseWonder | Route::Jev | Route::Modal => DataClass::Public,
+        Route::MuseSpark | Route::MuseWonder | Route::Jev | Route::Modal | Route::Baseten => {
+            DataClass::Public
+        }
     }
 }
 
@@ -181,6 +187,8 @@ pub const CEILING_MUSE_ENV: &str = "ANCIENTOS_CEILING_MUSE";
 pub const CEILING_JEV_ENV: &str = "ANCIENTOS_CEILING_JEV";
 /// Env override for the Modal ceiling ([`Route::Modal`]).
 pub const CEILING_MODAL_ENV: &str = "ANCIENTOS_CEILING_MODAL";
+/// Env override for the Baseten ceiling ([`Route::Baseten`]).
+pub const CEILING_BASETEN_ENV: &str = "ANCIENTOS_CEILING_BASETEN";
 
 /// Env var carrying a ceiling override for `route`, if any. Local routes
 /// have none: their data stays on the device, so there is no ceiling to lower.
@@ -189,6 +197,7 @@ fn ceiling_env_var(route: Route) -> Option<&'static str> {
         Route::MuseSpark | Route::MuseWonder => Some(CEILING_MUSE_ENV),
         Route::Jev => Some(CEILING_JEV_ENV),
         Route::Modal => Some(CEILING_MODAL_ENV),
+        Route::Baseten => Some(CEILING_BASETEN_ENV),
         Route::LocalLlama | Route::LocalJev => None,
     }
 }
@@ -371,6 +380,7 @@ mod tests {
         assert_eq!(DataClass::from(Sensitivity::Unknown), DataClass::Restricted);
     }
 
+    /// Local routes see everything; every hosted route accepts Public only.
     #[test]
     fn ceiling_table_local_restricted_hosted_public() {
         assert_eq!(ceiling(Route::LocalLlama), DataClass::Restricted);
@@ -380,6 +390,7 @@ mod tests {
             Route::MuseWonder,
             Route::Jev,
             Route::Modal,
+            Route::Baseten,
         ] {
             assert_eq!(ceiling(route), DataClass::Public, "route {route:?}");
             assert!(route.is_hosted(), "route {route:?}");
@@ -441,6 +452,7 @@ mod tests {
         }
     }
 
+    /// Ceiling env overrides can only lower a hosted ceiling, never raise it.
     #[test]
     fn env_cannot_raise_a_hosted_ceiling() {
         let _guard = crate::test_env_lock();
@@ -449,6 +461,7 @@ mod tests {
             (Route::MuseWonder, CEILING_MUSE_ENV),
             (Route::Jev, CEILING_JEV_ENV),
             (Route::Modal, CEILING_MODAL_ENV),
+            (Route::Baseten, CEILING_BASETEN_ENV),
         ];
         // Unset or blank: the compiled default.
         for (route, var) in hosted {
@@ -481,10 +494,12 @@ mod tests {
             (CEILING_MUSE_ENV, Some("restricted")),
             (CEILING_JEV_ENV, Some("confidential")),
             (CEILING_MODAL_ENV, Some("internal")),
+            (CEILING_BASETEN_ENV, Some("restricted")),
         ]);
         assert_eq!(ceiling_from_env(Route::MuseSpark), DataClass::Public);
         assert_eq!(ceiling_from_env(Route::Jev), DataClass::Public);
         assert_eq!(ceiling_from_env(Route::Modal), DataClass::Public);
+        assert_eq!(ceiling_from_env(Route::Baseten), DataClass::Public);
         assert_eq!(ceiling_from_env(Route::LocalLlama), DataClass::Restricted);
         assert_eq!(ceiling_from_env(Route::LocalJev), DataClass::Restricted);
     }

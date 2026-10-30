@@ -9,14 +9,21 @@
 //! [`parse_findings`]. `reasoning_effort` is `low`, which in a live test cut
 //! output from ~1.5K to ~1.1K tokens and latency from 7.7s to 5.3s with the
 //! same findings. Usage (prompt + completion tokens) adds to a running total;
-//! once it reaches the cap, further items fail before any call.
+//! once it reaches the cap, further items fail before any call. Every call
+//! passes [`check_egress`] first: only [`DataClass::Public`] content
+//! reaches the hosted model, and the decision is logged.
 use crate::analyze_media::{MediaBackend, PaidConfig, RawFinding, ResolvedMedia};
 use crate::analyze_media_live::{parse_findings, BASE_ENV_VAR, MODEL_ENV_VAR};
 use crate::analyze_media_muse::{parse_token_cap, Usage, MAX_TOKENS_ENV_VAR};
+use ancientos_core::log::DecisionLog;
+use ancientos_router::data_class::{check_egress, DataClass, Route};
+use ancientos_router::http::HttpError;
 use std::cell::Cell;
 
 /// Env var holding the Baseten API key.
 pub const KEY_ENV_VAR: &str = "BASETEN_API_KEY";
+/// Caller name recorded on egress decisions (shared with the live backend).
+const CALLER: &str = "analyze_media";
 /// Completion-token cap per item (reasoning counts toward it).
 pub const MAX_COMPLETION_TOKENS: u32 = 4000;
 /// Reasoning effort sent with every call.
@@ -124,9 +131,20 @@ pub fn parse_reply(v: &serde_json::Value) -> Result<(String, Usage), String> {
     Ok((content.to_string(), usage))
 }
 
-impl MediaBackend for BasetenBackend {
-    /// Check the cap, make one call, add usage, parse findings.
-    fn analyze(&self, item: &ResolvedMedia) -> Result<Vec<RawFinding>, String> {
+impl BasetenBackend {
+    /// Analyze one media item with an explicit data class and caller.
+    /// Content above [`DataClass::Public`] is refused before any network
+    /// I/O, with the decision appended to `log` when given (class, route,
+    /// and caller only, never content). The paid switch was proven at
+    /// construction ([`PaidConfig`]).
+    pub fn analyze_with_class(
+        &self,
+        class: DataClass,
+        caller: &str,
+        log: Option<&mut DecisionLog>,
+        item: &ResolvedMedia,
+    ) -> Result<Vec<RawFinding>, String> {
+        check_egress(class, Route::Baseten, caller, log).map_err(|e| e.to_string())?;
         let before = self.used.get();
         if before.input + before.output >= self.max_tokens {
             return Err(format!("token cap {} reached", self.max_tokens));
@@ -143,6 +161,17 @@ impl MediaBackend for BasetenBackend {
         });
         parse_findings(&parse_reply(&reply)?.0)
     }
+}
+
+impl MediaBackend for BasetenBackend {
+    /// Check the class, the cap, make one call, add usage, parse findings.
+    /// Media comes from public bookmarks, so the class is
+    /// [`DataClass::Public`] (the same assumption the live backend makes);
+    /// callers with classified content use
+    /// [`BasetenBackend::analyze_with_class`].
+    fn analyze(&self, item: &ResolvedMedia) -> Result<Vec<RawFinding>, String> {
+        self.analyze_with_class(DataClass::Public, CALLER, None, item)
+    }
 
     /// Calls and tokens used so far.
     fn usage_summary(&self) -> Option<String> {
@@ -158,15 +187,18 @@ impl MediaBackend for BasetenBackend {
 
 /// POST with `Authorization: Api-Key`; errors never include the key.
 fn http_post(url: &str, key: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let resp = ureq::post(url)
-        .timeout(std::time::Duration::from_secs(120))
-        .set("Authorization", &format!("Api-Key {key}"))
-        .send_json(body.clone());
-    match resp {
-        Ok(r) => r.into_json().map_err(|e| format!("bad JSON reply: {e}")),
-        Err(ureq::Error::Status(code, _)) => Err(format!("Baseten HTTP {code}")),
-        Err(e) => Err(format!("Baseten request failed: {}", e.kind())),
-    }
+    let auth = format!("Api-Key {key}");
+    ancientos_router::http::post_json(
+        url,
+        std::time::Duration::from_secs(120),
+        &[("Authorization", auth.as_str())],
+        body,
+    )
+    .map_err(|e| match e {
+        HttpError::Status { code, .. } => format!("Baseten HTTP {code}"),
+        HttpError::Transport { message, .. } => format!("Baseten request failed: {message}"),
+        HttpError::Body(e) => format!("bad JSON reply: {e}"),
+    })
 }
 
 #[cfg(test)]
@@ -289,5 +321,91 @@ mod tests {
         assert!(b.analyze(&item()).unwrap().is_empty());
         let e = b.analyze(&item()).unwrap_err();
         assert!(e.contains("token cap"));
+    }
+
+    /// Non-public content is refused before any HTTP and each refusal is
+    /// logged with class, route, and caller only (never content).
+    #[test]
+    fn non_public_content_is_refused_before_any_http() {
+        use ancientos_router::data_class::EGRESS_DENIED_KIND;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        // The fake panics if called: reaching it would mean HTTP was attempted.
+        let b = BasetenBackend::with_post(
+            &env,
+            paid(),
+            Box::new(|_, _, _| panic!("refused call must not reach HTTP")),
+        )
+        .unwrap();
+        for class in [
+            DataClass::Internal,
+            DataClass::Confidential,
+            DataClass::Restricted,
+        ] {
+            let err = b
+                .analyze_with_class(class, "test-baseten", Some(&mut log), &item())
+                .unwrap_err();
+            assert!(err.contains("egress denied"), "{err}");
+            assert!(err.contains("baseten"), "{err}");
+            assert!(!err.contains("twimg"), "{err}");
+        }
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 3);
+        for (entry, name) in entries
+            .iter()
+            .zip(["internal", "confidential", "restricted"])
+        {
+            assert_eq!(entry.kind, EGRESS_DENIED_KIND);
+            assert_eq!(entry.payload["class"], name);
+            assert_eq!(entry.payload["route"], "baseten");
+            assert_eq!(entry.payload["caller"], "test-baseten");
+            let raw = serde_json::to_string(&entry.payload).unwrap();
+            assert!(!raw.contains("twimg"), "{raw}");
+        }
+    }
+
+    /// Public content passes the egress check: the fake is called, findings
+    /// parse, and one allowed entry (class and route only) is logged.
+    #[test]
+    fn public_content_passes_egress_and_logs_allowed() {
+        use ancientos_router::data_class::EGRESS_ALLOWED_KIND;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.jsonl");
+        let mut log = DecisionLog::open(&path).unwrap();
+        let b = BasetenBackend::with_post(
+            &env,
+            paid(),
+            Box::new(|_, _, _| {
+                Ok(reply(
+                    r#"{"findings":[{"kind":"text","text":"Hi","quote":"Hi","region":null}]}"#,
+                    "stop",
+                ))
+            }),
+        )
+        .unwrap();
+        let findings = b
+            .analyze_with_class(DataClass::Public, "test-baseten", Some(&mut log), &item())
+            .unwrap();
+        assert_eq!(findings.len(), 1);
+        let entries = log.verify().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, EGRESS_ALLOWED_KIND);
+        assert_eq!(entries[0].payload["class"], "public");
+        assert_eq!(entries[0].payload["route"], "baseten");
+        assert!(entries[0].payload.get("caller").is_none());
+    }
+
+    /// The trait entry point delegates with the public class, so the
+    /// default media path keeps working through the egress check.
+    #[test]
+    fn trait_analyze_delegates_with_public_class() {
+        let b = BasetenBackend::with_post(
+            &env,
+            paid(),
+            Box::new(|_, _, _| Ok(reply(r#"{"findings":[]}"#, "stop"))),
+        )
+        .unwrap();
+        assert!(b.analyze(&item()).unwrap().is_empty());
     }
 }

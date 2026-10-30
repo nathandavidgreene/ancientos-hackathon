@@ -148,12 +148,13 @@ impl ModelClient for LocalLlmClient {
         self.health_check()?;
         let endpoint = self.endpoint()?;
         let body = self.request_body(prompt);
-        let raw: serde_json::Value = ureq::post(&endpoint)
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-            .send_json(&body)
-            .map_err(map_ureq_error)?
-            .into_json()
-            .map_err(|e| RouterError::Http(e.to_string()))?;
+        let raw = crate::http::post_json(
+            &endpoint,
+            std::time::Duration::from_secs(TIMEOUT_SECS),
+            &[],
+            &body,
+        )
+        .map_err(map_http_error)?;
         Self::parse_chat_response(&raw)
     }
 }
@@ -163,7 +164,7 @@ fn get_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
-/// Outcome of a health GET. A small enum (not `ureq::Error`) so the
+/// Outcome of a health GET. A small enum (not the transport error) so the
 /// `Err` branch stays under clippy's `result_large_err` limit.
 enum HealthGet {
     Ok,
@@ -173,14 +174,14 @@ enum HealthGet {
 
 /// Plain GET succeeding only on 2xx; the body is discarded.
 fn get_health(url: &str) -> HealthGet {
-    match ureq::get(url)
-        .timeout(std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS))
-        .call()
-    {
-        Ok(_) => HealthGet::Ok,
-        Err(ureq::Error::Status(404, _)) => HealthGet::NotFound,
-        Err(ureq::Error::Status(code, _)) => HealthGet::Failed(format!("http status {code}")),
-        Err(other) => HealthGet::Failed(other.to_string()),
+    match crate::http::get_status(url, std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS)) {
+        Ok(()) => HealthGet::Ok,
+        Err(crate::http::HttpError::Status { code: 404, .. }) => HealthGet::NotFound,
+        Err(crate::http::HttpError::Status { code, .. }) => {
+            HealthGet::Failed(format!("http status {code}"))
+        }
+        Err(crate::http::HttpError::Transport { message, .. }) => HealthGet::Failed(message),
+        Err(crate::http::HttpError::Body(message)) => HealthGet::Failed(message),
     }
 }
 
@@ -192,15 +193,14 @@ fn unavailable(url: &str, reason: &str) -> RouterError {
     ))
 }
 
-/// Map a ureq error to a router error.
-fn map_ureq_error(e: ureq::Error) -> RouterError {
+/// Map a transport error to a router error.
+fn map_http_error(e: crate::http::HttpError) -> RouterError {
     match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let snippet: String = body.chars().take(500).collect();
+        crate::http::HttpError::Status { code, snippet } => {
             RouterError::Http(format!("http status {code}: {snippet}"))
         }
-        other => RouterError::Http(other.to_string()),
+        crate::http::HttpError::Transport { message, .. } => RouterError::Http(message),
+        crate::http::HttpError::Body(message) => RouterError::Http(message),
     }
 }
 

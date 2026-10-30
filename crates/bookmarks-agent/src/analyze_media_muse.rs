@@ -211,21 +211,23 @@ impl MediaBackend for MuseExecBackend {
 
 /// Download an X media URL to `path`, refusing non-X hosts and big files.
 fn http_fetch(url: &str, path: &Path) -> Result<(), String> {
+    use ancientos_router::http::HttpError;
     let url = crate::media::safe_media_url(url).ok_or("unsafe media URL")?;
-    let resp = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(30))
-        .call()
-        .map_err(|e| format!("download failed: {e}"))?;
-    let mut buf = Vec::new();
-    use std::io::Read;
-    resp.into_reader()
-        .take(MAX_IMAGE_BYTES + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| e.to_string())?;
-    if buf.len() as u64 > MAX_IMAGE_BYTES {
+    let fetched = ancientos_router::http::get_bytes(
+        &url,
+        std::time::Duration::from_secs(30),
+        None,
+        MAX_IMAGE_BYTES + 1,
+    )
+    .map_err(|e| match e {
+        HttpError::Status { code, .. } => format!("download failed: http status {code}"),
+        HttpError::Transport { message, .. } => format!("download failed: {message}"),
+        HttpError::Body(e) => e.to_string(),
+    })?;
+    if fetched.bytes.len() as u64 > MAX_IMAGE_BYTES {
         return Err("image too large".into());
     }
-    std::fs::write(path, buf).map_err(|e| e.to_string())
+    std::fs::write(path, fetched.bytes).map_err(|e| e.to_string())
 }
 
 /// Run `args[0]` with the rest in `dir`, returning stdout; nonzero exit errors.

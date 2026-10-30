@@ -16,6 +16,7 @@
 
 use crate::fixture::Bookmark;
 use crate::ranker::{LabeledEvent, Ranker};
+use ancientos_router::http::HttpError;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -163,15 +164,19 @@ impl VectorCache {
 pub fn fetch_local(base_url: &str, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     let base = base_url.trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
-    let raw: serde_json::Value = ureq::post(&format!("{base}/api/embed"))
-        .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-        .send_json(serde_json::json!({ "model": model, "input": texts }))
-        .map_err(|e| match e {
-            ureq::Error::Status(code, _) => format!("local embedding server: http status {code}"),
-            ureq::Error::Transport(_) => "local embedding server unreachable".to_string(),
-        })?
-        .into_json()
-        .map_err(|e| format!("local embedding reply: {e}"))?;
+    let raw = ancientos_router::http::post_json(
+        &format!("{base}/api/embed"),
+        std::time::Duration::from_secs(TIMEOUT_SECS),
+        &[],
+        &serde_json::json!({ "model": model, "input": texts }),
+    )
+    .map_err(|e| match e {
+        HttpError::Status { code, .. } => {
+            format!("local embedding server: http status {code}")
+        }
+        HttpError::Transport { .. } => "local embedding server unreachable".to_string(),
+        HttpError::Body(e) => format!("local embedding reply: {e}"),
+    })?;
     parse_embed_reply(&raw)
 }
 

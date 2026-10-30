@@ -6,6 +6,7 @@ use serde::Serialize;
 
 pub mod data_class;
 pub mod dispatch;
+pub mod http;
 pub mod jev_client;
 pub mod local_llm;
 pub mod modal;
