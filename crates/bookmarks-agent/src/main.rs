@@ -51,8 +51,8 @@
 //! decision log and the Muse Code run log (no network, no paid calls).
 //! Tokens, codes, and verifiers are never printed.
 use bookmarks_agent::{
-    author_filter, brief, callback, daemon, deeper, delegate, digest, fixture, idea_card, ingest,
-    merge, oauth, ranker, stats, token_store, try_it, vote, wiki, x_api,
+    author_filter, brief, callback, classify, daemon, deeper, delegate, digest, fixture, idea_card,
+    ingest, merge, oauth, ranker, stats, token_store, try_it, vote, wiki, x_api,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -138,7 +138,10 @@ fn parse_max_pages(args: &[String]) -> Result<usize, String> {
     Err(USAGE.to_string())
 }
 
-/// `sync`: incremental bookmark sync from the X API (paid, gated).
+/// `sync`: incremental bookmark sync from the X API (paid, gated). After
+/// saving, every post without a classification is classified (scores plus
+/// media findings, persisted for the labels page); classification never fails
+/// the sync — setup failures only warn.
 fn cmd_sync(args: &[String]) -> Result<(), String> {
     let max_pages = parse_max_pages(args)?;
     let id = client_id()?;
@@ -152,6 +155,21 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         report.pages,
         path.display()
     );
+    match classify::classify_after_import() {
+        Ok(done) => {
+            println!(
+                "classify: {} classified, {} already classified, {} pending, {} muted, {} errors",
+                done.classified, done.skipped, done.pending, done.muted, done.errors
+            );
+            if done.pending > 0 {
+                println!(
+                    "classify: {} post(s) pending (paid calls off; set ANCIENTOS_ALLOW_PAID=1)",
+                    done.pending
+                );
+            }
+        }
+        Err(e) => eprintln!("warning: classify on import skipped: {e}"),
+    }
     Ok(())
 }
 

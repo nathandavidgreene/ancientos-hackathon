@@ -106,6 +106,36 @@ fn append_findings(path: &str, post_id: &str, rep: &analyze_media::Report) -> Re
     Ok(())
 }
 
+/// Build the live media backend from an env reader: `muse_exec` (default)
+/// or `http` or `baseten` per `ANCIENTOS_MEDIA_BACKEND`; anything else is
+/// refused. Shared by the `analyze-media` binary and classify-on-import.
+pub fn select_backend(
+    env: &dyn Fn(&str) -> Option<String>,
+    paid: PaidConfig,
+) -> Result<Box<dyn MediaBackend>, String> {
+    match env("ANCIENTOS_MEDIA_BACKEND")
+        .as_deref()
+        .unwrap_or("muse_exec")
+    {
+        "muse_exec" => Ok(Box::new(crate::analyze_media_muse::muse_backend(
+            env, paid,
+        )?)),
+        "http" => Ok(Box::new(crate::analyze_media_live::live_backend(
+            env, paid,
+        )?)),
+        "baseten" => Ok(Box::new(crate::analyze_media_baseten::baseten_backend(
+            env, paid,
+        )?)),
+        other => Err(format!("unknown ANCIENTOS_MEDIA_BACKEND '{other}'")),
+    }
+}
+
+/// [`select_backend`] over the process env.
+pub fn live_backend_from_env(paid: PaidConfig) -> Result<Box<dyn MediaBackend>, String> {
+    let env = |k: &str| std::env::var(k).ok();
+    select_backend(&env, paid)
+}
+
 /// Decision log path: `--log`, else `$DECISION_LOG_PATH`, else
 /// `$ANCIENTOS_HOME/decision_log.jsonl`, else
 /// `$HOME/.ancientos-hackathon/decision_log.jsonl`.
@@ -331,5 +361,37 @@ mod tests {
     fn rejects_unknown_args() {
         assert!(run(&argv(&["--rows", FIXTURE, "--yolo"]), &|_| None, &never, 1).is_err());
         assert!(run(&argv(&[]), &|_| None, &never, 1).is_err());
+    }
+
+    /// Unknown backend names are refused without touching anything else.
+    #[test]
+    fn select_backend_rejects_unknown_names() {
+        let env = |k: &str| match k {
+            "ANCIENTOS_MEDIA_BACKEND" => Some("wat".into()),
+            _ => None,
+        };
+        let err = select_backend(&env, PaidConfig { max_items: 5 })
+            .err()
+            .unwrap();
+        assert!(err.contains("unknown ANCIENTOS_MEDIA_BACKEND"), "{err}");
+    }
+
+    /// Named backends fail closed on missing env (no defaults guessed, no
+    /// network at construction).
+    #[test]
+    fn select_backend_fails_closed_on_missing_env() {
+        for backend in ["http", "baseten"] {
+            let env = |k: &str| {
+                if k == "ANCIENTOS_MEDIA_BACKEND" {
+                    Some(backend.to_string())
+                } else {
+                    None
+                }
+            };
+            assert!(
+                select_backend(&env, PaidConfig { max_items: 5 }).is_err(),
+                "{backend} must fail closed without env"
+            );
+        }
     }
 }
