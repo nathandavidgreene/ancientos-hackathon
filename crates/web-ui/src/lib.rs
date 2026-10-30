@@ -3894,6 +3894,7 @@ mod tests {
         assert_eq!(log_entries(&state).len(), 2);
     }
 
+    /// A browser-approved run still needs a token and the paid switch.
     #[test]
     fn approvals_page_lists_and_decides_a_muse_runs_proposal() {
         // Second app on the same core and log: a proposed Muse Code run shows
@@ -3928,7 +3929,10 @@ mod tests {
             repo: dir.path().to_path_buf(),
             allow_paid: false,
         };
-        assert!(muse_runs::run(&mut log, &req.id, &runner).is_err());
+        let token =
+            ancientos_core::approvals::claim_release_token(&log, &req.id, &req.payload_hash)
+                .unwrap();
+        assert!(muse_runs::run(&mut log, token, &runner).is_err());
     }
 
     #[test]

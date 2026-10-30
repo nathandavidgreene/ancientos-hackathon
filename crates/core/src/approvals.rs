@@ -195,9 +195,40 @@ impl Approval {
 }
 
 /// Single-use token proving a human approved one request. Deliberately not
-/// `Clone` and not `Serialize`: it cannot be duplicated or persisted, and
-/// [`release`] consumes it by value. The log is still the source of truth —
-/// a second release for the same id fails even with another token.
+/// `Clone`, not `Copy` and not `Serialize`: it cannot be duplicated or
+/// persisted, and [`release`] consumes it by value. Its fields are private,
+/// so only [`approve`] and [`claim_release_token`] (in this module) can
+/// construct one. Every side-effecting executor takes a `ReleaseToken` by
+/// value, so a side effect cannot run without consuming one. The log is
+/// still the source of truth — a second release for the same id fails even
+/// with another token.
+///
+/// ```compile_fail
+/// # use ancientos_core::approvals::ReleaseToken;
+/// fn assert_clone<T: Clone>() {}
+/// // ReleaseToken is deliberately not Clone: this must not compile.
+/// assert_clone::<ReleaseToken>();
+/// ```
+///
+/// ```compile_fail
+/// # use ancientos_core::approvals::ReleaseToken;
+/// fn consume_twice(token: ReleaseToken) {
+///     drop(token);
+///     // ReleaseToken is deliberately not Copy: this use-after-move must
+///     // not compile.
+///     drop(token);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use ancientos_core::approvals::ReleaseToken;
+/// // The fields are private: only this module can construct a token, so
+/// // this must not compile.
+/// let _token = ReleaseToken {
+///     approval_id: String::from("synthetic"),
+///     payload_hash: String::from("synthetic"),
+/// };
+/// ```
 #[derive(Debug)]
 pub struct ReleaseToken {
     approval_id: String,
@@ -1115,6 +1146,28 @@ mod tests {
         let err = release(&mut log, forged, &payload).unwrap_err();
         assert!(matches!(err, ApprovalError::AlreadyReleased(_)), "{err}");
         assert_eq!(len(&log), 3);
+    }
+
+    /// Two live tokens for one approval still release exactly once.
+    #[test]
+    fn two_live_tokens_release_exactly_once() {
+        let (_dir, mut log, _path) = open_log();
+        let payload = json!({"draft": "ship it once"});
+        let r = propose(&mut log, NOW, payload.clone());
+        let first = approve(&mut log, &r.id, &r.payload_hash, "human", NOW + 1).unwrap();
+        // A second live token through the public claim path (front ends drop
+        // the approve token; the daemon re-derives it).
+        let second =
+            claim_release_token(&log, &r.id, &r.payload_hash).expect("approved, so claimable");
+        release(&mut log, first, &payload).unwrap();
+        assert_eq!(get(&log, &r.id).unwrap().status, Status::Released);
+        let err = release(&mut log, second, &payload).unwrap_err();
+        assert!(matches!(err, ApprovalError::AlreadyReleased(_)), "{err}");
+        assert_eq!(len(&log), 3);
+        assert!(
+            claim_release_token(&log, &r.id, &r.payload_hash).is_err(),
+            "released approvals yield no further tokens"
+        );
     }
 
     #[test]

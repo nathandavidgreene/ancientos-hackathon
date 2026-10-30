@@ -126,16 +126,28 @@ impl Workspace {
             repo: dir.clone(),
             allow_paid: false,
         };
-        let refusal = |log: &mut DecisionLog, id: &str, label: &str| -> Result<String, String> {
-            match muse_runs::run(log, id, &runner) {
+        let refusal = |log: &mut DecisionLog,
+                       req: &ancientos_core::approvals::ApprovalRequest,
+                       label: &str|
+         -> Result<String, String> {
+            let id = req.id.as_str();
+            // Claim first, like the CLI: a denied run yields no token, an
+            // approved one yields a token that `run` then refuses (paid
+            // switch off), consuming nothing.
+            let token =
+                match ancientos_core::approvals::claim_release_token(log, id, &req.payload_hash) {
+                    Ok(t) => t,
+                    Err(e) => return Ok(e.to_string().replace(id, &format!("#{label}"))),
+                };
+            match muse_runs::run(log, token, &runner) {
                 Ok(code) => Err(format!(
                     "run {label} executed (exit {code}); demo must refuse"
                 )),
                 Err(e) => Ok(e.replace(id, &format!("#{label}"))),
             }
         };
-        let denied_run_refusal = refusal(&mut log, &r2.id, DENIED_RUN.0)?;
-        let approved_run_refusal = refusal(&mut log, &r1.id, APPROVED_RUN.0)?;
+        let denied_run_refusal = refusal(&mut log, &r2, DENIED_RUN.0)?;
+        let approved_run_refusal = refusal(&mut log, &r1, APPROVED_RUN.0)?;
         let statuses = muse_runs::runs(&log, now + 12)?
             .into_iter()
             .map(|a| {
