@@ -42,7 +42,7 @@ pub const EVAL_DIR_ENV: &str = "ANCIENTOS_EVAL_PRIVATE_DIR";
 /// Env var holding the `remove_bookmark` binary path.
 pub const REMOVE_BIN_ENV: &str = "ANCIENTOS_REMOVE_BOOKMARK_CMD";
 /// CLI binary name used in safe error messages.
-pub const REMOVE_BIN_NAME: &str = "bookmark remover";
+pub const REMOVE_BIN_NAME: &str = "remove_bookmark";
 /// Queries + posts file, relative to the eval-private dir.
 pub const QUERIES_REL: &str = "nathan/label-queries.json";
 /// Seed text file, relative to the eval-private dir.
@@ -792,12 +792,22 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Return the saved result for a duplicate request UUID without invoking the CLI.
-fn prior_request(dir: &Path, request_id: &str) -> Option<Result<RemoveOutcome, String>> {
+fn prior_request(
+    dir: &Path,
+    request_id: &str,
+    post_key: &str,
+    post_id: &str,
+) -> Option<Result<RemoveOutcome, String>> {
     let text = std::fs::read_to_string(dir.join(REMOVALS_FILE)).ok()?;
     for line in text.lines().rev() {
-        let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        if v["request_id"].as_str() == Some(request_id) {
-            return Some(match v["outcome"].as_str()? {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["request_id"].as_str() == Some(request_id)
+            && v["post_id"].as_str() == Some(post_id)
+            && v["post_key"].as_str().is_none_or(|key| key == post_key)
+        {
+            return Some(match v["outcome"].as_str().unwrap_or("invalid") {
                 "removed" => Ok(RemoveOutcome::Removed),
                 "already_absent" => Ok(RemoveOutcome::AlreadyRemoved),
                 "refused_or_not_found" => {
@@ -811,16 +821,18 @@ fn prior_request(dir: &Path, request_id: &str) -> Option<Result<RemoveOutcome, S
 }
 
 /// Append the required sanitized audit record for one remover attempt.
+#[allow(clippy::too_many_arguments)]
 fn log_attempt(
     dir: &Path,
     post_id: &str,
+    post_key: &str,
     request_id: &str,
     outcome: &str,
     exit_code: Option<i32>,
     now: u64,
 ) -> Result<(), String> {
     use std::io::Write;
-    let row = serde_json::json!({"timestamp": now, "post_id": post_id, "request_id": request_id, "outcome": outcome, "exit_code": exit_code});
+    let row = serde_json::json!({"timestamp": now, "post_id": post_id, "post_key": post_key, "request_id": request_id, "outcome": outcome, "exit_code": exit_code});
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -862,41 +874,44 @@ pub fn remove_one(
     if !is_uuid(request_id) {
         return Err("invalid request id".to_string());
     }
-    if let Some(prior) = prior_request(dir, request_id) {
+    if let Some(prior) = prior_request(dir, request_id, post_key, &id) {
         return prior;
     }
-    let bin = match explicit_bin {
-        Some(path) if !path.as_os_str().is_empty() => path.to_path_buf(),
-        Some(_) => return Err("remover is not configured".to_string()),
-        None => PathBuf::from(
-            path_env
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| "remover is not configured".to_string())?,
-        ),
-    };
+    if explicit_bin.is_some_and(|path| path.as_os_str().is_empty()) {
+        return Err("remover is not configured".into());
+    }
+    let bin = resolve_remove_bin(explicit_bin, path_env)?;
     if !bin.is_file() || !is_executable(&bin) {
         return Err("remover is not executable".to_string());
     }
     let run = run_remove_cli(&bin, &id, request_id);
     if !run.ran {
-        let _ = log_attempt(dir, &id, request_id, "failed", None, now);
+        let _ = log_attempt(dir, &id, post_key, request_id, "failed", None, now);
         return Err(format!("{REMOVE_BIN_NAME} failed"));
     }
     match run.code {
         Some(0) => {
-            log_attempt(dir, &id, request_id, "removed", Some(0), now)?;
+            log_attempt(dir, &id, post_key, request_id, "removed", Some(0), now)?;
             Ok(RemoveOutcome::Removed)
         }
         Some(2) => {
-            log_attempt(dir, &id, request_id, "refused_or_not_found", Some(2), now)?;
+            log_attempt(
+                dir,
+                &id,
+                post_key,
+                request_id,
+                "refused_or_not_found",
+                Some(2),
+                now,
+            )?;
             Err("refused or not found on X".to_string())
         }
         Some(code) => {
-            log_attempt(dir, &id, request_id, "failed", Some(code), now)?;
+            log_attempt(dir, &id, post_key, request_id, "failed", Some(code), now)?;
             Err(format!("removal failed (exit code {code})"))
         }
         None => {
-            let _ = log_attempt(dir, &id, request_id, "failed", None, now);
+            let _ = log_attempt(dir, &id, post_key, request_id, "failed", None, now);
             Err(format!("{REMOVE_BIN_NAME} died by signal"))
         }
     }
@@ -1312,6 +1327,29 @@ mod tests {
         assert!(load_labels(dir.path()).unwrap().is_empty());
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn reused_request_id_is_bound_to_each_post_and_malformed_rows_are_skipped() {
+        use std::io::Write;
+        let dir = eval_dir();
+        let calls = dir.path().join("calls.txt");
+        fake_remove_bin(dir.path(), &calls, 0, "");
+        let path = dir.path().to_string_lossy().to_string();
+        let id = "00000000-0000-4000-8000-000000000001";
+        remove_one(dir.path(), "7", None, Some(&path), 100, id).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(REMOVALS_FILE))
+            .unwrap();
+        writeln!(file, "malformed row").unwrap();
+        remove_one(dir.path(), "7", None, Some(&path), 101, id).unwrap();
+        assert_eq!(recorded_calls(&calls).len(), 1);
+        remove_one(dir.path(), "9", None, Some(&path), 102, id).unwrap();
+        let calls = recorded_calls(&calls);
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].contains("9000000000000000009"));
+    }
+
     /// An already-removed post id is never called again and logs nothing.
     #[test]
     #[cfg(unix)]
@@ -1417,7 +1455,7 @@ mod tests {
             "00000000-0000-4000-8000-000000000005",
         )
         .unwrap_err();
-        assert!(err.contains("not executable"), "{err}");
+        assert!(err.contains("not found"), "{err}");
         assert!(removal_rows(dir.path()).is_empty());
     }
 
