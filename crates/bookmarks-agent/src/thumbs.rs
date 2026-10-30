@@ -554,12 +554,28 @@ fn thumbnail_one(
     (entry, Outcome::Fresh)
 }
 
+/// Warning shown when the input has posts but none carries a `media` field:
+/// the store most likely predates the media import, so zero thumbnails is a
+/// data problem rather than "no media". Returns `None` when there are no
+/// posts or at least one post has a `media` field (even an empty one).
+pub fn missing_media_warning(values: &[serde_json::Value]) -> Option<String> {
+    if values.is_empty() || values.iter().any(|v| v.get("media").is_some()) {
+        return None;
+    }
+    Some(format!(
+        "warning: {} post(s) read but none has a `media` field; the bookmark store probably predates the media import (re-import with media expansions, then rerun)\n",
+        values.len()
+    ))
+}
+
 /// Run the `thumbs` CLI: thumbnail every media item in the rows file,
 /// skipping muted posts, and rewrite the manifest. `fetch` downloads one URL,
 /// `first_frame` extracts a PNG frame from video bytes, and `mute` loads the
 /// mute list; the binary wires the production versions while tests inject
 /// mocks. Returns the text to print (counts and skip reasons only, never post
-/// text, muted terms, or personal paths).
+/// text, muted terms, or personal paths). When posts are read but none has a
+/// `media` field, a store-predates-media-import warning is printed to stderr
+/// and appended to the returned text.
 pub fn run(
     args: &[String],
     env: &dyn Fn(&str) -> Option<String>,
@@ -642,6 +658,10 @@ pub fn run(
                 entry.post_id, entry.index
             ));
         }
+    }
+    if let Some(warning) = missing_media_warning(&values) {
+        eprint!("{warning}");
+        out.push_str(&warning);
     }
     out.push_str(&format!("manifest: {MANIFEST_FILE_NAME}\n"));
     Ok(out)
@@ -1148,5 +1168,40 @@ mod tests {
         assert!(!hostile.contains(['/', '.', ':']), "{hostile}");
         assert!(hostile.ends_with("_2"), "{hostile}");
         assert_eq!(safe_stem("", 0), "post_0");
+    }
+
+    /// Rows with no `media` field at all (a pre-media-import store) produce
+    /// the predates-media-import warning in the summary.
+    #[test]
+    fn rows_without_media_field_warn_store_predates_import() {
+        let rows_text = "{\"post_id\":\"old1\",\"url\":\"https://x.com/i/status/old1\",\"text\":\"synthetic\"}\n{\"post_id\":\"old2\",\"url\":\"https://x.com/i/status/old2\",\"text\":\"synthetic\"}\n";
+        let (_rows_dir, rows) = rows_file(rows_text);
+        let (_dir_guard, dir) = out_dir();
+        let fetch = |_: &str| -> Result<Vec<u8>, String> { panic!("no media, no fetch") };
+        let no_frame = |_: &[u8]| -> Result<Vec<u8>, String> { panic!("no frames") };
+        let summary = run(
+            &argv(&["--rows", &rows, "--out-dir", &dir]),
+            &no_env,
+            &fetch,
+            &no_frame,
+            &no_mutes,
+        )
+        .unwrap();
+        assert!(summary.contains("2 post(s), 0 media item(s)"), "{summary}");
+        assert!(summary.contains("predates the media import"), "{summary}");
+    }
+
+    /// No warning when any post has a `media` field (even empty) or when
+    /// there are no posts at all.
+    #[test]
+    fn media_field_present_or_no_posts_means_no_warning() {
+        let with_media: Vec<serde_json::Value> = vec![
+            serde_json::json!({"post_id": "a"}),
+            serde_json::json!({"post_id": "b", "media": []}),
+        ];
+        assert_eq!(missing_media_warning(&with_media), None);
+        assert_eq!(missing_media_warning(&[]), None);
+        let none: Vec<serde_json::Value> = vec![serde_json::json!({"post_id": "a"})];
+        assert!(missing_media_warning(&none).unwrap().contains("1 post(s)"));
     }
 }
