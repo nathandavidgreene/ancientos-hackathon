@@ -159,7 +159,15 @@ pub fn token_valid(state: &State, given: &str) -> bool {
 /// True when the request's [`COOKIE_NAME`] cookie matches the configured
 /// token (constant-time, see `token_ok`).
 pub fn cookie_authorized(state: &State, req: &Request) -> bool {
-    token_ok(state, cookie_token(req.cookie.as_deref()).as_deref())
+    // Browsers may send both a scoped labels credential and the root credential.
+    req.cookie.as_deref().is_some_and(|cookie| {
+        cookie.split(';').any(|part| {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                return false;
+            };
+            name == COOKIE_NAME && token_ok(state, Some(&crate::percent_decode(value)))
+        })
+    })
 }
 
 /// Full mobile page with the given title and body.
@@ -413,7 +421,7 @@ pub fn do_decide_with_env(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handle;
+    use crate::handle_routes as handle;
     use ancientos_core::approvals::{ApprovalRequest, Status};
 
     const TOKEN: &str = "synthetic-phone-token-0001";

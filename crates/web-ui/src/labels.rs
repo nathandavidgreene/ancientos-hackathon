@@ -617,9 +617,9 @@ mod tests {
         let mut state = labels_state(data.path(), eval.path());
         state.phone_token = Some("different-phone-credential-123".into());
         let req = Request::get("/labels?k=different-phone-credential-123");
-        assert_eq!(crate::handle(&req, &state).status, 403);
+        assert_eq!(crate::handle_routes(&req, &state).status, 403);
         assert_eq!(
-            crate::handle(&Request::get(&format!("/labels?k={TOKEN}")), &state).status,
+            crate::handle_routes(&Request::get(&format!("/labels?k={TOKEN}")), &state).status,
             303
         );
     }
@@ -630,11 +630,11 @@ mod tests {
         let mut s = State::open(data.path()).unwrap();
         s.labels_token = crate::phone::token_from(Some(TOKEN.to_string()));
         assert_eq!(
-            crate::handle(&Request::get("/labels").with_cookie(COOKIE), &s).status,
+            crate::handle_routes(&Request::get("/labels").with_cookie(COOKIE), &s).status,
             404
         );
         assert_eq!(
-            crate::handle(
+            crate::handle_routes(
                 &Request::post("/labels/save", "label-7=relevant").with_cookie(COOKIE),
                 &s
             )
@@ -642,7 +642,7 @@ mod tests {
             404
         );
         assert_eq!(
-            crate::handle(
+            crate::handle_routes(
                 &Request::post(
                     "/labels/delete",
                     "post=7&request_id=00000000-0000-4000-8000-000000000001"
@@ -654,7 +654,7 @@ mod tests {
             404
         );
         assert_eq!(
-            crate::handle(
+            crate::handle_routes(
                 &Request::get("/labels/thumb/a_0.jpg").with_cookie(COOKIE),
                 &s
             )
@@ -669,7 +669,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let eval = eval_fixture();
         let s = labels_state(data.path(), eval.path());
-        let authed = |t: crate::Request| crate::handle(&t, &s).status;
+        let authed = |t: crate::Request| crate::handle_routes(&t, &s).status;
         assert_eq!(authed(Request::get("/labels")), 403);
         assert_eq!(
             authed(Request::post("/labels/save", "label-7=relevant")),
@@ -708,7 +708,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let eval = eval_fixture();
         let s = labels_state(data.path(), eval.path());
-        let resp = crate::handle(&Request::get(&format!("/labels?k={TOKEN}")), &s);
+        let resp = crate::handle_routes(&Request::get(&format!("/labels?k={TOKEN}")), &s);
         assert_eq!(resp.status, 303);
         assert_eq!(resp.location.as_deref(), Some("/labels"));
         assert_eq!(
@@ -719,10 +719,10 @@ mod tests {
             )
         );
         assert!(!resp.body.contains(TOKEN));
-        let bad = crate::handle(&Request::get("/labels?k=wrong-token-00000000"), &s);
+        let bad = crate::handle_routes(&Request::get("/labels?k=wrong-token-00000000"), &s);
         assert_eq!(bad.status, 403);
         assert!(bad.set_cookie.is_none());
-        let page = crate::handle(&Request::get("/labels").with_cookie(COOKIE), &s);
+        let page = crate::handle_routes(&Request::get("/labels").with_cookie(COOKIE), &s);
         assert_eq!(page.status, 200);
         assert!(!page.body.contains(TOKEN));
     }
@@ -734,7 +734,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let eval = eval_fixture();
         let s = labels_state(data.path(), eval.path());
-        let resp = crate::handle(&Request::get("/labels").with_cookie(COOKIE), &s);
+        let resp = crate::handle_routes(&Request::get("/labels").with_cookie(COOKIE), &s);
         assert_eq!(resp.status, 200);
         let body = &resp.body;
         assert_eq!(count(body, "id=\"post-7\""), 1, "{body}");
@@ -780,7 +780,7 @@ mod tests {
             100,
         )
         .unwrap();
-        let body = crate::handle(&Request::get("/labels").with_cookie(COOKIE), &s).body;
+        let body = crate::handle_routes(&Request::get("/labels").with_cookie(COOKIE), &s).body;
         assert!(body.contains("Labels (2 posts, 2 labeled)"), "{body}");
         assert!(
             body.contains("name=\"label-7\" value=\"relevant\" checked"),
@@ -798,7 +798,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let eval = eval_fixture();
         let s = labels_state(data.path(), eval.path());
-        let jpg = crate::handle(
+        let jpg = crate::handle_routes(
             &Request::get("/labels/thumb/a_0.jpg").with_cookie(COOKIE),
             &s,
         );
@@ -808,7 +808,7 @@ mod tests {
             jpg.raw_body.as_deref(),
             Some(b"fake-jpeg-bytes-7".as_slice())
         );
-        let png = crate::handle(
+        let png = crate::handle_routes(
             &Request::get("/labels/thumb/b_0.png").with_cookie(COOKIE),
             &s,
         );
@@ -835,10 +835,10 @@ mod tests {
             "/labels/thumb/",
             "/labels/thumb/a_0.jpg/extra",
         ] {
-            let resp = crate::handle(&Request::get(target).with_cookie(COOKIE), &s);
+            let resp = crate::handle_routes(&Request::get(target).with_cookie(COOKIE), &s);
             assert_eq!(resp.status, 404, "{target}: {}", resp.status);
         }
-        let missing = crate::handle(
+        let missing = crate::handle_routes(
             &Request::get("/labels/thumb/gone.jpg").with_cookie(COOKIE),
             &s,
         );
@@ -856,7 +856,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let eval = eval_fixture();
         let s = labels_state(data.path(), eval.path());
-        let resp = crate::handle(
+        let resp = crate::handle_routes(
             &Request::post("/labels/save", "label-7=relevant&label-9=not").with_cookie(COOKIE),
             &s,
         );
@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(stored["9"].label, Label::Not);
         assert_eq!(stored["7"].source, "ui");
         // An empty save is a no-op redirect.
-        let resp = crate::handle(&Request::post("/labels/save", "").with_cookie(COOKIE), &s);
+        let resp = crate::handle_routes(&Request::post("/labels/save", "").with_cookie(COOKIE), &s);
         assert_eq!(resp.status, 303);
     }
 
@@ -885,7 +885,8 @@ mod tests {
             "label-zzz=relevant",
             "label-=relevant",
         ] {
-            let resp = crate::handle(&Request::post("/labels/save", body).with_cookie(COOKIE), &s);
+            let resp =
+                crate::handle_routes(&Request::post("/labels/save", body).with_cookie(COOKIE), &s);
             assert_eq!(resp.status, 400, "{body}");
         }
         assert_eq!(
@@ -893,7 +894,7 @@ mod tests {
             before
         );
         // Non-label fields are ignored, not rejected.
-        let resp = crate::handle(
+        let resp = crate::handle_routes(
             &Request::post("/labels/save", "k=x&other=1").with_cookie(COOKIE),
             &s,
         );
@@ -910,7 +911,7 @@ mod tests {
         let mut s = labels_state(data.path(), eval.path());
         let calls = data.path().join("calls.txt");
         s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
-        let resp = crate::handle(
+        let resp = crate::handle_routes(
             &Request::post(
                 "/labels/delete",
                 "post=7&request_id=00000000-0000-4000-8000-000000000001",
@@ -947,7 +948,7 @@ mod tests {
         labels::save_labels(eval.path(), &[("7".to_string(), Label::Relevant)], 50).unwrap();
         let calls = data.path().join("calls.txt");
         s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 1, "synthetic boom"));
-        let resp = crate::handle(
+        let resp = crate::handle_routes(
             &Request::post(
                 "/labels/delete",
                 "post=7&request_id=00000000-0000-4000-8000-000000000001",
@@ -973,7 +974,7 @@ mod tests {
         let calls = data.path().join("calls.txt");
         s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
         for _ in 0..2 {
-            let resp = crate::handle(
+            let resp = crate::handle_routes(
                 &Request::post(
                     "/labels/delete",
                     "post=7&request_id=00000000-0000-4000-8000-000000000001",
@@ -996,7 +997,7 @@ mod tests {
         let eval = eval_fixture();
         let mut s = labels_state(data.path(), eval.path());
         s.labels_remove_bin = Some(data.path().join("no-such-bin"));
-        let resp = crate::handle(
+        let resp = crate::handle_routes(
             &Request::post(
                 "/labels/delete",
                 "post=7&request_id=00000000-0000-4000-8000-000000000001",
@@ -1014,7 +1015,7 @@ mod tests {
         assert!(labels::load_labels(eval.path()).unwrap().is_empty());
         // Unknown keys and missing fields are 400 with no CLI and no log.
         for body in ["post=zzz", "post=", "other=7"] {
-            let resp = crate::handle(
+            let resp = crate::handle_routes(
                 &Request::post("/labels/delete", body).with_cookie(COOKIE),
                 &s,
             );

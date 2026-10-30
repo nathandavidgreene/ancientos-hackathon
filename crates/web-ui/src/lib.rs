@@ -39,6 +39,10 @@ pub struct Request {
     pub body: Vec<u8>,
     /// Raw `Cookie` header, if the client sent one.
     pub cookie: Option<String>,
+    /// HTTP Host authority; required for writes.
+    pub host: Option<String>,
+    /// Browser Origin; required for writes.
+    pub origin: Option<String>,
 }
 
 impl Request {
@@ -51,6 +55,8 @@ impl Request {
             query,
             body: Vec::new(),
             cookie: None,
+            host: None,
+            origin: None,
         }
     }
 
@@ -62,6 +68,8 @@ impl Request {
             query: BTreeMap::new(),
             body: body.as_bytes().to_vec(),
             cookie: None,
+            host: None,
+            origin: None,
         }
     }
 
@@ -160,6 +168,10 @@ pub struct State {
     pub phone_token: Option<String>,
     /// Resolved labels credential; the binary applies the legacy fallback once.
     pub labels_token: Option<String>,
+    /// Exact allowed browser origins, configured at server startup.
+    pub allowed_origins: Vec<String>,
+    /// Process secret binding CSRF tokens to random browser sessions.
+    csrf_secret: String,
     /// Failed-login buckets shared by the server workers.
     login_attempts: LoginAttempts,
     /// Eval-private dir for the labels page (`/labels`); `None` turns
@@ -223,6 +235,11 @@ impl State {
             all_bookmarks: bookmarks,
             muse_log_path: bookmarks_agent::stats::muse_log_path_from_env(),
             phone_token: None,
+            allowed_origins: vec![
+                "http://127.0.0.1:8787".into(),
+                "http://localhost:8787".into(),
+            ],
+            csrf_secret: phone::random_token()?,
             labels_token: None,
             login_attempts: Default::default(),
             labels_dir: None,
@@ -240,6 +257,11 @@ impl State {
             all_bookmarks: state.all_bookmarks,
             muse_log_path: state.muse_log_path,
             phone_token: None,
+            allowed_origins: vec![
+                "http://127.0.0.1:8787".into(),
+                "http://localhost:8787".into(),
+            ],
+            csrf_secret: phone::random_token()?,
             labels_token: None,
             login_attempts: Default::default(),
             labels_dir: None,
@@ -1981,10 +2003,128 @@ fn authenticated_log(req: &Request, state: &State) -> Response {
     page_log(state)
 }
 
+/// Parse a comma-separated exact origin allowlist; reject malformed configuration.
+/// Origins must contain a scheme and authority only, with no credentials or path.
+pub fn allowed_origins(raw: &str) -> Result<Vec<String>, String> {
+    let origins: Vec<String> = raw.split(',').map(|s| s.trim().to_string()).collect();
+    for origin in &origins {
+        let authority = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .ok_or("invalid UI allowed origins")?;
+        if authority.is_empty()
+            || authority.contains(['/', '?', '#', '@', '\\'])
+            || !authority.is_ascii()
+            || authority
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
+            return Err("invalid UI allowed origins".into());
+        }
+    }
+    Ok(origins)
+}
+
+/// Read a single unambiguous browser session cookie.
+fn session_cookie(req: &Request) -> Option<&str> {
+    let mut values = req.cookie.as_deref()?.split(';').filter_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        (name == "ap_session").then_some(value)
+    });
+    let value = values.next()?;
+    (values.next().is_none() && value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(value)
+}
+
+/// Bind a form token to this server, browser session and configured credential.
+fn csrf_token(state: &State, session: &str) -> String {
+    ancientos_core::approvals::canonical_hash(&serde_json::json!([
+        state.csrf_secret,
+        session,
+        state.phone_token
+    ]))
+}
+
+/// Reject missing, ambiguous, cross-origin or unconfigured write authorities.
+fn write_origin_allowed(req: &Request, state: &State) -> bool {
+    let (Some(host), Some(origin)) = (&req.host, &req.origin) else {
+        return false;
+    };
+    state.allowed_origins.iter().any(|allowed| {
+        let authority = allowed
+            .strip_prefix("https://")
+            .or_else(|| allowed.strip_prefix("http://"));
+        origin == allowed
+            && authority == Some(host.as_str())
+            && !host.is_empty()
+            && !host.contains(['/', '?', '#', '@', ' ', '\\'])
+    })
+}
+
+/// Enforce authentication and session CSRF before any route can mutate state.
+/// Every rendered form receives the same session-bound hidden token. Missing
+/// credentials, headers, entropy or session material fail closed.
+pub fn handle(req: &Request, state: &State) -> Response {
+    if req.method != "GET" {
+        let form = parse_body(&req.body);
+        let authenticated = phone::cookie_authorized(state, req)
+            || phone::token_matches(
+                state.phone_token.as_deref(),
+                form.get("k").map(String::as_str),
+            );
+        let valid_csrf = session_cookie(req).is_some_and(|session| {
+            phone::token_matches(
+                Some(&csrf_token(state, session)),
+                form.get("csrf").map(String::as_str),
+            )
+        });
+        if !authenticated || !write_origin_allowed(req, state) || !valid_csrf {
+            return Response::status(403, "<h1>Request authorization required</h1>".into());
+        }
+    }
+    // A desktop login uses the same credential as the phone, scoped to all routes.
+    if req.method == "GET" && !req.path.starts_with("/labels") && !req.path.starts_with("/m") {
+        if let Some(token) = req.query.get("k") {
+            if phone::token_valid(state, token) {
+                let mut response = Response::redirect(req.path.clone());
+                response.set_cookie = Some(phone::login_cookie_scoped(token, "/"));
+                return response;
+            }
+            return Response::status(403, "<h1>Authentication required</h1>".into());
+        }
+    }
+    let mut response = handle_routes(req, state);
+    if response.status == 200 && response.raw_body.is_none() {
+        let session = match session_cookie(req) {
+            Some(value) => value.to_string(),
+            None => match phone::random_token() {
+                Ok(value) => {
+                    if response.set_cookie.is_some() {
+                        return Response::status(500, "Session unavailable".into());
+                    }
+                    response.set_cookie = Some(format!(
+                        "ap_session={value}; HttpOnly; Secure; SameSite=Strict; Path=/"
+                    ));
+                    value
+                }
+                Err(_) => return Response::status(500, "Session unavailable".into()),
+            },
+        };
+        let hidden = format!(
+            "<input type=\"hidden\" name=\"csrf\" value=\"{}\">",
+            escape(&csrf_token(state, &session))
+        );
+        response.body = response
+            .body
+            .replace("</form>", &format!("{hidden}</form>"));
+    }
+    response
+}
+
 /// Route one request. Pure over `(Request, &State)` apart from the file
 /// appends that votes, triage, follow-ups and approval decisions require.
 /// `GET /stats` renders the local stats dashboard (read-only).
-pub fn handle(req: &Request, state: &State) -> Response {
+fn handle_routes(req: &Request, state: &State) -> Response {
     if matches!(req.path.as_str(), "/" | "/ideas" | "/try") && hidden_authors_of(state).is_err() {
         return log_unreadable(state);
     }
@@ -2094,6 +2234,8 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Box<Respons
     }
     let mut content_length: usize = 0;
     let mut cookie: Option<String> = None;
+    let mut host = None;
+    let mut origin = None;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -2107,7 +2249,20 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Box<Respons
                 .parse::<usize>()
                 .map_err(|_| bad_request("bad content-length"))?;
         } else if name.trim().eq_ignore_ascii_case("cookie") {
+            if cookie.is_some() {
+                return Err(bad_request("duplicate cookie"));
+            }
             cookie = Some(value.trim().to_string());
+        } else if name.trim().eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return Err(bad_request("duplicate host"));
+            }
+            host = Some(value.trim().to_string());
+        } else if name.trim().eq_ignore_ascii_case("origin") {
+            if origin.is_some() {
+                return Err(bad_request("duplicate origin"));
+            }
+            origin = Some(value.trim().to_string());
         }
     }
     if content_length > MAX_BODY_BYTES {
@@ -2137,6 +2292,8 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Box<Respons
         query,
         body,
         cookie,
+        host,
+        origin,
     })
 }
 
@@ -2279,6 +2436,8 @@ pub fn serve(listener: std::net::TcpListener, state: &State, max_connections: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Route unit tests exercise business behavior; request_security_tests covers the public boundary.
+    use super::handle_routes as handle;
 
     /// Test helper: English bookmark row JSON for the given id and text.
     fn bookmark(
@@ -3149,6 +3308,8 @@ mod tests {
             query: BTreeMap::new(),
             body: Vec::new(),
             cookie: None,
+            host: None,
+            origin: None,
         };
         assert_eq!(handle(&req, &state).status, 405);
     }
@@ -3162,6 +3323,8 @@ mod tests {
             query: BTreeMap::new(),
             body: vec![b'x'; MAX_BODY_BYTES + 1],
             cookie: None,
+            host: None,
+            origin: None,
         };
         assert_eq!(handle(&req, &state).status, 413);
     }
@@ -3205,18 +3368,21 @@ mod tests {
 
     #[test]
     fn socket_roundtrip_serves_get_post_and_404() {
-        let (_dir, state) = test_state();
+        let (_dir, mut state) = test_state();
+        state.phone_token = Some("synthetic-socket-token-0002".into());
+        let session = "a".repeat(64);
+        let csrf = csrf_token(&state, &session);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || serve(listener, &state, Some(3)));
         let get = http_roundtrip(&addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(get.starts_with("HTTP/1.1 200 OK"), "{get}");
         assert!(get.contains("post 1 of 3"), "{get}");
-        let body = "post_id=p3&verdict=skip&i=2";
+        let body = format!("post_id=p3&verdict=skip&i=2&csrf={csrf}");
         let post = http_roundtrip(
             &addr,
             &format!(
-                "POST /vote HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST /vote HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nOrigin: http://127.0.0.1:8787\r\nCookie: ap_k=synthetic-socket-token-0002; ap_session={session}\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             ),
         );
@@ -4478,5 +4644,178 @@ mod tests {
         );
         // Log-derived sections still render.
         assert!(resp.body.contains("chain verified"), "{}", resp.body);
+    }
+}
+
+#[cfg(test)]
+mod request_security_tests {
+    use super::*;
+
+    const TOKEN: &str = "synthetic-desktop-token-0002";
+    const SESSION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// Create a fully authorized synthetic browser request, without changing the environment.
+    fn browser(state: &State, path: &str) -> Request {
+        let mut request = Request::post(path, &format!("csrf={}", csrf_token(state, SESSION)))
+            .with_cookie(&format!("ap_k={TOKEN}; ap_session={SESSION}"));
+        request.host = Some("127.0.0.1:8787".into());
+        request.origin = Some("http://127.0.0.1:8787".into());
+        request
+    }
+
+    #[test]
+    fn all_non_get_routes_require_authentication_and_session_csrf() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        state.phone_token = Some(TOKEN.into());
+        for path in [
+            "/vote",
+            "/ideas/triage",
+            "/try",
+            "/unhide-author",
+            "/approvals/approve",
+            "/approvals/deny",
+            "/deeper/test",
+            "/m/decide",
+            "/labels/save",
+            "/labels/delete",
+            "/unknown",
+        ] {
+            let good = browser(&state, path);
+            for bad in 0..7 {
+                let mut request = good.clone();
+                match bad {
+                    0 => request.cookie = None,
+                    1 => request.cookie = Some(format!("ap_k=wrong; ap_session={SESSION}")),
+                    2 => request.body.clear(),
+                    3 => request.body = b"csrf=wrong".to_vec(),
+                    4 => request.host = None,
+                    5 => request.origin = None,
+                    _ => {
+                        request.cookie =
+                            Some(format!("ap_k={TOKEN}; ap_session={}", "b".repeat(64)))
+                    }
+                }
+                assert_eq!(handle(&request, &state).status, 403, "{path}, case {bad}");
+            }
+        }
+        let mut request = browser(&state, "/unknown");
+        request.method = "DELETE".into();
+        request.cookie = None;
+        assert_eq!(handle(&request, &state).status, 403);
+        assert_eq!(handle(&Request::get("/log"), &state).status, 403);
+        assert_eq!(
+            handle(
+                &Request::get("/log").with_cookie(&format!("ap_k={TOKEN}")),
+                &state
+            )
+            .status,
+            200
+        );
+        state.phone_token = None;
+        assert_eq!(handle(&browser(&state, "/unknown"), &state).status, 403);
+    }
+
+    #[test]
+    fn origin_and_host_must_match_an_explicit_allowed_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        state.phone_token = Some(TOKEN.into());
+        let mut request = browser(&state, "/unknown");
+        assert_eq!(handle(&request, &state).status, 404);
+        for (host, origin) in [
+            ("evil.example", "http://127.0.0.1:8787"),
+            ("127.0.0.1:8787", "https://evil.example"),
+            ("127.0.0.1:8787", "null"),
+            ("127.0.0.1:8787", "http://127.0.0.1:8787/"),
+        ] {
+            request.host = Some(host.into());
+            request.origin = Some(origin.into());
+            assert_eq!(handle(&request, &state).status, 403);
+        }
+        let proxy = "https://ser6buzz.tail3ab3aa.ts.net:8445";
+        request.host = Some("ser6buzz.tail3ab3aa.ts.net:8445".into());
+        request.origin = Some(proxy.into());
+        assert_eq!(handle(&request, &state).status, 403);
+        state.allowed_origins = allowed_origins(proxy).unwrap();
+        assert_eq!(handle(&request, &state).status, 404);
+        for bad in [
+            "",
+            "null",
+            "https://x/",
+            "https://user@x",
+            "https://x?y",
+            "ftp://x",
+        ] {
+            assert!(allowed_origins(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn only_authenticated_csrf_bound_approval_appends_a_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        state.phone_token = Some(TOKEN.into());
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        let proposal = ancientos_core::approvals::request(
+            &mut log,
+            &bookmarks_agent::app_gate(),
+            "bookmarks-agent",
+            "x.post",
+            "synthetic security approval",
+            serde_json::json!({"draft": "synthetic"}),
+            now_secs(),
+            None,
+        )
+        .unwrap();
+        let page = handle(
+            &Request::get("/approvals").with_cookie(&format!("ap_k={TOKEN}; ap_session={SESSION}")),
+            &state,
+        );
+        assert_eq!(page.body.matches("</form>").count(), 2);
+        assert_eq!(page.body.matches("name=\"csrf\"").count(), 2);
+        let mut request = browser(&state, "/approvals/approve");
+        request.body.extend_from_slice(
+            format!("&id={}&payload_hash={}", proposal.id, proposal.payload_hash).as_bytes(),
+        );
+        let before = std::fs::read(state.log_path()).unwrap();
+        let mut rejected = request.clone();
+        rejected.origin = Some("https://evil.example".into());
+        assert_eq!(handle(&rejected, &state).status, 403);
+        assert_eq!(std::fs::read(state.log_path()).unwrap(), before);
+        assert_eq!(handle(&request, &state).status, 303);
+        assert_eq!(log.verify().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn every_form_has_a_session_bound_token_and_login_sets_root_cookie() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        state.phone_token = Some(TOKEN.into());
+        let mut log = ancientos_core::log::DecisionLog::open(state.log_path()).unwrap();
+        log.append("synthetic.fixture", serde_json::json!({}))
+            .unwrap();
+        let login = handle(&Request::get(&format!("/?k={TOKEN}")), &state);
+        assert_eq!(login.status, 303);
+        assert_eq!(login.location.as_deref(), Some("/"));
+        assert!(login.set_cookie.unwrap().contains("Path=/;"));
+        for path in ["/", "/approvals", "/try", "/ideas", "/m"] {
+            let response = handle(
+                &Request::get(path).with_cookie(&format!("ap_k={TOKEN}; ap_session={SESSION}")),
+                &state,
+            );
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                response.body.matches("</form>").count(),
+                response.body.matches("name=\"csrf\"").count()
+            );
+            if response.body.contains("</form>") {
+                assert!(response.body.contains(&csrf_token(&state, SESSION)));
+            }
+        }
+        let first = handle(&Request::get("/"), &state).set_cookie.unwrap();
+        let second = handle(&Request::get("/"), &state).set_cookie.unwrap();
+        assert_ne!(first, second);
+        assert!(first.contains("HttpOnly; Secure; SameSite=Strict; Path=/"));
     }
 }

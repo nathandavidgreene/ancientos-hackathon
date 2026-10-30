@@ -181,6 +181,19 @@ fn run(args: &[String]) -> Result<(), String> {
         None
     };
     let mut state = State::open_with_liveness(&dir, parsed.demo)?;
+    state.allowed_origins = match std::env::var("ANCIENTOS_UI_ALLOWED_ORIGINS") {
+        Ok(raw) => web_ui::allowed_origins(&raw)?,
+        Err(std::env::VarError::NotPresent) => vec![format!(
+            "http://{}:{}",
+            if parsed.host == "::1" {
+                "[::1]"
+            } else {
+                &parsed.host
+            },
+            parsed.port
+        )],
+        Err(_) => return Err("invalid UI allowed origins".into()),
+    };
     state.phone_token = web_ui::phone::token_from(std::env::var(web_ui::phone::TOKEN_ENV).ok());
     state.labels_token = web_ui::phone::labels_token_from(
         std::env::var_os(web_ui::phone::LABELS_TOKEN_ENV)

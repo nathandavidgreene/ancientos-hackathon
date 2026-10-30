@@ -40,3 +40,33 @@ summaries. Preserve these directories with the log. Runner prompt payloads
 contain a basename: place prompt files in the runner repository root before
 proposal/execution. Re-propose older pending requests that stored absolute
 paths or lack private content files. Existing log entries remain untouched.
+
+
+Desktop write protection: every non-GET request requires the existing
+`ANCIENTOS_PHONE_TOKEN` credential (`ap_k` cookie or form `k`), a session-bound
+hidden `csrf` form field, and matching allowed `Origin` and `Host` headers.
+`/log` also requires this credential. Missing configuration or request evidence
+returns 403 before routing. Labels retain their additional labels credential check;
+with separate credentials, log into the desktop first, then labels.
+
+Log into the desktop using `/?k=TOKEN` over HTTPS; it redirects to `/` and sets
+an HttpOnly, Secure, SameSite=Strict `ap_k` cookie with `Path=/`. Rendered forms
+include a CSRF token bound to a random `ap_session` cookie and this server process.
+Reload forms after a server restart. Phone and labels forms use the same CSRF
+protection. Programmatic writes must first GET a page, retain its cookies and
+hidden token, then POST with matching Origin/Host headers and the credential.
+
+`ANCIENTOS_UI_ALLOWED_ORIGINS` is a comma-separated list of exact HTTP(S)
+origins, without trailing slashes, paths, or credentials. By default only the
+configured loopback bind host and port are allowed. For the tailnet HTTPS proxy,
+configure:
+
+```sh
+export ANCIENTOS_UI_ALLOWED_ORIGINS=https://ser6buzz.tail3ab3aa.ts.net:8445
+```
+
+The proxy must preserve `Host: ser6buzz.tail3ab3aa.ts.net:8445` and the browser's
+`Origin: https://ser6buzz.tail3ab3aa.ts.net:8445`. Forwarded headers are not trusted.
+Add the loopback origin explicitly, separated by a comma, if both access paths
+are needed. An invalid or empty configured allowlist prevents startup. No proxy
+hostname is implicitly trusted.

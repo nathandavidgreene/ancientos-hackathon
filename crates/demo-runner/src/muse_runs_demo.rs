@@ -80,8 +80,13 @@ pub fn pending_count(html: &str) -> Option<usize> {
 impl Workspace {
     /// Render web-ui's `/approvals` page for this data dir.
     fn approvals_page(&self) -> Result<String, String> {
-        let state = web_ui::State::open(&self.dir)?;
-        let resp = web_ui::handle(&web_ui::Request::get("/approvals"), &state);
+        let mut state = web_ui::State::open(&self.dir)?;
+        state.phone_token = Some("synthetic-demo-desktop-token-0002".into());
+        let resp = web_ui::handle(
+            &web_ui::Request::get("/approvals")
+                .with_cookie("ap_k=synthetic-demo-desktop-token-0002"),
+            &state,
+        );
         if resp.status != 200 {
             return Err(format!("/approvals returned {}", resp.status));
         }

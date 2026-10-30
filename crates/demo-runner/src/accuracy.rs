@@ -95,8 +95,13 @@ impl Workspace {
     /// numbers printed).
     pub fn accuracy_demo(&self) -> Result<AccuracyDemo, String> {
         require_paid_off()?;
-        let state = web_ui::State::open(&self.dir)?;
-        let resp = web_ui::handle(&web_ui::Request::get("/accuracy"), &state);
+        let mut state = web_ui::State::open(&self.dir)?;
+        state.phone_token = Some("synthetic-demo-desktop-token-0002".into());
+        let resp = web_ui::handle(
+            &web_ui::Request::get("/accuracy")
+                .with_cookie("ap_k=synthetic-demo-desktop-token-0002"),
+            &state,
+        );
         if resp.status != 200 {
             return Err(format!("/accuracy returned {}", resp.status));
         }
