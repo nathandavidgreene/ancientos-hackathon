@@ -30,8 +30,12 @@ labels/deletion scope. If it is unset, labels falls back to
 or weak configured labels token disables labels authentication instead of
 falling back. Generate a random token with `web-ui --print-phone-token`.
 Use an HTTPS-terminating proxy: the Secure cookies require HTTPS. Five failed
-logins per peer in a minute temporarily block that peer; proxies sharing one
-backend peer address share the limit.
+logins per client in a minute temporarily block that client. For a loopback direct
+peer, the limiter uses the trimmed, rightmost `X-Forwarded-For` entry parsed as an
+IP address. Tailscale Serve appends the client IP; nginx must pass that header
+through unchanged. Missing, empty or malformed rightmost entries fall back to the
+shared peer bucket. Duplicate headers are rejected with 400. Non-loopback peers
+always use their own IP and cannot override it with this header.
 
 Decision-log privacy: `/log` requires the phone credential, initially via
 `/log?k=TOKEN` over HTTPS. New Wonder questions and answers live in private

@@ -43,6 +43,8 @@ pub struct Request {
     pub host: Option<String>,
     /// Browser Origin; required for writes.
     pub origin: Option<String>,
+    /// Raw `X-Forwarded-For` header; trusted only for loopback limiter peers.
+    pub x_forwarded_for: Option<String>,
 }
 
 impl Request {
@@ -57,6 +59,7 @@ impl Request {
             cookie: None,
             host: None,
             origin: None,
+            x_forwarded_for: None,
         }
     }
 
@@ -70,6 +73,7 @@ impl Request {
             cookie: None,
             host: None,
             origin: None,
+            x_forwarded_for: None,
         }
     }
 
@@ -2236,6 +2240,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Box<Respons
     let mut cookie: Option<String> = None;
     let mut host = None;
     let mut origin = None;
+    let mut x_forwarded_for = None;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -2258,6 +2263,11 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Box<Respons
                 return Err(bad_request("duplicate host"));
             }
             host = Some(value.trim().to_string());
+        } else if name.trim().eq_ignore_ascii_case("x-forwarded-for") {
+            if x_forwarded_for.is_some() {
+                return Err(bad_request("duplicate x-forwarded-for"));
+            }
+            x_forwarded_for = Some(value.trim().to_string());
         } else if name.trim().eq_ignore_ascii_case("origin") {
             if origin.is_some() {
                 return Err(bad_request("duplicate origin"));
@@ -2294,6 +2304,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Box<Respons
         cookie,
         host,
         origin,
+        x_forwarded_for,
     })
 }
 
@@ -2313,7 +2324,20 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// Permit at most five failures per peer per minute; bound bucket storage.
+/// Use the rightmost forwarded IP only behind a loopback peer (the proxy appends it).
+/// Missing, empty or invalid values fall back to the shared peer bucket;
+/// duplicate headers are rejected by the request parser.
+fn limiter_key(peer: std::net::IpAddr, xff: Option<&str>) -> std::net::IpAddr {
+    if peer.is_loopback() {
+        xff.and_then(|value| value.rsplit(',').next())
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(peer)
+    } else {
+        peer
+    }
+}
+
+/// Permit at most five failures per client per minute; bound bucket storage.
 fn login_allowed(state: &State, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
     let Ok(mut attempts) = state.login_attempts.lock() else {
         return false;
@@ -2343,7 +2367,10 @@ fn serve_one(stream: &mut std::net::TcpStream, state: &State) {
                 || req.path.starts_with("/m/")
                 || req.path == "/labels"
                 || req.path.starts_with("/labels/");
-            let peer = stream.peer_addr().ok().map(|a| a.ip());
+            let peer = stream
+                .peer_addr()
+                .ok()
+                .map(|a| limiter_key(a.ip(), req.x_forwarded_for.as_deref()));
             let now = std::time::Instant::now();
             if scoped && !peer.is_some_and(|ip| login_allowed(state, ip, now)) {
                 Response::status(429, "<h1>Try again later</h1>".into())
@@ -2552,6 +2579,46 @@ mod tests {
             assert!(!response.body.contains("Try this stretch"));
             assert!(response.body.contains("Approvals (unavailable)"));
         }
+    }
+
+    #[test]
+    fn limiter_key_trusts_only_loopback_and_uses_rightmost_ip() {
+        let peer = "127.0.0.1".parse().unwrap();
+        let client = "100.64.0.5".parse().unwrap();
+        for loopback in [peer, "::1".parse().unwrap()] {
+            assert_eq!(limiter_key(loopback, Some("1.2.3.4, 100.64.0.5 ")), client);
+            for xff in [
+                None,
+                Some(""),
+                Some("   "),
+                Some("invalid"),
+                Some("1.2.3.4,"),
+                Some("1.2.3.4, invalid"),
+            ] {
+                assert_eq!(limiter_key(loopback, xff), loopback);
+            }
+        }
+        assert_eq!(limiter_key(client, Some("1.2.3.4")), client);
+    }
+
+    #[test]
+    fn socket_login_limiter_separates_forwarded_clients() {
+        let (_dir, state) = test_state();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || serve(listener, &state, Some(8)));
+        let request = "GET /m HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 1.2.3.4, 100.64.0.5\r\n\r\n";
+        for _ in 0..5 {
+            assert!(http_roundtrip(&addr, request).starts_with("HTTP/1.1 403"));
+        }
+        assert!(http_roundtrip(&addr, request).starts_with("HTTP/1.1 429"));
+        assert!(
+            http_roundtrip(&addr, &request.replace("100.64.0.5", "100.64.0.6"))
+                .starts_with("HTTP/1.1 403")
+        );
+        assert!(http_roundtrip(&addr, "GET /m HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 100.64.0.6\r\nx-forwarded-for: 100.64.0.7\r\n\r\n")
+            .starts_with("HTTP/1.1 400"));
+        server.join().unwrap();
     }
 
     #[test]
@@ -3310,6 +3377,7 @@ mod tests {
             cookie: None,
             host: None,
             origin: None,
+            x_forwarded_for: None,
         };
         assert_eq!(handle(&req, &state).status, 405);
     }
@@ -3325,6 +3393,7 @@ mod tests {
             cookie: None,
             host: None,
             origin: None,
+            x_forwarded_for: None,
         };
         assert_eq!(handle(&req, &state).status, 413);
     }
