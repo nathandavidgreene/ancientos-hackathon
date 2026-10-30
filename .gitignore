@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 /data/
+eval-private/
 *.jsonl
 !fixtures/sample_bookmarks.jsonl
 !fixtures/demo/synthetic_bookmarks.jsonl

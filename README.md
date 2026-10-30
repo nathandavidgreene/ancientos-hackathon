@@ -1,6 +1,27 @@
 # ancientos-hackathon
 AncientOS rebuild for the Meta hackathon \(Oct 26-Nov 4, 2026\)
 
+## Why AncientOS exists
+
+An AI agent is only useful if it can act: sync your bookmarks, run a coding job, ask a model a question. But most agents get that power by being handed your keys and trusted to behave.
+
+AncientOS takes a different route: the agent can act, but it never holds unrestricted authority. Four jobs are kept apart:
+
+```
+ intelligence  ->  authorization  ->  execution  ->  evidence
+ (models,          (gate + your       (runs once,     (hash-chained
+  privacy router)   approval)          paid switch)    decision log)
+```
+
+- **Intelligence** proposes. A privacy router keeps sensitive or unclassified text on a local Llama model; only sanitized text goes to Meta's cloud models.
+- **Authorization** decides. Actions an app hasn't registered are denied. Risky ones wait for your approval, on the CLI or your phone, and the approval is bound to a hash of the exact payload.
+- **Execution** is limited. Anything that costs money stays off unless `ANCIENTOS_ALLOW_PAID=1` is set.
+- **Evidence** is kept. Every decision lands in an append-only, hash-chained log, checked on every read.
+
+Three apps (an X bookmarks curator, gated Muse Code runs, and Muse Wonder questions) share this one small core, which knows nothing about any of them.
+
+What isn't done yet: the gate is enforced by convention, not by types; the log has no cross-process lock and isn't signed; and the router can still be bypassed by code that calls a model directly. Those are next.
+
 ## What this is
 AncientOS hackathon build (Oct 26 - Nov 4 2026): a Rust core with a scheduler,
 a fail-closed approval gate and an append-only, hash-chained decision log; a

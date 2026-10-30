@@ -14,3 +14,4 @@ thiserror.workspace = true
 ureq.workspace = true
 getrandom.workspace = true
 tempfile.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }

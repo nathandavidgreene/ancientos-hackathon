@@ -777,6 +777,8 @@ mod tests {
 
     /// One-shot mock HTTP server on 127.0.0.1: captures the request body,
     /// replies once with `status` + `body`, then exits. No external network.
+    /// Joining callers must guarantee the request is actually sent (Muse
+    /// tests: `env_lock` plus `META_API_KEY`), or the join hangs forever.
     fn mock_server(status: u16, body: &str) -> (String, SeenBodies, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let url = format!("http://{}", listener.local_addr().expect("mock addr"));
@@ -861,7 +863,8 @@ mod tests {
     /// Multi-shot mock HTTP server on 127.0.0.1: serves the scripted
     /// `(status, body)` replies in order on one listener, captures request
     /// bodies, then exits. For the Muse retry tests (first try and retry hit
-    /// the same base URL). No external network.
+    /// the same base URL). No external network. Like [`mock_server`],
+    /// joining callers must guarantee every scripted request is sent.
     fn mock_server_seq(
         replies: Vec<(u16, String)>,
     ) -> (String, SeenBodies, std::thread::JoinHandle<()>) {
@@ -2120,11 +2123,11 @@ mod tests {
         assert_eq!(d.explanation.confidence, Some(0.9f32));
     }
 
+    /// Muse explanation is sanitized and capped; sets META_API_KEY via EnvGuard so the test cannot hang on a missing key.
     #[test]
     fn muse_explanation_uses_sanitized_capped_reason() {
-        // Pre-existing fix (not the locking change): the Muse stage needs a
-        // key set even for mocks, or it fails closed pre-HTTP, the one-shot
-        // mock starves, and join() hangs forever. Same guard as siblings.
+        // The Muse stage reads META_API_KEY at call time: without the lock
+        // and key, a key-absent run makes no request and hangs on join.
         let _guard = env_lock();
         let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
         // With a model reason: surfaced, one line.
