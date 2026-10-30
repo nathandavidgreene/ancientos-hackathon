@@ -554,13 +554,27 @@ mod tests {
     }
 
     /// Test helper: write `body` to `name` under `dir`, executable (unix).
+    ///
+    /// The executable itself is never opened for writing by this (test)
+    /// process: the body goes to a sibling `.src` file and a `cp` child
+    /// creates the executable. Writing it directly raced with other test
+    /// threads forking concurrently: a child forked while our write fd was
+    /// open inherits it until its exec, so exec'ing the script could fail
+    /// with ETXTBSY ("Text file busy"). Only `cp` ever holds a write fd
+    /// on the executable, and it exits before we return.
     #[cfg(unix)]
     fn write_executable(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(body.as_bytes()).unwrap();
-        drop(f);
+        let src = dir.join(format!("{name}.src"));
+        std::fs::write(&src, body.as_bytes()).unwrap();
+        let st = std::process::Command::new("cp")
+            .arg(&src)
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "cp failed: {st}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
