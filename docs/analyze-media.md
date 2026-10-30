@@ -97,3 +97,8 @@ and bounded to X media hosts only, and no paid calls are made.
 Media rows must include original `full_text` and, when applicable, `quoted_text`.
 Missing post context fails closed. Post text, quoted text, and alt text are
 screened against mutes before resolution or any backend call.
+
+Each backend retains its paid configuration and rechecks the paid switch per
+call. Muse CLI execution has a 120-second deadline; timeout kills and reaps
+the child. Shell, write, web, reminder and interactive tools are disabled
+before launch. Any reported tool event aborts the whole analysis run.

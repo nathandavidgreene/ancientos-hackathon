@@ -219,6 +219,17 @@ pub struct PaidConfig {
 }
 
 impl PaidConfig {
+    /// Recheck the live paid switch before each backend invocation.
+    pub fn require_current(&self) -> Result<(), String> {
+        if std::env::var(PAID_ENV_VAR).is_ok_and(|value| value == "1")
+            && (1..=HARD_MAX_ITEMS).contains(&self.max_items)
+        {
+            Ok(())
+        } else {
+            Err("paid media calls are disabled (fail closed)".into())
+        }
+    }
+
     /// Read the paid switch and cap from the environment; refuses unless
     /// `ANCIENTOS_ALLOW_PAID=1` and a cap in 1..=[`HARD_MAX_ITEMS`] is set.
     pub fn from_env() -> Result<Self, String> {
@@ -469,6 +480,9 @@ pub fn analyze(
         let raws = match backend.analyze(item) {
             Ok(r) => r,
             Err(e) => {
+                if e == "model tried to use a tool" {
+                    return Err(e);
+                }
                 skipped.push(Skipped {
                     post_id: item.provenance.post_id.clone(),
                     media_key: item.provenance.media_key.clone(),
@@ -721,6 +735,23 @@ mod tests {
         assert_eq!(rep.skipped.len(), 1);
         let kinds: Vec<_> = log.verify().unwrap().into_iter().map(|e| e.kind).collect();
         assert_eq!(kinds, vec![REJECTED_KIND, SKIPPED_KIND]);
+    }
+
+    #[test]
+    fn tool_event_aborts_the_whole_analysis_run() {
+        struct Tool;
+        impl MediaBackend for Tool {
+            /// Simulate a forbidden tool event from the CLI backend.
+            fn analyze(&self, _: &ResolvedMedia) -> Result<Vec<RawFinding>, String> {
+                Err("model tried to use a tool".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DecisionLog::open(dir.path().join("log")).unwrap();
+        let rows = parse_rows(FIXTURE).unwrap();
+        let request = req("demo-9001", &["3_demo_photo"]);
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
+        assert!(analyze(&mut log, &request, &rows, &Tool, paid(10)).is_err());
     }
 
     #[test]

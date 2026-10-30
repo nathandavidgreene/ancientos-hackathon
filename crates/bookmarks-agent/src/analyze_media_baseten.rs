@@ -34,6 +34,7 @@ pub type Post = Box<dyn Fn(&str, &str, &serde_json::Value) -> Result<serde_json:
 
 /// The Baseten backend with a running token total.
 pub struct BasetenBackend {
+    paid: PaidConfig,
     model: String,
     base: String,
     key: String,
@@ -67,7 +68,7 @@ impl BasetenBackend {
     /// Build from env with an injected `post` (tests use a fake).
     pub fn with_post(
         env: &dyn Fn(&str) -> Option<String>,
-        _paid: PaidConfig,
+        paid: PaidConfig,
         post: Post,
     ) -> Result<Self, String> {
         let get = |k: &str| env(k).filter(|v| !v.trim().is_empty());
@@ -81,6 +82,7 @@ impl BasetenBackend {
         }
         let max_tokens = parse_token_cap(env(MAX_TOKENS_ENV_VAR).as_deref())?;
         Ok(Self {
+            paid,
             model,
             base: base.trim_end_matches('/').to_string(),
             key,
@@ -144,6 +146,7 @@ impl BasetenBackend {
         log: Option<&mut DecisionLog>,
         item: &ResolvedMedia,
     ) -> Result<Vec<RawFinding>, String> {
+        self.paid.require_current()?;
         check_egress(class, Route::Baseten, caller, log).map_err(|e| e.to_string())?;
         let before = self.used.get();
         if before.input + before.output >= self.max_tokens {
@@ -275,6 +278,7 @@ mod tests {
     #[test]
     /// Body carries model, low effort, image URL; key goes to post, not Debug.
     fn sends_image_and_parses_content_not_reasoning() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         let seen = Rc::new(std::cell::RefCell::new(None));
         let s2 = seen.clone();
         let b = BasetenBackend::with_post(
@@ -310,6 +314,7 @@ mod tests {
     #[test]
     /// Truncated or empty replies are errors; cap stops the next call.
     fn truncation_errors_and_cap_stops() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         assert!(parse_reply(&reply("{", "length")).is_err());
         assert!(parse_reply(&reply("", "stop")).is_err());
         let b = BasetenBackend::with_post(
@@ -327,6 +332,7 @@ mod tests {
     /// logged with class, route, and caller only (never content).
     #[test]
     fn non_public_content_is_refused_before_any_http() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         use ancientos_router::data_class::EGRESS_DENIED_KIND;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.jsonl");
@@ -369,6 +375,7 @@ mod tests {
     /// parse, and one allowed entry (class and route only) is logged.
     #[test]
     fn public_content_passes_egress_and_logs_allowed() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         use ancientos_router::data_class::EGRESS_ALLOWED_KIND;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.jsonl");
@@ -400,6 +407,7 @@ mod tests {
     /// default media path keeps working through the egress check.
     #[test]
     fn trait_analyze_delegates_with_public_class() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         let b = BasetenBackend::with_post(
             &env,
             paid(),

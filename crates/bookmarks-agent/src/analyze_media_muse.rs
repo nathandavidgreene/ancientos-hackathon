@@ -3,8 +3,10 @@
 //!
 //! Per item: the image is downloaded (X media hosts only, size-capped) into
 //! a fresh temp dir as `image.<ext>` (neutral name, no URL in the prompt),
-//! then `muse exec --json --image <file> --workspace <tmp> --trust-workspace
-//! --reasoning-effort low <prompt>` runs with that dir as the only trusted
+//! then `muse exec --json --image <file> --workspace <tmp>` with shell,
+//! filesystem writes, web tools and reminder agents disabled, and a 120s deadline.
+//! The command uses
+//! `--reasoning-effort low <prompt>` with that directory as its isolated
 //! workspace. The reply is the `text` of the `run.terminal.completed` event,
 //! parsed by [`parse_findings`]; `run.usage` input+output tokens add to a
 //! running total. Once the total reaches `ANCIENTOS_MEDIA_MAX_TOKENS`, every
@@ -38,6 +40,7 @@ pub type Exec = Box<dyn Fn(&[String], &Path) -> Result<String, String>>;
 
 /// The `muse exec` backend with a running token total.
 pub struct MuseExecBackend {
+    paid: PaidConfig,
     muse_bin: String,
     max_tokens: u64,
     used: Cell<Usage>,
@@ -79,12 +82,13 @@ impl MuseExecBackend {
     /// Build with injected download/exec (tests); checks the token cap.
     pub fn with_io(
         env: &dyn Fn(&str) -> Option<String>,
-        _paid: PaidConfig,
+        paid: PaidConfig,
         muse_bin: String,
         fetch: Fetch,
         exec: Exec,
     ) -> Result<Self, String> {
         Ok(Self {
+            paid,
             muse_bin,
             max_tokens: parse_token_cap(env(MAX_TOKENS_ENV_VAR).as_deref())?,
             used: Cell::new(Usage::default()),
@@ -115,7 +119,12 @@ impl MuseExecBackend {
             "off".into(),
             "--workspace".into(),
             dir.display().to_string(),
-            "--trust-workspace".into(),
+            "--disable-shell".into(),
+            "--disable-write".into(),
+            "--disable-web-tools".into(),
+            "--disable-reminders".into(),
+            "--disable-request-user-input".into(),
+            "--no-foreign-personal-context".into(),
             "--image".into(),
             image.display().to_string(),
             format!("{PROMPT}{NO_TOOLS}"),
@@ -174,6 +183,7 @@ pub fn parse_events(stdout: &str) -> Result<(String, Usage), String> {
 impl MediaBackend for MuseExecBackend {
     /// Download, run one `muse exec`, add usage, parse findings.
     fn analyze(&self, item: &ResolvedMedia) -> Result<Vec<RawFinding>, String> {
+        self.paid.require_current()?;
         let before = self.used.get();
         if before.input + before.output >= self.max_tokens {
             return Err(format!("token cap {} reached", self.max_tokens));
@@ -233,17 +243,62 @@ fn http_fetch(url: &str, path: &Path) -> Result<(), String> {
 
 /// Run `args[0]` with the rest in `dir`, returning stdout; nonzero exit errors.
 fn run_process(args: &[String], dir: &Path) -> Result<String, String> {
+    run_process_with_timeout(args, dir, std::time::Duration::from_secs(120))
+}
+
+/// Run with a bounded deadline, killing and reaping the child on timeout.
+/// Stdout is spooled to a private file so a full pipe cannot deadlock wait.
+fn run_process_with_timeout(
+    args: &[String],
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::{Read, Seek};
     let (bin, rest) = args.split_first().ok_or("empty command")?;
-    let out = std::process::Command::new(bin)
+    let mut stdout = tempfile::tempfile().map_err(|_| "stdout staging failed".to_string())?;
+    let mut child = std::process::Command::new(bin)
         .args(rest)
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!("muse exited {}", out.status));
+        .stderr(std::process::Stdio::null())
+        .stdout(
+            stdout
+                .try_clone()
+                .map_err(|_| "stdout staging failed".to_string())?,
+        )
+        .spawn()
+        .map_err(|_| "muse spawn failed".to_string())?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Err(format!("muse exited {status}"));
+                }
+                break;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("muse deadline or wait failure".into());
+            }
+        }
     }
-    String::from_utf8(out.stdout).map_err(|e| e.to_string())
+    stdout
+        .rewind()
+        .map_err(|_| "stdout read failed".to_string())?;
+    let mut bytes = Vec::new();
+    stdout
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "stdout read failed".to_string())?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("muse output exceeds cap".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "invalid muse output".to_string())
 }
 
 #[cfg(test)]
@@ -274,7 +329,8 @@ mod tests {
             "muse".into(),
             Box::new(|_, p| std::fs::write(p, b"x").map_err(|e| e.to_string())),
             Box::new(move |args, _| {
-                assert!(args.contains(&"--trust-workspace".to_string()));
+                assert!(args.contains(&"--disable-shell".to_string()));
+                assert!(!args.contains(&"--trust-workspace".to_string()));
                 assert!(
                     !args.iter().any(|a| a.contains("twimg")),
                     "URL leaked into args"
@@ -300,7 +356,36 @@ mod tests {
     }
 
     #[test]
+    fn process_deadline_kills_hung_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let args = vec!["/bin/sh".into(), "-c".into(), "sleep 2".into()];
+        assert!(
+            run_process_with_timeout(&args, dir.path(), std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn paid_revocation_precedes_download_and_execution() {
+        let _paid = crate::test_support::EnvHold::paid_on();
+        let b = MuseExecBackend::with_io(
+            &env_cap("100"),
+            PaidConfig { max_items: 1 },
+            "muse".into(),
+            Box::new(|_, _| panic!("download after revocation")),
+            Box::new(|_, _| panic!("execution after revocation")),
+        )
+        .unwrap();
+        std::env::remove_var(crate::analyze_media::PAID_ENV_VAR);
+        assert!(b.analyze(&item()).unwrap_err().contains("disabled"));
+        assert_eq!(b.calls(), 0);
+    }
+
+    #[test]
     fn parses_recorded_events_and_counts_tokens() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         let (text, u) = parse_events(EVENTS).unwrap();
         assert!(text.contains("findings"));
         assert_eq!(
@@ -318,6 +403,7 @@ mod tests {
 
     #[test]
     fn token_cap_stops_before_next_call() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         let b = backend("1000", EVENTS);
         assert!(b.analyze(&item()).is_ok());
         assert!(b.analyze(&item()).unwrap_err().contains("cap"));
@@ -326,6 +412,7 @@ mod tests {
 
     #[test]
     fn missing_cap_fails_closed() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         assert!(parse_token_cap(None).is_err());
         assert!(parse_token_cap(Some("0")).is_err());
         assert!(parse_token_cap(Some("abc")).is_err());
@@ -334,6 +421,7 @@ mod tests {
 
     #[test]
     fn bad_streams_are_errors() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         assert!(parse_events(r#"{"payload_type":"run.usage","payload":{}}"#).is_err());
         assert!(parse_events(
             r#"{"payload_type":"run.terminal.failed","payload":{"terminal":"failed"}}"#
@@ -350,6 +438,7 @@ mod tests {
 
     #[test]
     fn metadata_download_is_refused_without_writing() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("image");
         assert!(http_fetch("http://169.254.169.254/latest/meta-data/", &path).is_err());
@@ -358,6 +447,7 @@ mod tests {
 
     #[test]
     fn neutral_names_and_low_effort() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         assert_eq!(ext_for("https://pbs.twimg.com/media/a.PNG?x=1"), "png");
         assert_eq!(ext_for("https://pbs.twimg.com/media/a"), "jpg");
         let b = backend("10", EVENTS);

@@ -34,6 +34,7 @@ quote, or a region box around them. Omit anything you cannot point to.";
 /// Live backend: one chat call per media item with the image URL attached.
 #[derive(Debug, Clone)]
 pub struct LiveBackend {
+    paid: PaidConfig,
     client: MuseClient,
 }
 
@@ -41,7 +42,7 @@ pub struct LiveBackend {
 /// API base. `paid` must come from [`PaidConfig::from_env`].
 pub fn live_backend(
     env: &dyn Fn(&str) -> Option<String>,
-    _paid: PaidConfig,
+    paid: PaidConfig,
 ) -> Result<LiveBackend, String> {
     let get = |k: &str| env(k).filter(|v| !v.trim().is_empty());
     let model = get(MODEL_ENV_VAR)
@@ -52,7 +53,13 @@ pub fn live_backend(
         return Err(format!("{BASE_ENV_VAR} must be https (fail closed)"));
     }
     Ok(LiveBackend {
-        client: MuseClient::new(model, base, MAX_COMPLETION_TOKENS, true),
+        paid,
+        client: MuseClient::new(
+            model,
+            base,
+            MAX_COMPLETION_TOKENS,
+            env(crate::analyze_media::PAID_ENV_VAR).as_deref() == Some("1"),
+        ),
     })
 }
 
@@ -110,6 +117,7 @@ pub fn parse_findings(content: &str) -> Result<Vec<RawFinding>, String> {
 impl MediaBackend for LiveBackend {
     /// One paid call for the item; the reply must parse as findings JSON.
     fn analyze(&self, item: &ResolvedMedia) -> Result<Vec<RawFinding>, String> {
+        self.paid.require_current()?;
         let resp = self
             .client
             .chat_messages_with_class(DataClass::Public, "analyze_media", None, messages_for(item))
@@ -140,6 +148,7 @@ mod tests {
 
     #[test]
     fn missing_env_fails_closed() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         assert!(live_backend(&env_of(&[]), paid())
             .unwrap_err()
             .contains(MODEL_ENV_VAR));
@@ -165,6 +174,7 @@ mod tests {
 
     #[test]
     fn messages_carry_image_url() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         let item = ResolvedMedia {
             provenance: Provenance {
                 post_id: "demo-1".into(),
@@ -184,6 +194,7 @@ mod tests {
 
     #[test]
     fn parses_recorded_style_reply_and_check_filters_evidence() {
+        let _paid = crate::test_support::EnvHold::paid_on();
         // Synthetic reply in the recorded chat-completions content shape.
         let reply = "```json\n{\"findings\":[\
             {\"kind\":\"text\",\"text\":\"[synthetic] 10,000 steps\",\"quote\":\"10,000 steps\",\"region\":null},\
