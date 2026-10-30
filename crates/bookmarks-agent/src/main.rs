@@ -180,7 +180,13 @@ fn cmd_load(args: &[String]) -> Result<(), String> {
         .map_or("fixtures/sample_bookmarks.jsonl", String::as_str);
     match fixture::load(path) {
         Ok(rows) => {
-            println!("loaded {} bookmarks", rows.len());
+            let count = rows.len();
+            let mut store = bookmarks_agent::ingest::Store::load()?;
+            for row in rows {
+                store.by_id.insert(row.post_id.clone(), row);
+            }
+            store.save()?;
+            println!("loaded {count} bookmarks");
             Ok(())
         }
         Err(e) => Err(e.to_string()),
