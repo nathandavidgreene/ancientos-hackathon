@@ -777,6 +777,8 @@ mod tests {
 
     /// One-shot mock HTTP server on 127.0.0.1: captures the request body,
     /// replies once with `status` + `body`, then exits. No external network.
+    /// Joining callers must guarantee the request is actually sent (Muse
+    /// tests: `env_lock` plus `META_API_KEY`), or the join hangs forever.
     fn mock_server(status: u16, body: &str) -> (String, SeenBodies, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let url = format!("http://{}", listener.local_addr().expect("mock addr"));
@@ -861,7 +863,8 @@ mod tests {
     /// Multi-shot mock HTTP server on 127.0.0.1: serves the scripted
     /// `(status, body)` replies in order on one listener, captures request
     /// bodies, then exits. For the Muse retry tests (first try and retry hit
-    /// the same base URL). No external network.
+    /// the same base URL). No external network. Like [`mock_server`],
+    /// joining callers must guarantee every scripted request is sent.
     fn mock_server_seq(
         replies: Vec<(u16, String)>,
     ) -> (String, SeenBodies, std::thread::JoinHandle<()>) {
@@ -2122,6 +2125,10 @@ mod tests {
 
     #[test]
     fn muse_explanation_uses_sanitized_capped_reason() {
+        // The Muse stage reads META_API_KEY at call time: without the lock
+        // and key, a key-absent run makes no request and hangs on join.
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
         // With a model reason: surfaced, one line.
         let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
         let (muse_url, _, muse_handle) = mock_server(
