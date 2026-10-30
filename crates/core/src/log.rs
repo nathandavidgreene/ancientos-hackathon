@@ -515,7 +515,10 @@ impl DecisionLog {
     ) -> Result<Self, LogError> {
         match env(LOG_KEY_ENV_VAR).filter(|v| !v.is_empty()) {
             Some(p) => Self::open_signed(path, p),
-            None => Self::open(path),
+            None => {
+                eprintln!("WARNING: ANCIENTOS_LOG_KEY_PATH is unset; decision log is UNSIGNED and tail truncation protection is not authenticated");
+                Self::open(path)
+            }
         }
     }
 

@@ -74,7 +74,7 @@ fn two_processes_append_concurrently_without_forking_chain() {
     let b = spawn(&["append", &p, "b", &count]);
     wait_ok(a, "appender a");
     wait_ok(b, "appender b");
-    let log = DecisionLog::open(&path).unwrap();
+    let log = DecisionLog::open_with_key_env(&path, &|key| std::env::var(key).ok()).unwrap();
     let entries = log.verify().unwrap();
     assert_eq!(entries.len(), 2 * APPENDS_PER_CHILD);
     for (i, e) in entries.iter().enumerate() {
@@ -95,7 +95,7 @@ fn two_processes_append_concurrently_without_forking_chain() {
 fn two_processes_racing_release_yield_exactly_one_success() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("log.jsonl");
-    let mut log = DecisionLog::open(&path).unwrap();
+    let mut log = DecisionLog::open_with_key_env(&path, &|key| std::env::var(key).ok()).unwrap();
     let mut specs = Vec::new();
     for i in 0..RACE_APPROVALS {
         let payload = serde_json::json!({"draft": format!("race-{i}")});
@@ -136,7 +136,7 @@ fn two_processes_racing_release_yield_exactly_one_success() {
         RACE_APPROVALS,
         "every approval released exactly once"
     );
-    let log = DecisionLog::open(&path).unwrap();
+    let log = DecisionLog::open_with_key_env(&path, &|key| std::env::var(key).ok()).unwrap();
     let entries = log.verify().unwrap();
     assert_eq!(entries.len(), 3 * RACE_APPROVALS);
     for spec in &specs {

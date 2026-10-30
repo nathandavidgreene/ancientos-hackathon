@@ -284,7 +284,7 @@ pub fn cli(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<i32,
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| format!("log dir: {e}"))?;
     }
-    let mut log = DecisionLog::open(&path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&path, env).map_err(|e| e.to_string())?;
     let now = now_secs();
     let words: Vec<&str> = rest.iter().map(String::as_str).collect();
     match words.as_slice() {

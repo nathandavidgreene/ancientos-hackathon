@@ -735,7 +735,8 @@ fn run_impl(
     // author, never become candidates. Silent in-memory filtering (like
     // liveness below): no log entry, store never modified.
     let (hidden, hidden_authors) = {
-        let log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+        let log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+            .map_err(|e| e.to_string())?;
         let records = feedback::records_from_log(&log).map_err(|e| e.to_string())?;
         (
             feedback::hidden_posts(&records),
@@ -777,7 +778,8 @@ fn run_impl(
     // untouched. Hidden/never filtering above applied first.
     // Semantic ranking (local embeddings, opt-in) blends in when its model
     // is configured and reachable; otherwise the vote-learned order stands.
-    let vote_log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let vote_log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let events = crate::ranker::events_from_log(&vote_log, &merged.rows)?;
     let ranker = crate::ranker::Ranker::train(&events, crate::ranker::min_records_from_env());
     let mut semantic = false;
@@ -967,7 +969,8 @@ fn run_impl(
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     if !mute_skips.is_empty() {
         log.append(
             "topic_mute.skipped",

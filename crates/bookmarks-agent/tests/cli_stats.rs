@@ -58,7 +58,7 @@ fn seed(log_path: &Path) -> u64 {
     use ancientos_core::log::DecisionLog;
     use bookmarks_agent::feedback::{FeedbackRecord, ThresholdPolicy, Verdict};
     let now = now_secs();
-    let mut log = DecisionLog::open(log_path).unwrap();
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok()).unwrap();
     ancientos_core::approvals::request(
         &mut log,
         &bookmarks_agent::app_gate(),

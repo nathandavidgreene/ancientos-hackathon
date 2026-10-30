@@ -23,7 +23,9 @@ struct ReleaseSpec {
 
 /// Append `count` entries as `worker` to the log at `path`.
 fn cmd_append(path: &Path, worker: &str, count: usize) -> Result<(), String> {
-    let mut log = ancientos_core::log::DecisionLog::open(path).map_err(|e| e.to_string())?;
+    let mut log =
+        ancientos_core::log::DecisionLog::open_with_key_env(path, &|key| std::env::var(key).ok())
+            .map_err(|e| e.to_string())?;
     for i in 0..count {
         log.append("stress", serde_json::json!({"worker": worker, "i": i}))
             .map_err(|e| format!("append {i}: {e}"))?;
@@ -38,7 +40,9 @@ fn cmd_append(path: &Path, worker: &str, count: usize) -> Result<(), String> {
 fn cmd_release_all(path: &Path, specs_json: &str) -> Result<usize, String> {
     let specs: Vec<ReleaseSpec> =
         serde_json::from_str(specs_json).map_err(|e| format!("bad specs: {e}"))?;
-    let mut log = ancientos_core::log::DecisionLog::open(path).map_err(|e| e.to_string())?;
+    let mut log =
+        ancientos_core::log::DecisionLog::open_with_key_env(path, &|key| std::env::var(key).ok())
+            .map_err(|e| e.to_string())?;
     let mut wins = 0;
     for spec in &specs {
         let token = match ancientos_core::approvals::claim_release_token(

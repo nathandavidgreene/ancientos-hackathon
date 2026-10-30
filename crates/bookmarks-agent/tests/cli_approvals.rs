@@ -41,7 +41,10 @@ fn seed_at(
     log_path: &Path,
     now: u64,
 ) -> ancientos_core::approvals::ApprovalRequest {
-    let mut log = ancientos_core::log::DecisionLog::open(log_path).unwrap();
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .unwrap();
     ancientos_core::approvals::request(
         &mut log,
         &bookmarks_agent::app_gate(),
@@ -106,7 +109,9 @@ fn approve_records_decision_prints_release_ready_and_is_once_only() {
     let text = stdout(&out);
     assert!(text.contains(&r.id), "{text}");
     assert!(text.contains("release-ready"), "{text}");
-    let log_read = ancientos_core::log::DecisionLog::open(&log).unwrap();
+    let log_read =
+        ancientos_core::log::DecisionLog::open_with_key_env(&log, &|key| std::env::var(key).ok())
+            .unwrap();
     let entries = log_read.verify().unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[1].kind, "approval.approved");
@@ -123,7 +128,7 @@ fn approve_records_decision_prints_release_ready_and_is_once_only() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("already decided"), "{}", stderr(&out));
     assert_eq!(
-        ancientos_core::log::DecisionLog::open(&log)
+        ancientos_core::log::DecisionLog::open_with_key_env(&log, &|key| std::env::var(key).ok())
             .unwrap()
             .verify()
             .unwrap()
@@ -146,10 +151,11 @@ fn deny_records_reason_and_allows_empty_reason() {
     );
     let out = run(&["deny", &b.id], &log);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    let entries = ancientos_core::log::DecisionLog::open(&log)
-        .unwrap()
-        .verify()
-        .unwrap();
+    let entries =
+        ancientos_core::log::DecisionLog::open_with_key_env(&log, &|key| std::env::var(key).ok())
+            .unwrap()
+            .verify()
+            .unwrap();
     let denied: Vec<_> = entries
         .iter()
         .filter(|e| e.kind == "approval.denied")
@@ -172,7 +178,7 @@ fn approve_unknown_id_fails_without_logging() {
         stderr(&out)
     );
     assert_eq!(
-        ancientos_core::log::DecisionLog::open(&log)
+        ancientos_core::log::DecisionLog::open_with_key_env(&log, &|key| std::env::var(key).ok())
             .unwrap()
             .verify()
             .unwrap()
@@ -209,10 +215,11 @@ fn approve_now_records_fixed_clock_and_rejects_bad_clock() {
     let expected = bookmarks_agent::idea_card::parse_rfc3339(fixed).unwrap();
     let out = run(&["approve", &r.id, "--now", fixed], &log);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    let entries = ancientos_core::log::DecisionLog::open(&log)
-        .unwrap()
-        .verify()
-        .unwrap();
+    let entries =
+        ancientos_core::log::DecisionLog::open_with_key_env(&log, &|key| std::env::var(key).ok())
+            .unwrap()
+            .verify()
+            .unwrap();
     assert_eq!(entries[1].kind, "approval.approved");
     assert_eq!(entries[1].payload["decided_at"], expected);
     // Bad clocks fail closed without appending.
@@ -231,7 +238,7 @@ fn approve_now_records_fixed_clock_and_rejects_bad_clock() {
         assert!(!out.status.success(), "{args:?} must fail");
     }
     assert_eq!(
-        ancientos_core::log::DecisionLog::open(&log)
+        ancientos_core::log::DecisionLog::open_with_key_env(&log, &|key| std::env::var(key).ok())
             .unwrap()
             .verify()
             .unwrap()

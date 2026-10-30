@@ -323,7 +323,7 @@ fn first_bad_line(path: &Path) -> Option<usize> {
 /// failure yields unverified with `broken_at: None`. Args: the
 /// decision-log path; returns the triple; never fails.
 fn read_verified_entries(log_path: &Path) -> (Vec<Entry>, bool, Option<usize>) {
-    let log = match DecisionLog::open(log_path) {
+    let log = match DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok()) {
         Ok(log) => log,
         Err(LogError::Chain(n)) => return (Vec::new(), false, Some(n)),
         Err(LogError::Json(_)) => return (Vec::new(), false, first_bad_line(log_path)),
@@ -560,7 +560,7 @@ pub fn collect(log_path: &Path, muse_log_path: &Path, now: u64) -> Stats {
     if !verified {
         return Stats::broken(broken_at, muse_log);
     }
-    let Ok(log) = DecisionLog::open(log_path) else {
+    let Ok(log) = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok()) else {
         return Stats::broken(first_bad_line(log_path), muse_log);
     };
     let records = feedback_records(&entries);

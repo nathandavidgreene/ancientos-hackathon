@@ -12,3 +12,9 @@ doc comments are included. [Open in a new tab](api/index.html){ target=_blank }.
 
 The only Python in the repo is the docs tooling under `tools/`. Its reference
 is generated from the docstrings: [Python build tools](reference/python-tools.md).
+
+Decision-log signing: every application opens logs using `ANCIENTOS_LOG_KEY_PATH`.
+Unset preserves unsigned operation with a loud warning. A configured key must
+be at least 32 bytes and mode 0600. Existing unsigned logs cannot be opened
+in signed mode: retain the old log unchanged and configure a new log path
+when enabling signing. Restart the affected binaries after configuring it.

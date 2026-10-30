@@ -277,7 +277,10 @@ fn cmd_rank(args: &[String]) -> Result<(), String> {
         return Err("no bookmarks to rank".to_string());
     }
     let log_path = brief::decision_log_path()?;
-    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let log = ancientos_core::log::DecisionLog::open_with_key_env(&log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let records = bookmarks_agent::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
     let hidden_posts = bookmarks_agent::feedback::hidden_posts(&records);
     let hidden_authors = bookmarks_agent::feedback::hidden_authors(&records);
@@ -593,7 +596,10 @@ fn cmd_deeper_queue(args: &[String]) -> Result<(), String> {
         return Err(USAGE.to_string());
     }
     let log_path = brief::decision_log_path()?;
-    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let log = ancientos_core::log::DecisionLog::open_with_key_env(&log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let jobs = deeper::list_queue(&entries);
     if jobs.is_empty() {
@@ -767,7 +773,10 @@ fn cmd_try_pending(args: &[String]) -> Result<(), String> {
         return Err(USAGE.to_string());
     }
     let log_path = brief::decision_log_path()?;
-    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let log = ancientos_core::log::DecisionLog::open_with_key_env(&log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let pending = try_it::pending_followups(&log);
     let records = bookmarks_agent::feedback::records_from_log(&log).map_err(|e| e.to_string())?;
     let hidden = bookmarks_agent::feedback::hidden_authors(&records);
@@ -844,7 +853,10 @@ fn cmd_digest(args: &[String]) -> Result<(), String> {
     };
     let cards = idea_card::load(&idea_card::idea_cards_path()?)?;
     let log_path = brief::decision_log_path()?;
-    let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(&log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let pending = try_it::pending_followups(&log);
     let bookmarks = bookmarks_for_filtering();
@@ -876,7 +888,10 @@ fn cmd_approvals(args: &[String]) -> Result<(), String> {
         return Err(USAGE.to_string());
     }
     let log_path = brief::decision_log_path()?;
-    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let log = ancientos_core::log::DecisionLog::open_with_key_env(&log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let now = idea_card::now_secs();
     let list = ancientos_core::approvals::pending(&log, now).map_err(|e| e.to_string())?;
     if list.is_empty() {
@@ -961,7 +976,10 @@ fn parse_decide_args(args: &[String], is_deny: bool) -> Result<DecideArgs, Strin
 fn cmd_approve(args: &[String]) -> Result<(), String> {
     let parsed = parse_decide_args(args, false)?;
     let log_path = brief::decision_log_path()?;
-    let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(&log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let hash = stored_hash(&log, &parsed.id)?;
     let now = parsed.now.unwrap_or_else(idea_card::now_secs);
     let token = ancientos_core::approvals::approve(&mut log, &parsed.id, &hash, CLI_DECIDER, now)
@@ -977,7 +995,10 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
 fn cmd_deny(args: &[String]) -> Result<(), String> {
     let parsed = parse_decide_args(args, true)?;
     let log_path = brief::decision_log_path()?;
-    let mut log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(&log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let hash = stored_hash(&log, &parsed.id)?;
     let now = parsed.now.unwrap_or_else(idea_card::now_secs);
     ancientos_core::approvals::deny(

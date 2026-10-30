@@ -41,7 +41,7 @@ const NOW_RFC3339: &str = "2023-11-14T22:13:20Z";
 /// (which auto-write one threshold_change). Six entries, seq 0..=5.
 fn seed_mixed(path: &Path) {
     use ancientos_core::log::DecisionLog;
-    let mut log = DecisionLog::open(path).unwrap();
+    let mut log = DecisionLog::open_with_key_env(path, &|key| std::env::var(key).ok()).unwrap();
     log.append(
         "route",
         serde_json::json!({"to": "local", "pick_id": "syn-pick-1", "category": "SynRust"}),
@@ -76,7 +76,7 @@ fn seed_mixed(path: &Path) {
 /// Approval lifecycle log: one released, one denied, one pending.
 fn seed_approvals(path: &Path) -> (String, String, String) {
     use ancientos_core::log::DecisionLog;
-    let mut log = DecisionLog::open(path).unwrap();
+    let mut log = DecisionLog::open_with_key_env(path, &|key| std::env::var(key).ok()).unwrap();
     let a = ancientos_core::approvals::request(
         &mut log,
         &gate(),

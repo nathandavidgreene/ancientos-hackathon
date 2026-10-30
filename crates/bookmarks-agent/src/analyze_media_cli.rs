@@ -204,7 +204,10 @@ pub fn run(
         ));
     }
     let backend = make_backend(paid)?;
-    let mut log = DecisionLog::open(log_path(a.log.as_deref(), env)?).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path(a.log.as_deref(), env)?, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let gate = analyze_media::store_gate();
     for q in &reqs {
         let rep = analyze_media::analyze(&mut log, q, &rows, backend.as_ref(), paid)?;

@@ -248,7 +248,7 @@ pub fn page_list_with_env(
         return forbidden(state);
     }
     let path = resolve_log_path(&state.data_dir, env);
-    let log = match DecisionLog::open(&path) {
+    let log = match DecisionLog::open_with_key_env(&path, &|key| std::env::var(key).ok()) {
         Err(LogError::Chain(n)) => return tampered(n),
         Err(e) => return error(500, "Approvals failed", &e.to_string()),
         Ok(log) => log,
@@ -348,7 +348,7 @@ pub fn do_decide_with_env(
         _ => return error(400, "Bad request", "decision must be approve or deny."),
     };
     let path = resolve_log_path(&state.data_dir, env);
-    let mut log = match DecisionLog::open(&path) {
+    let mut log = match DecisionLog::open_with_key_env(&path, &|key| std::env::var(key).ok()) {
         Err(LogError::Chain(n)) => return tampered(n),
         Err(e) => return error(500, "Approvals failed", &e.to_string()),
         Ok(log) => log,

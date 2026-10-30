@@ -309,7 +309,7 @@ pub fn cli(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(), 
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| format!("log dir: {e}"))?;
     }
-    let mut log = DecisionLog::open(&path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&path, env).map_err(|e| e.to_string())?;
     let now = now_secs();
     let words: Vec<&str> = rest.iter().map(String::as_str).collect();
     match words.as_slice() {
@@ -563,6 +563,25 @@ mod tests {
         let c = live_client(&|k| (k == MODEL_ENV_VAR).then(|| "synthetic-wonder".into())).unwrap();
         assert_eq!(c.destination(), Destination::MuseWonder);
         assert!(c.complete("x").is_err());
+    }
+
+    #[test]
+    fn cli_requires_configured_signing_key_before_log_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let missing_key = dir.path().join("absent-key");
+        let env = |key: &str| {
+            (key == ancientos_core::log::LOG_KEY_ENV_VAR)
+                .then(|| missing_key.to_string_lossy().into_owned())
+        };
+        let args = vec![
+            "--log".into(),
+            path.to_string_lossy().into_owned(),
+            "propose".into(),
+            "what if".into(),
+        ];
+        assert!(cli(&args, &env).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

@@ -729,7 +729,8 @@ pub fn classify_after_import() -> Result<ClassifyReport, String> {
     let queries_path = label_queries_path()?;
     let path = classify_path()?;
     let log_path = crate::brief::decision_log_path()?;
-    let mut log = DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     if !allow_paid {
         let gates = ClassifyGates {
             allow_paid: false,

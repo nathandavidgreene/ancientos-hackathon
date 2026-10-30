@@ -106,7 +106,7 @@ impl Workspace {
     }
     /// Open the decision log.
     fn log(&self) -> Result<DecisionLog, String> {
-        DecisionLog::open(self.log_path()).map_err(err)
+        DecisionLog::open_with_key_env(self.log_path(), &|key| std::env::var(key).ok()).map_err(err)
     }
 
     /// Offline "sync": copy new rows from a fixture into the store. Never drops rows.
@@ -399,9 +399,10 @@ impl Workspace {
 
     /// Verify the log, then tamper a copy and show verification fails closed.
     pub fn tamper_demo(&self) -> Result<TamperDemo, String> {
-        let entries = DecisionLog::open(self.log_path())
-            .and_then(|l| l.verify())
-            .map_err(|e| e.to_string())?;
+        let entries =
+            DecisionLog::open_with_key_env(self.log_path(), &|key| std::env::var(key).ok())
+                .and_then(|l| l.verify())
+                .map_err(|e| e.to_string())?;
         let count = entries.len();
         let body = std::fs::read_to_string(self.log_path()).map_err(err)?;
         // Deterministic single-line tamper: flip the first kind value.
@@ -417,7 +418,11 @@ impl Workspace {
             tampered
         };
         std::fs::write(self.tampered_path(), tampered).map_err(err)?;
-        let failure = match DecisionLog::open(self.tampered_path()).and_then(|l| l.verify()) {
+        let failure = match DecisionLog::open_with_key_env(self.tampered_path(), &|key| {
+            std::env::var(key).ok()
+        })
+        .and_then(|l| l.verify())
+        {
             Ok(_) => "unexpectedly verified".to_string(),
             Err(e) => e.to_string(),
         };
@@ -864,7 +869,8 @@ impl Workspace {
         if tick.proposed.is_empty() && tick.waiting.is_empty() {
             return Err(format!("approvals demo: expected a proposal, got {tick:?}"));
         }
-        let log = DecisionLog::open(self.log_path()).map_err(err)?;
+        let log = DecisionLog::open_with_key_env(self.log_path(), &|key| std::env::var(key).ok())
+            .map_err(err)?;
         let payload = daemon::deeper_paid_payload(post_id, now);
         let payload_hash = approvals::canonical_hash(&approvals::redact(&payload));
         let pending = approvals::pending(&log, now).map_err(err)?;
@@ -926,7 +932,8 @@ impl Workspace {
                 "approvals demo: expected exactly one paid execution, got {tick:?}"
             ));
         }
-        let log = DecisionLog::open(self.log_path()).map_err(err)?;
+        let log = DecisionLog::open_with_key_env(self.log_path(), &|key| std::env::var(key).ok())
+            .map_err(err)?;
         let payload = daemon::deeper_paid_payload(post_id, now);
         let payload_hash = approvals::canonical_hash(&approvals::redact(&payload));
         let decided = approvals::decided(&log, now).map_err(err)?;
@@ -957,9 +964,10 @@ impl Workspace {
     /// Approval log excerpt for the demo: the requested/approved/released
     /// triple in log order plus the verified total.
     pub fn approvals_chain(&self) -> Result<ApprovalsChain, String> {
-        let entries = DecisionLog::open(self.log_path())
-            .and_then(|l| l.verify())
-            .map_err(err)?;
+        let entries =
+            DecisionLog::open_with_key_env(self.log_path(), &|key| std::env::var(key).ok())
+                .and_then(|l| l.verify())
+                .map_err(err)?;
         let total = entries.len();
         let mut kinds = Vec::new();
         for e in &entries {

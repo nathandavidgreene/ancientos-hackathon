@@ -86,7 +86,8 @@ pub fn run_vote(
         None
     };
     ensure_log_dir(log_path)?;
-    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     // For never_author the record id is the username (see hidden_authors).
     let pick_id = author.clone().unwrap_or_else(|| post_id.to_string());
     feedback::record(
@@ -134,7 +135,8 @@ pub fn run_unhide_author(username: &str, log_path: &Path) -> Result<String, Stri
         return Err("username must be non-empty".to_string());
     }
     ensure_log_dir(log_path)?;
-    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     feedback::record(
         &mut log,
         FeedbackRecord {
@@ -152,7 +154,8 @@ pub fn run_unhide_author(username: &str, log_path: &Path) -> Result<String, Stri
 /// Currently hidden authors from the decision log (normalized, sorted).
 /// A missing log means none; a tampered log is an error (fail closed).
 pub fn list_hidden_authors(log_path: &Path) -> Result<BTreeSet<String>, String> {
-    let log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let records = feedback::records_from_log(&log).map_err(|e| e.to_string())?;
     Ok(feedback::hidden_authors(&records))
 }

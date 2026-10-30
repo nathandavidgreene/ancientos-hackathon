@@ -250,7 +250,8 @@ pub fn brief_tick(ctx: &AgentCtx, now: u64, paid: bool) -> Result<BriefTick, Str
     let result =
         crate::brief::run_local_full(&merged, &ctx.log_path, &date, None, None, true, None, now)?;
     let proposed = if paid {
-        let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+        let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+            .map_err(|e| e.to_string())?;
         let req = approvals::request(
             &mut log,
             &crate::app_gate(),
@@ -291,7 +292,8 @@ pub struct DigestTick {
 /// called, so a daemon tick never resets the due check.
 pub fn digest_tick(ctx: &AgentCtx, now: u64) -> Result<DigestTick, String> {
     let cards = crate::idea_card::load(&ctx.cards_path)?;
-    let log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let pending = crate::try_it::pending_followups(&log);
     // Unreadable store means no filtering (read-only listing never fails).
@@ -311,7 +313,8 @@ pub fn digest_tick(ctx: &AgentCtx, now: u64) -> Result<DigestTick, String> {
 /// ([`crate::try_it::pending_followups`]) plus a [`TRY_FOLLOWUP_KIND`]
 /// entry carrying the count. Returns the due post ids.
 pub fn try_followup_tick(ctx: &AgentCtx, now: u64) -> Result<Vec<String>, String> {
-    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let pending = crate::try_it::pending_followups(&log);
     log.append(
         TRY_FOLLOWUP_KIND,
@@ -323,7 +326,8 @@ pub fn try_followup_tick(ctx: &AgentCtx, now: u64) -> Result<Vec<String>, String
 
 /// Expiry sweep: [`approvals::sweep_expired`]. Returns entries appended.
 pub fn approvals_sweep_tick(ctx: &AgentCtx, now: u64) -> Result<usize, String> {
-    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     approvals::sweep_expired(&mut log, now).map_err(|e| e.to_string())
 }
 
@@ -476,7 +480,8 @@ pub fn deeper_queue_tick_with(
     fetch_post: &crate::deeper::PostFetcher<'_>,
     call: &crate::deeper::DeeperMuseCaller<'_>,
 ) -> Result<DeeperQueueTick, String> {
-    let log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let jobs = crate::deeper::due_jobs(&entries, now);
     let mut out = DeeperQueueTick::default();
@@ -499,7 +504,10 @@ pub fn deeper_queue_tick_with(
                 Ok(_) => {
                     // run_with appended through its own handle; reopen before
                     // marking done so the chain stays contiguous.
-                    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+                    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| {
+                        std::env::var(key).ok()
+                    })
+                    .map_err(|e| e.to_string())?;
                     log.append(
                         crate::deeper::DEEPER_QUEUE_DONE_KIND,
                         serde_json::json!({
@@ -516,7 +524,9 @@ pub fn deeper_queue_tick_with(
         }
         if guard.tripped().is_some() || guard.step(&job.post_id, true, now).is_err() {
             if out.guard_resume.is_none() {
-                let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+                let mut log =
+                    DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+                        .map_err(|e| e.to_string())?;
                 let req = loop_guard::propose_resume(
                     &mut log,
                     &crate::app_gate(),
@@ -583,7 +593,8 @@ fn paid_job_step(
     fetch_post: &crate::deeper::PostFetcher<'_>,
     call: &crate::deeper::DeeperMuseCaller<'_>,
 ) -> Result<PaidStep, String> {
-    let log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let payload_hash = approvals::canonical_hash(&approvals::redact(payload));
     let pending: Vec<approvals::Approval> = approvals::pending(&log, now)
         .map_err(|e| e.to_string())?
@@ -627,7 +638,8 @@ fn paid_job_step(
     if let Some(a) = approved {
         let id = a.request.id.clone();
         let hash = a.request.payload_hash.clone();
-        let log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+        let log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+            .map_err(|e| e.to_string())?;
         let token = match approvals::claim_release_token(&log, &id, &hash) {
             Ok(t) => t,
             Err(e) => return Ok(PaidStep::Failed(format!("claim failed: {e}"))),
@@ -658,7 +670,8 @@ fn paid_job_step(
     // itself is never executed: every execution consumes a fresh token in
     // `execute_paid`, so a retry after a crash or a failed paid run needs a
     // fresh human approval.
-    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let req = match approvals::request(
         &mut log,
         &crate::app_gate(),
@@ -686,7 +699,8 @@ fn ensure_proposed(
     if job.status == crate::deeper::QueueStatus::Proposed {
         return Ok(());
     }
-    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     log.append(
         crate::deeper::DEEPER_PROPOSED_KIND,
         serde_json::json!({
@@ -708,7 +722,8 @@ fn mark_paid_done(
     job: &crate::deeper::QueuedJob,
     now: u64,
 ) -> Result<PaidStep, String> {
-    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     if let Err(e) = log.append(
         crate::deeper::DEEPER_QUEUE_DONE_KIND,
         serde_json::json!({
@@ -746,7 +761,8 @@ fn execute_paid(
     fetch_post: &crate::deeper::PostFetcher<'_>,
     call: &crate::deeper::DeeperMuseCaller<'_>,
 ) -> Result<PaidStep, String> {
-    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     if let Err(e) = approvals::release(&mut log, token, payload) {
         return Ok(PaidStep::Failed(format!("release failed: {e}")));
     }
@@ -772,7 +788,8 @@ fn execute_paid(
     // run_with appended through its own handle; reopen before marking done
     // so the chain stays contiguous. job.done first: a crash before the
     // queue marker still heals without re-running the side effect.
-    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     if let Err(e) = log.append(
         JOB_DONE_KIND,
         job_done_payload(approval_id, payload_hash, &job.post_id, job.at, now),
@@ -1044,7 +1061,8 @@ pub fn log_tick(
     result: &Result<(), String>,
     now: u64,
 ) -> Result<(), String> {
-    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let mut payload = serde_json::json!({"agent": agent, "ok": result.is_ok(), "at": now});
     if let Err(e) = result {
         payload["error"] = serde_json::json!(e);

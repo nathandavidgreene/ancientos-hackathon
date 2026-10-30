@@ -97,7 +97,9 @@ impl Workspace {
         let dir = self.dir.join(STUB_DIR);
         let (p1, p2) = write_stub_repo(&dir)?;
         let now = approvals_demo_now() + 3600;
-        let mut log = DecisionLog::open(self.log_path()).map_err(|e| e.to_string())?;
+        let mut log =
+            DecisionLog::open_with_key_env(self.log_path(), &|key| std::env::var(key).ok())
+                .map_err(|e| e.to_string())?;
         let unknown_action_refusal = ancientos_core::approvals::request(
             &mut log,
             &muse_runs::app_gate(),

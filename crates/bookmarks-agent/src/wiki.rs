@@ -1257,7 +1257,9 @@ pub struct IngestReport {
 /// class is allowed (and the decision was recorded); a log failure fails
 /// closed to false.
 fn egress_allowed(log_path: &Path, class: DataClass) -> bool {
-    match ancientos_core::log::DecisionLog::open(log_path) {
+    match ancientos_core::log::DecisionLog::open_with_key_env(log_path, &|key| {
+        std::env::var(key).ok()
+    }) {
         Ok(mut log) => check_egress(class, Route::MuseSpark, "wiki", Some(&mut log)).is_ok(),
         Err(_) => false,
     }
@@ -1266,7 +1268,9 @@ fn egress_allowed(log_path: &Path, class: DataClass) -> bool {
 /// Record the refused hosted egress for a non-public ingest (best-effort:
 /// the ingest itself stays fail-open to the local model or the fallback).
 fn log_refused_egress(log_path: &Path, class: DataClass) {
-    if let Ok(mut log) = ancientos_core::log::DecisionLog::open(log_path) {
+    if let Ok(mut log) = ancientos_core::log::DecisionLog::open_with_key_env(log_path, &|key| {
+        std::env::var(key).ok()
+    }) {
         let _ = check_egress(class, Route::MuseSpark, "wiki", Some(&mut log));
     }
 }
@@ -1442,7 +1446,10 @@ fn append_ingest(
         .and_then(|n| n.to_str())
         .unwrap_or("raw.md")
         .to_string();
-    let mut log = ancientos_core::log::DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     log.append(
         WIKI_INGEST_KIND,
         serde_json::json!({
@@ -1509,7 +1516,10 @@ pub fn queue_ingest(
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = ancientos_core::log::DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     append_queued(&mut log, reason, ref_id, post_id, now)
 }
 
@@ -1677,7 +1687,10 @@ pub fn ingest_post(post_id: &str) -> Result<IngestReport, String> {
 /// returned together so one bad post never stops the rest.
 pub fn ingest_delegated() -> Result<Vec<IngestReport>, String> {
     let log_path = crate::brief::decision_log_path()?;
-    let log = ancientos_core::log::DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let log = ancientos_core::log::DecisionLog::open_with_key_env(&log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let cards = crate::idea_card::load(&crate::idea_card::idea_cards_path()?)?;
     let ids = delegated_post_ids(&entries, &cards);
@@ -1777,7 +1790,10 @@ fn log_line_for(entry: &ancientos_core::log::Entry) -> Option<String> {
 /// the missing suffix is appended. Any divergence is an error (fail closed,
 /// never rewrite history). Returns the appended line count.
 pub fn sync_log_md(log_path: &Path, wiki: &Path) -> Result<usize, String> {
-    let log = ancientos_core::log::DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let log = ancientos_core::log::DecisionLog::open_with_key_env(log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let expected: Vec<String> = entries.iter().filter_map(log_line_for).collect();
     let path = wiki.join(LOG_FILE_NAME);
@@ -2027,7 +2043,10 @@ pub fn file_back(
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = ancientos_core::log::DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     log.append(
         WIKI_FILEBACK_KIND,
         serde_json::json!({
@@ -2330,7 +2349,10 @@ pub fn lint_and_propose(wiki: &Path, log_path: &Path, now: u64) -> Result<LintRe
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = ancientos_core::log::DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = ancientos_core::log::DecisionLog::open_with_key_env(log_path, &|key| {
+        std::env::var(key).ok()
+    })
+    .map_err(|e| e.to_string())?;
     let mut approvals = Vec::new();
     for f in &findings {
         let req = ancientos_core::approvals::request(

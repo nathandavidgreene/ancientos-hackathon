@@ -411,7 +411,9 @@ fn now_secs() -> u64 {
 /// `hidden_authors_of`: a missing or unreadable log reads as zero
 /// (tampering is surfaced on `/approvals` and `/log` instead).
 fn pending_count(state: &State) -> usize {
-    let Ok(log) = ancientos_core::log::DecisionLog::open(state.log_path()) else {
+    let Ok(log) = ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
+        std::env::var(key).ok()
+    }) else {
         return 0;
     };
     ancientos_core::approvals::pending(&log, now_secs())
@@ -629,7 +631,10 @@ fn try_it_html(b: &Bookmark, text: &str) -> String {
 /// `hidden_authors_of`: a missing or unreadable log, or too few labels,
 /// renders no section at all.
 fn rank_reasons_html(state: &State, bm: &Bookmark) -> Option<String> {
-    let log = ancientos_core::log::DecisionLog::open(state.log_path()).ok()?;
+    let log = ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
+        std::env::var(key).ok()
+    })
+    .ok()?;
     let ranker =
         bookmarks_agent::ranker::Ranker::train_from_log(&log, &state.all_bookmarks).ok()?;
     if !ranker.is_active() {
@@ -650,7 +655,9 @@ fn rank_reasons_html(state: &State, bm: &Bookmark) -> Option<String> {
 /// Best-effort like `mark_shown` below: a missing or unreadable log means
 /// no hides (tampering is still surfaced on `/log`).
 fn hidden_authors_of(state: &State) -> BTreeSet<String> {
-    let Ok(log) = ancientos_core::log::DecisionLog::open(state.log_path()) else {
+    let Ok(log) = ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
+        std::env::var(key).ok()
+    }) else {
         return BTreeSet::new();
     };
     let Ok(records) = bookmarks_agent::feedback::records_from_log(&log) else {
@@ -667,7 +674,11 @@ fn visible_bookmarks(state: &State) -> Vec<Bookmark> {
 /// Mark a rendered tagged pick as shown (metadata only), once: entries
 /// already in the log are never duplicated.
 fn mark_shown(state: &State, post_id: &str) {
-    let Ok(mut log) = ancientos_core::log::DecisionLog::open(state.log_path()) else {
+    let Ok(mut log) =
+        ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
+            std::env::var(key).ok()
+        })
+    else {
         return;
     };
     let shown: bool = log.verify_or_empty().unwrap_or_default().iter().any(|e| {
@@ -925,10 +936,13 @@ fn do_triage(state: &State, body: &[u8]) -> Response {
 
 /// `/try` page.
 fn page_try(state: &State) -> Response {
-    let pending: Vec<String> = match ancientos_core::log::DecisionLog::open(state.log_path()) {
-        Ok(log) => bookmarks_agent::try_it::pending_followups(&log),
-        Err(_) => Vec::new(),
-    };
+    let pending: Vec<String> =
+        match ancientos_core::log::DecisionLog::open_with_key_env(state.log_path(), &|key| {
+            std::env::var(key).ok()
+        }) {
+            Ok(log) => bookmarks_agent::try_it::pending_followups(&log),
+            Err(_) => Vec::new(),
+        };
     // Dead posts get no UI mention: skip pending ids with a fresh
     // `unavailable` liveness-cache entry (read-only reuse, no network).
     // Unknown ids are kept (they show "(not in store)"). Hidden authors the
@@ -1010,7 +1024,9 @@ fn do_try(state: &State, body: &[u8]) -> Response {
 /// `/hidden-authors` page.
 fn page_hidden_authors(state: &State) -> Response {
     use ancientos_core::log::{DecisionLog, LogError};
-    let hidden = match DecisionLog::open(state.log_path()) {
+    let hidden = match DecisionLog::open_with_key_env(state.log_path(), &|key| {
+        std::env::var(key).ok()
+    }) {
         Err(LogError::Chain(n)) => {
             return Response::ok(layout(
                 "Hidden authors",
@@ -1085,7 +1101,8 @@ fn tampered_page(row: usize, state: &State) -> Response {
 /// `/log` page.
 fn page_log(state: &State) -> Response {
     use ancientos_core::log::{DecisionLog, LogError};
-    let log = match DecisionLog::open(state.log_path()) {
+    let log = match DecisionLog::open_with_key_env(state.log_path(), &|key| std::env::var(key).ok())
+    {
         Err(LogError::Chain(n)) => return tampered_page(n, state),
         Err(e) => {
             return Response::status(500, error_page("Log failed", &e.to_string(), state));
@@ -1457,7 +1474,8 @@ fn tampered_approvals_page(row: usize, state: &State) -> Response {
 fn page_approvals(state: &State) -> Response {
     use ancientos_core::approvals::{decided, pending, ApprovalError};
     use ancientos_core::log::{DecisionLog, LogError};
-    let log = match DecisionLog::open(state.log_path()) {
+    let log = match DecisionLog::open_with_key_env(state.log_path(), &|key| std::env::var(key).ok())
+    {
         Err(LogError::Chain(n)) => return tampered_approvals_page(n, state),
         Err(e) => {
             return Response::status(500, error_page("Approvals failed", &e.to_string(), state));
@@ -1559,7 +1577,9 @@ fn decide_approval(state: &State, body: &[u8], approve_it: bool) -> Response {
             error_page("Bad approval", "Missing payload_hash.", state),
         );
     }
-    let mut log = match DecisionLog::open(state.log_path()) {
+    let mut log = match DecisionLog::open_with_key_env(state.log_path(), &|key| {
+        std::env::var(key).ok()
+    }) {
         Err(LogError::Chain(n)) => return tampered_approvals_page(n, state),
         Err(e) => {
             return Response::status(500, error_page("Approvals failed", &e.to_string(), state));

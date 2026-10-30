@@ -149,7 +149,8 @@ pub fn queue_later_at_path(
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     queue_later(&mut log, post_id, at, now)
 }
 
@@ -1404,7 +1405,8 @@ pub fn run_with(
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     let (pt, ct, tt) = match &usage {
         Some(u) => (u.prompt_tokens, u.completion_tokens, u.total_tokens),
         None => (None, None, None),
@@ -1490,7 +1492,8 @@ pub fn run(post_id: &str, offline: Option<&str>) -> Result<DeeperResult, String>
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = DecisionLog::open(&log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(&log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     run_with(
         post_id,
         allow_paid,
@@ -1530,7 +1533,8 @@ pub fn run_paid_with_paths(
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     run_with(
         post_id,
         true,

@@ -552,7 +552,8 @@ pub fn run_tried(
                 .map_err(|e| format!("log dir failed: {e}"))?;
         }
     }
-    let mut log = DecisionLog::open(log_path).map_err(|e| e.to_string())?;
+    let mut log = DecisionLog::open_with_key_env(log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
     record_followup(&mut log, post_id, tried, note)
 }
 

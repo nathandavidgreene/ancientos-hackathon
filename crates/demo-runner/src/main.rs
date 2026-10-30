@@ -98,9 +98,10 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("auto-approved categories: {:?}", ws.auto_approved(p)?)
         }
         [c] if c == "log" => {
-            let entries = DecisionLog::open(ws.log_path())
-                .and_then(|l| l.verify())
-                .map_err(|e| e.to_string())?;
+            let entries =
+                DecisionLog::open_with_key_env(ws.log_path(), &|key| std::env::var(key).ok())
+                    .and_then(|l| l.verify())
+                    .map_err(|e| e.to_string())?;
             for e in &entries {
                 println!("  #{:<3} {:<16} {}", e.seq, e.kind, e.payload);
             }
@@ -169,7 +170,7 @@ fn run(args: &[String]) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?;
             // Log the routing decision (metadata only, never the prompt text).
-            DecisionLog::open(ws.log_path())
+            DecisionLog::open_with_key_env(ws.log_path(), &|key| std::env::var(key).ok())
                 .and_then(|mut l| {
                     l.append(
                         "route",
