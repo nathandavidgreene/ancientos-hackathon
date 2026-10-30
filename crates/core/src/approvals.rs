@@ -721,11 +721,17 @@ pub fn claim_release_token(
 /// so callers pass the original payload) and requires the request to be
 /// currently Approved: a second release for the same id fails on the log
 /// check. Appends `approval.released`. Callers execute only after `Ok`.
+///
+/// Cross-process safe: holds the log's exclusive lock across the
+/// already-released check and the release write, so two processes racing to
+/// release the same approval yield exactly one success. A lock failure fails
+/// closed: nothing is written and the token is consumed without effect.
 pub fn release(
     log: &mut DecisionLog,
     token: ReleaseToken,
     payload: &serde_json::Value,
 ) -> Result<(), ApprovalError> {
+    let guard = log.acquire_lock()?;
     let a = get(log, &token.approval_id)?;
     match a.status {
         Status::Approved => {}
@@ -743,12 +749,13 @@ pub fn release(
     if canonical_hash(&redact(payload)) != a.request.payload_hash {
         return Err(ApprovalError::HashMismatch(a.request.id));
     }
-    log.append(
+    log.append_locked(
         RELEASED_KIND,
         serde_json::json!({
             "id": a.request.id,
             "payload_hash": a.request.payload_hash,
         }),
+        &guard,
     )?;
     Ok(())
 }

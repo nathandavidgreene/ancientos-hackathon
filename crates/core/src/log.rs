@@ -3,8 +3,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+/// Failures from opening, appending to, or verifying a [`DecisionLog`].
+///
+/// A [`LogError::Lock`] failure is fail-closed: nothing was written and the
+/// caller's in-memory head is unchanged. Callers must surface the error, not
+/// retry as an unlocked write.
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
     #[error("io: {0}")]
@@ -13,6 +20,10 @@ pub enum LogError {
     Json(#[from] serde_json::Error),
     #[error("chain broken at line {0}")]
     Chain(usize),
+    /// The exclusive log lock could not be acquired, a lock syscall failed,
+    /// or a guard for another log was passed: nothing was written.
+    #[error("lock: {0}")]
+    Lock(String),
 }
 
 /// Read-only load failure: either the file could not be read at all, or the
@@ -85,6 +96,89 @@ fn digest(seq: u64, prev: &str, kind: &str, payload: &serde_json::Value) -> Stri
     hex::encode(h.finalize())
 }
 
+/// How long a writer waits for the exclusive log lock before failing closed.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for the exclusive log lock.
+const LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// Sibling lock file for a log path: `<path>.lock`, created on first use.
+///
+/// The lock lives beside the log (rather than on the log file itself) so its
+/// lifecycle is independent of log creation and of the read-only opens in
+/// [`DecisionLog::verify`]: only writers take it, always exclusively.
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// Exclusive advisory (`flock`, `LOCK_EX`) lock on one decision log.
+///
+/// One guard covers one critical section (read-tail, hash, write, fsync).
+/// The lock is cross-process: a second process waits (bounded, see
+/// [`DecisionLog::acquire_lock`]) until the guard is dropped. Dropping
+/// releases the lock; closing the handle releases it even if `LOCK_UN` fails.
+#[derive(Debug)]
+pub struct LogLock {
+    /// Open handle to the sibling `.lock` file; the `flock` is tied to it.
+    file: File,
+    /// Which lock file this guard holds, so a mismatched guard fails closed.
+    path: PathBuf,
+}
+
+impl Drop for LogLock {
+    /// Release the advisory lock (best effort; close releases it anyway).
+    fn drop(&mut self) {
+        // SAFETY: `flock` on a live open fd has no memory effects. The
+        // result is ignored: closing `file` right after releases the lock.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Acquire an exclusive advisory lock on `lock_path`, polling at most
+/// `LOCK_TIMEOUT`. Any `flock` error or timeout fails closed with
+/// [`LogError::Lock`]; there is no unlocked fallback.
+fn acquire_exclusive(lock_path: &Path) -> Result<LogLock, LogError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        // The lock file holds no data (only the flock); never truncate it.
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|e| LogError::Lock(format!("cannot open {}: {e}", lock_path.display())))?;
+    let fd = file.as_raw_fd();
+    let start = Instant::now();
+    loop {
+        // SAFETY: `flock` on a live open fd has no memory effects.
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(LogLock {
+                file,
+                path: lock_path.to_path_buf(),
+            });
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(LogError::Lock(format!(
+                "flock {}: {err}",
+                lock_path.display()
+            )));
+        }
+        if start.elapsed() >= LOCK_TIMEOUT {
+            return Err(LogError::Lock(format!(
+                "timed out waiting for {}",
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
+/// Append-only decision log: one hash-chained JSONL file plus its lock.
 #[derive(Debug)]
 pub struct DecisionLog {
     path: PathBuf,
@@ -110,13 +204,48 @@ impl DecisionLog {
         Ok(log)
     }
 
+    /// Acquire this log's exclusive advisory lock (the sibling `.lock` file).
+    ///
+    /// Lets one writer hold a single critical section across several steps
+    /// (see [`DecisionLog::append_locked`]). Fails closed with
+    /// [`LogError::Lock`] on any lock error; never returns an unlocked guard.
+    pub fn acquire_lock(&self) -> Result<LogLock, LogError> {
+        acquire_exclusive(&lock_path_for(&self.path))
+    }
+
     /// Append one entry. The file is only ever opened in append mode.
+    ///
+    /// Cross-process safe: holds the exclusive advisory lock for the whole
+    /// read-tail / hash / write / fsync sequence and re-reads the on-disk
+    /// head under the lock, so concurrent appenders form one unbroken hash
+    /// chain instead of forking from a stale in-memory head. A lock failure
+    /// or a broken on-disk chain fails closed: nothing is written.
     ///
     /// The payload is redacted ([`crate::redact::redact_json`]) before hashing
     /// and writing, so secrets never enter the hash chain or the file. When
     /// anything was redacted, object payloads gain a `redacted` field listing
     /// the kinds found; clean payloads are stored byte-identical.
     pub fn append(&mut self, kind: &str, payload: serde_json::Value) -> Result<Entry, LogError> {
+        let guard = self.acquire_lock()?;
+        self.append_locked(kind, payload, &guard)
+    }
+
+    /// Append one entry while holding `guard` from [`DecisionLog::acquire_lock`].
+    ///
+    /// Same write as [`DecisionLog::append`], but the caller supplies the
+    /// lock: multi-step writers (e.g. `crate::approvals::release`) hold one
+    /// guard across check-then-append so two processes cannot interleave.
+    /// The guard must be for this same log; a mismatched guard, a lock
+    /// failure, or a broken on-disk chain fails closed with no write.
+    pub fn append_locked(
+        &mut self,
+        kind: &str,
+        payload: serde_json::Value,
+        guard: &LogLock,
+    ) -> Result<Entry, LogError> {
+        if guard.path != lock_path_for(&self.path) {
+            return Err(LogError::Lock("guard is for a different log".to_string()));
+        }
         let (mut payload, hits) = crate::redact::redact_json(&payload);
         if !hits.is_empty() {
             if let Some(obj) = payload.as_object_mut() {
@@ -136,6 +265,18 @@ impl DecisionLog {
                         obj.insert("redacted".to_string(), serde_json::Value::Array(kinds));
                     }
                 }
+            }
+        }
+        // Re-read the on-disk head under the lock: another process may have
+        // appended since this handle last wrote. A broken chain fails closed.
+        match self.verify_or_empty()?.last() {
+            Some(last) => {
+                self.next_seq = last.seq + 1;
+                self.last_hash = last.hash.clone();
+            }
+            None => {
+                self.next_seq = 0;
+                self.last_hash = GENESIS.into();
             }
         }
         let hash = digest(self.next_seq, &self.last_hash, kind, &payload);
@@ -330,5 +471,25 @@ mod tests {
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.contains("\"total_tokens\":150"), "{raw}");
         assert!(!raw.contains("redacted"), "{raw}");
+    }
+
+    /// Appending while the sibling lock path is unusable fails closed: the
+    /// write returns a lock error and leaves no log file behind. Once the
+    /// lock path is usable again, appends work and the chain verifies.
+    #[test]
+    fn append_fails_closed_when_lock_file_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d.jsonl");
+        // A directory at the lock path makes the lock open fail (EISDIR).
+        let lock_dir = dir.path().join("d.jsonl.lock");
+        std::fs::create_dir(&lock_dir).unwrap();
+        let mut log = DecisionLog::open(&p).unwrap();
+        let err = log.append("a", json!(1)).unwrap_err();
+        assert!(matches!(err, LogError::Lock(_)), "{err}");
+        assert!(!p.exists(), "failed append must write nothing");
+        // Recovery: with the lock path usable again, appends work and verify.
+        std::fs::remove_dir(&lock_dir).unwrap();
+        log.append("a", json!(1)).unwrap();
+        assert_eq!(log.verify().unwrap().len(), 1);
     }
 }

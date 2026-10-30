@@ -74,3 +74,22 @@ missing value fails closed. It sends `reasoning_effort: low`, reads
 `message.content` (not the reasoning), and treats a reply cut off at the token
 limit as an error. In a live one-image test it returned the same letter
 findings as Muse with about 1.6K input tokens (Muse: about 29K) in about 5s.
+
+## Thumbnails
+
+`bookmarks-agent::thumbs` makes sharp 240px thumbnails from the stored
+bookmark media (same `media.rs` model: photos use the image itself, videos
+and GIFs prefer the poster, else the first frame via local `/usr/bin/ffmpeg`):
+
+```
+cargo run -q -p bookmarks-agent --bin thumbs -- [--rows FILE] [--out-dir DIR]
+```
+
+240px on the long edge (Lanczos3 plus a light unsharp mask, never upscaled),
+JPEG quality 85, or PNG when the source has alpha. Output defaults to
+`~/.ancientos-hackathon/eval-private/thumbs/` (dir 0700, files 0600,
+overridable by `--out-dir` / `ANCIENTOS_THUMBS_DIR`), with a `manifest.jsonl`
+of `{post_id, index, kind, path, width, height}` or `{..., skipped: reason}`
+per item — no post text. Muted posts are skipped via the shared
+`topic_mute` list (fail closed when unreadable), downloads are incremental
+and bounded to X media hosts only, and no paid calls are made.

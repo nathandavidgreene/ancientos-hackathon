@@ -86,6 +86,13 @@ sequenceDiagram
   Note over Q,L: undecided past expires_at reads as Expired;<br/>approvals_sweep records approval.expired.<br/>Denied or expired proposals never execute.
 ```
 
+Phone approvals (`/m`) read the same queue from a resolved log path:
+`$DECISION_LOG_PATH` when set and non-empty, else
+`<--data dir>/decision_log.jsonl` (`$ANCIENTOS_HOME` is not consulted: the
+`--data` dir is the server's workspace root). A missing, unreadable or
+malformed log fails closed — a 500 with no queue and no approve buttons,
+and refused decides — instead of an empty "nothing pending" list.
+
 The daemon's six agents, each ticking on its own interval. One agent's error
 never stops the others; every tick appends a `daemon.tick` entry.
 

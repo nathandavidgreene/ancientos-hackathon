@@ -19,7 +19,9 @@
 //! deployer's job (for example a tailnet-only reverse proxy).
 use crate::{escape, now_secs, parse_body, Request, Response, State};
 use ancientos_core::approvals::{self, ApprovalError};
-use ancientos_core::log::{DecisionLog, LogError};
+use ancientos_core::log::{DecisionLog, Entry, LogError};
+use bookmarks_agent::brief::{DECISION_LOG_ENV_VAR, DECISION_LOG_FILE_NAME};
+use std::path::{Path, PathBuf};
 
 /// Decider recorded for phone decisions.
 pub const PHONE_DECIDER: &str = "phone";
@@ -103,10 +105,27 @@ fn authorized(state: &State, cookie: Option<&str>, k: Option<&String>) -> bool {
 
 /// `Set-Cookie` value remembering `token` for [`COOKIE_MAX_AGE`] seconds.
 fn login_cookie(token: &str) -> String {
+    login_cookie_scoped(token, "/m")
+}
+
+/// `Set-Cookie` value remembering `token` for [`COOKIE_MAX_AGE`] seconds,
+/// scoped to `path` (the labels page logs in separately under `/labels`).
+pub fn login_cookie_scoped(token: &str, path: &str) -> String {
     format!(
-        "{COOKIE_NAME}={}; HttpOnly; Secure; SameSite=Strict; Path=/m; Max-Age={COOKIE_MAX_AGE}",
+        "{COOKIE_NAME}={}; HttpOnly; Secure; SameSite=Strict; Path={path}; Max-Age={COOKIE_MAX_AGE}",
         percent_encode(token)
     )
+}
+
+/// True when `given` matches the configured token (constant-time).
+pub fn token_valid(state: &State, given: &str) -> bool {
+    token_ok(state, Some(given))
+}
+
+/// True when the request's [`COOKIE_NAME`] cookie matches the configured
+/// token (constant-time, see `token_ok`).
+pub fn cookie_authorized(state: &State, req: &Request) -> bool {
+    token_ok(state, cookie_token(req.cookie.as_deref()).as_deref())
 }
 
 /// Full mobile page with the given title and body.
@@ -148,6 +167,46 @@ fn error(status: u16, title: &str, msg: &str) -> Response {
     )
 }
 
+/// Phone approvals log path, resolved without touching the filesystem:
+///
+/// 1. `$DECISION_LOG_PATH` when set and non-empty (explicit override wins,
+///    matching `bookmarks-agent::brief::decision_log_path` and the
+///    `wonder`/`analyze_media` CLIs);
+/// 2. otherwise `<data_dir>/decision_log.jsonl`.
+///
+/// `$ANCIENTOS_HOME` is deliberately not consulted: the `--data` dir is this
+/// server's workspace root (store, cards and caches all live under it), so
+/// falling back to a different log when the workspace log is missing would
+/// hide a misconfigured deploy instead of failing closed, and would let
+/// ambient environment steer tests at real user data. `env` reads
+/// environment variables so tests inject fakes and never touch the real
+/// environment.
+pub fn resolve_log_path(data_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    if let Some(p) = env(DECISION_LOG_ENV_VAR).filter(|v| !v.is_empty()) {
+        return PathBuf::from(p);
+    }
+    data_dir.join(DECISION_LOG_FILE_NAME)
+}
+
+/// Verify an opened phone approvals log, failing closed: a missing log is a
+/// 500 naming the outage (never an empty queue — an empty queue would hide a
+/// misconfigured path behind "nothing pending"), other read/parse failures
+/// are a 500 with the cause, and a broken hash chain renders the tampered
+/// page. No message contains the log path or the token. The error page is
+/// boxed (`Box<Response>`) to keep the `Result` small; callers unbox it.
+fn verify_for_phone(log: &DecisionLog) -> Result<Vec<Entry>, Box<Response>> {
+    match log.verify() {
+        Err(LogError::Chain(n)) => Err(Box::new(tampered(n))),
+        Err(LogError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(Box::new(error(
+            500,
+            "Approvals unavailable",
+            "The decision log is missing, so no requests are shown and nothing can be decided.",
+        ))),
+        Err(e) => Err(Box::new(error(500, "Approvals failed", &e.to_string()))),
+        Ok(entries) => Ok(entries),
+    }
+}
+
 /// Tampered-log page: every request is withheld (fail closed).
 fn tampered(row: usize) -> Response {
     Response::ok(page(
@@ -163,7 +222,20 @@ fn tampered(row: usize) -> Response {
 /// (an invalid one gets 403 and no cookie); otherwise the cookie must
 /// authorize, and the page lists pending requests with approve/deny
 /// buttons, chain status and recent decisions, with no token in the HTML.
+/// Reads the real process environment; see [`page_list_with_env`].
 pub fn page_list(req: &Request, state: &State) -> Response {
+    page_list_with_env(req, state, &|k| std::env::var(k).ok())
+}
+
+/// [`page_list`] with an injected environment reader for the log path (see
+/// [`resolve_log_path`]), so tests never touch the real environment.
+///
+/// Fails closed with the page from `verify_for_phone`, unboxed.
+pub fn page_list_with_env(
+    req: &Request,
+    state: &State,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Response {
     if let Some(k) = req.query.get("k") {
         if !token_ok(state, Some(k)) {
             return forbidden(state);
@@ -175,15 +247,17 @@ pub fn page_list(req: &Request, state: &State) -> Response {
     if !authorized(state, req.cookie.as_deref(), None) {
         return forbidden(state);
     }
-    let log = match DecisionLog::open(state.log_path()) {
+    let path = resolve_log_path(&state.data_dir, env);
+    let log = match DecisionLog::open(&path) {
         Err(LogError::Chain(n)) => return tampered(n),
         Err(e) => return error(500, "Approvals failed", &e.to_string()),
         Ok(log) => log,
     };
-    let entries = match log.verify_or_empty() {
-        Err(LogError::Chain(n)) => return tampered(n),
-        Err(e) => return error(500, "Approvals failed", &e.to_string()),
+    // `verify`, not `verify_or_empty`: a missing log fails closed, it never
+    // renders as "nothing pending".
+    let entries = match verify_for_phone(&log) {
         Ok(v) => v,
+        Err(resp) => return *resp,
     };
     let now = now_secs();
     let all = approvals::replay(&entries);
@@ -243,8 +317,22 @@ pub fn page_list(req: &Request, state: &State) -> Response {
 
 /// `POST /m/decide`: record one approve or deny as [`PHONE_DECIDER`].
 /// Authorized by the login cookie, or a form `k` as a fallback; redirects
-/// to a token-free `/m`.
+/// to a token-free `/m`. Reads the real process environment; see
+/// [`do_decide_with_env`].
 pub fn do_decide(req: &Request, state: &State) -> Response {
+    do_decide_with_env(req, state, &|k| std::env::var(k).ok())
+}
+
+/// [`do_decide`] with an injected environment reader for the log path (see
+/// [`resolve_log_path`]), so tests never touch the real environment. The
+/// decision lands in the same resolved log the list reads.
+///
+/// Fails closed with the page from `verify_for_phone`, unboxed.
+pub fn do_decide_with_env(
+    req: &Request,
+    state: &State,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Response {
     let form = parse_body(&req.body);
     if !authorized(state, req.cookie.as_deref(), form.get("k")) {
         return forbidden(state);
@@ -259,11 +347,17 @@ pub fn do_decide(req: &Request, state: &State) -> Response {
         "deny" => false,
         _ => return error(400, "Bad request", "decision must be approve or deny."),
     };
-    let mut log = match DecisionLog::open(state.log_path()) {
+    let path = resolve_log_path(&state.data_dir, env);
+    let mut log = match DecisionLog::open(&path) {
         Err(LogError::Chain(n)) => return tampered(n),
         Err(e) => return error(500, "Approvals failed", &e.to_string()),
         Ok(log) => log,
     };
+    // A missing log opens as empty, so verify before deciding: without this
+    // a missing log would fail with a misleading "unknown id".
+    if let Err(resp) = verify_for_phone(&log) {
+        return *resp;
+    }
     let now = now_secs();
     let outcome: Result<(), ApprovalError> = if approve_it {
         approvals::approve(&mut log, id, hash, PHONE_DECIDER, now).map(|_| ())
@@ -332,6 +426,42 @@ mod tests {
     fn status(state: &State, id: &str) -> Status {
         let log = DecisionLog::open(state.log_path()).unwrap();
         approvals::get(&log, id).unwrap().status_at(now_secs())
+    }
+
+    /// Test helper: environment with no variables set, so the resolved log
+    /// path is hermetic (ambient `DECISION_LOG_PATH` can never steer the
+    /// test at real user data).
+    fn env_none(_: &str) -> Option<String> {
+        None
+    }
+
+    /// Test helper: environment resolving `DECISION_LOG_PATH` to `path`.
+    fn env_log_path(path: &std::path::Path) -> impl Fn(&str) -> Option<String> {
+        let p = path.to_string_lossy().into_owned();
+        move |k: &str| {
+            if k == DECISION_LOG_ENV_VAR {
+                Some(p.clone())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Test helper: one pending synthetic `x.post` request in the log file
+    /// at `path` (the file's parent dir must already exist).
+    fn pending_request_at(path: &std::path::Path, n: u32) -> ApprovalRequest {
+        let mut log = DecisionLog::open(path).unwrap();
+        approvals::request(
+            &mut log,
+            &bookmarks_agent::app_gate(),
+            "bookmarks-agent",
+            "x.post",
+            &format!("synthetic post {n}"),
+            serde_json::json!({"draft": n}),
+            now_secs(),
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -576,5 +706,174 @@ mod tests {
         assert!(!page.contains("synthetic post"));
         let resp = handle(&Request::post("/m/decide", &form(TOKEN, &r, "approve")), &s);
         assert!(resp.body.contains("TAMPERED"));
+    }
+
+    /// The env path wins when set; an unset or empty variable falls back to
+    /// the data dir log. Pure path resolution: no filesystem or real env.
+    #[test]
+    fn resolve_prefers_env_path_over_data_dir() {
+        let data = std::path::PathBuf::from("/synthetic/data");
+        let shared = "/synthetic/shared/decision_log.jsonl".to_string();
+        let some = |k: &str| {
+            if k == DECISION_LOG_ENV_VAR {
+                Some(shared.clone())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            resolve_log_path(&data, &some),
+            std::path::PathBuf::from(&shared)
+        );
+        let empty = |k: &str| {
+            if k == DECISION_LOG_ENV_VAR {
+                Some(String::new())
+            } else {
+                None
+            }
+        };
+        for env in [&empty as &dyn Fn(&str) -> Option<String>, &env_none] {
+            assert_eq!(
+                resolve_log_path(&data, env),
+                data.join("decision_log.jsonl")
+            );
+        }
+    }
+
+    /// The phone list reads pending items from the `$DECISION_LOG_PATH` log,
+    /// not the `--data` dir log, when the variable is set.
+    #[test]
+    fn list_reads_pending_from_env_log() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(data_dir.path());
+        pending_request(&s, 1);
+        let shared = tempfile::tempdir().unwrap();
+        let env_log = shared.path().join("decision_log.jsonl");
+        pending_request_at(&env_log, 2);
+        let env = env_log_path(&env_log);
+        let resp = page_list_with_env(&Request::get("/m").with_cookie(COOKIE), &s, &env);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("synthetic post 2"));
+        assert!(!resp.body.contains("synthetic post 1"));
+    }
+
+    /// Decided items leave the pending queue: after one approve and one
+    /// deny, only the remaining pending item renders with buttons.
+    #[test]
+    fn list_excludes_decided_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(dir.path());
+        let a = pending_request(&s, 1);
+        let b = pending_request(&s, 2);
+        pending_request(&s, 3);
+        for (r, decision) in [(&a, "approve"), (&b, "deny")] {
+            let resp = do_decide_with_env(
+                &Request::post("/m/decide", &form(TOKEN, r, decision)),
+                &s,
+                &env_none,
+            );
+            assert_eq!(resp.status, 303);
+        }
+        let resp = page_list_with_env(&Request::get("/m").with_cookie(COOKIE), &s, &env_none);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("Approvals (1)"));
+        assert!(resp.body.contains("synthetic post 3"));
+        assert_eq!(resp.body.matches("value=\"approve\"").count(), 1);
+        assert!(resp.body.contains("approved by phone"));
+        assert!(resp.body.contains("denied by phone"));
+    }
+
+    /// A missing log fails closed: the list is a 500 with no queue and no
+    /// approve buttons, and deciding is refused without creating the file.
+    #[test]
+    fn missing_log_fails_closed_on_list_and_decide() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(dir.path());
+        assert!(!s.log_path().exists());
+        let resp = page_list_with_env(&Request::get("/m").with_cookie(COOKIE), &s, &env_none);
+        assert_eq!(resp.status, 500);
+        assert!(!resp.body.contains("Nothing waiting"));
+        assert!(!resp.body.contains("<button"));
+        assert!(!resp.body.contains("/m/decide"));
+        assert!(!s.log_path().exists(), "GET must not create the log");
+        let body = format!(
+            "k={TOKEN}&id=synthetic-1&payload_hash={}&decision=approve",
+            "0".repeat(64)
+        );
+        let resp = do_decide_with_env(&Request::post("/m/decide", &body), &s, &env_none);
+        assert_eq!(resp.status, 500);
+        assert!(!resp.body.contains("<button"));
+        assert!(!s.log_path().exists(), "a refused decide creates nothing");
+    }
+
+    /// A malformed log (invalid JSON) fails closed on list and decide, and
+    /// the file bytes are left untouched.
+    #[test]
+    fn malformed_log_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(dir.path());
+        let r = pending_request(&s, 1);
+        let mut raw = std::fs::read_to_string(s.log_path()).unwrap();
+        raw.push_str("{ not valid json\n");
+        std::fs::write(s.log_path(), &raw).unwrap();
+        let resp = page_list_with_env(&Request::get("/m").with_cookie(COOKIE), &s, &env_none);
+        assert_eq!(resp.status, 500);
+        assert!(!resp.body.contains("synthetic post 1"));
+        assert!(!resp.body.contains("<button"));
+        let resp = do_decide_with_env(
+            &Request::post("/m/decide", &form(TOKEN, &r, "approve")),
+            &s,
+            &env_none,
+        );
+        assert_eq!(resp.status, 500);
+        assert_eq!(
+            std::fs::read_to_string(s.log_path()).unwrap(),
+            raw,
+            "a refused decide writes nothing"
+        );
+    }
+
+    /// An unreadable log (a directory at the log path) fails closed: the
+    /// list is a 500 with no queue and no buttons, and decide is refused.
+    #[test]
+    fn unreadable_log_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(dir.path());
+        std::fs::create_dir(s.log_path()).unwrap();
+        let resp = page_list_with_env(&Request::get("/m").with_cookie(COOKIE), &s, &env_none);
+        assert_eq!(resp.status, 500);
+        assert!(!resp.body.contains("Nothing waiting"));
+        assert!(!resp.body.contains("<button"));
+        assert!(!resp.body.contains("/m/decide"));
+        let body = format!(
+            "k={TOKEN}&id=synthetic-1&payload_hash={}&decision=approve",
+            "0".repeat(64)
+        );
+        let resp = do_decide_with_env(&Request::post("/m/decide", &body), &s, &env_none);
+        assert_eq!(resp.status, 500);
+    }
+
+    /// Decisions through the phone route land in the `$DECISION_LOG_PATH`
+    /// log, leaving the `--data` dir log untouched.
+    #[test]
+    fn decide_writes_to_env_log() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(data_dir.path());
+        let shared = tempfile::tempdir().unwrap();
+        let env_log = shared.path().join("decision_log.jsonl");
+        let r = pending_request_at(&env_log, 7);
+        let env = env_log_path(&env_log);
+        let resp = do_decide_with_env(
+            &Request::post("/m/decide", &form(TOKEN, &r, "approve")),
+            &s,
+            &env,
+        );
+        assert_eq!(resp.status, 303);
+        let log = DecisionLog::open(&env_log).unwrap();
+        assert_eq!(
+            approvals::get(&log, &r.id).unwrap().status_at(now_secs()),
+            Status::Approved
+        );
+        assert!(!s.log_path().exists(), "the data-dir log stays untouched");
     }
 }
