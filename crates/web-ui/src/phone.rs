@@ -192,16 +192,17 @@ pub fn resolve_log_path(data_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -
 /// 500 naming the outage (never an empty queue — an empty queue would hide a
 /// misconfigured path behind "nothing pending"), other read/parse failures
 /// are a 500 with the cause, and a broken hash chain renders the tampered
-/// page. No message contains the log path or the token.
-fn verify_for_phone(log: &DecisionLog) -> Result<Vec<Entry>, Response> {
+/// page. No message contains the log path or the token. The error page is
+/// boxed (`Box<Response>`) to keep the `Result` small; callers unbox it.
+fn verify_for_phone(log: &DecisionLog) -> Result<Vec<Entry>, Box<Response>> {
     match log.verify() {
-        Err(LogError::Chain(n)) => Err(tampered(n)),
-        Err(LogError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(error(
+        Err(LogError::Chain(n)) => Err(Box::new(tampered(n))),
+        Err(LogError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(Box::new(error(
             500,
             "Approvals unavailable",
             "The decision log is missing, so no requests are shown and nothing can be decided.",
-        )),
-        Err(e) => Err(error(500, "Approvals failed", &e.to_string())),
+        ))),
+        Err(e) => Err(Box::new(error(500, "Approvals failed", &e.to_string()))),
         Ok(entries) => Ok(entries),
     }
 }
@@ -228,6 +229,8 @@ pub fn page_list(req: &Request, state: &State) -> Response {
 
 /// [`page_list`] with an injected environment reader for the log path (see
 /// [`resolve_log_path`]), so tests never touch the real environment.
+///
+/// Fails closed with the page from `verify_for_phone`, unboxed.
 pub fn page_list_with_env(
     req: &Request,
     state: &State,
@@ -254,7 +257,7 @@ pub fn page_list_with_env(
     // renders as "nothing pending".
     let entries = match verify_for_phone(&log) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let now = now_secs();
     let all = approvals::replay(&entries);
@@ -323,6 +326,8 @@ pub fn do_decide(req: &Request, state: &State) -> Response {
 /// [`do_decide`] with an injected environment reader for the log path (see
 /// [`resolve_log_path`]), so tests never touch the real environment. The
 /// decision lands in the same resolved log the list reads.
+///
+/// Fails closed with the page from `verify_for_phone`, unboxed.
 pub fn do_decide_with_env(
     req: &Request,
     state: &State,
@@ -351,7 +356,7 @@ pub fn do_decide_with_env(
     // A missing log opens as empty, so verify before deciding: without this
     // a missing log would fail with a misleading "unknown id".
     if let Err(resp) = verify_for_phone(&log) {
-        return resp;
+        return *resp;
     }
     let now = now_secs();
     let outcome: Result<(), ApprovalError> = if approve_it {
