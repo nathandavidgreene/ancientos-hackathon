@@ -100,8 +100,8 @@ pub struct Redacted {
 }
 
 /// True when an object key looks secret-bearing: its lowercased alphanumeric
-/// form contains `token`, `secret`, `password`, `apikey`, `credential` or
-/// `authorization`. Matches `access_token`, `api_key`, `apiKey`,
+/// form contains secret synonyms including keys, auth, bearer, cookies,
+/// sessions, passwords and private material. Matches `access_token`, `api_key`, `apiKey`,
 /// `client_secret`, `password`, `credentials`, `authorization`, and nested
 /// equivalents. Shared by [`redact_json`] and the approvals queue.
 pub fn is_secret_key(key: &str) -> bool {
@@ -117,6 +117,14 @@ pub fn is_secret_key(key: &str) -> bool {
         "apikey",
         "credential",
         "authorization",
+        "key",
+        "auth",
+        "bearer",
+        "cookie",
+        "session",
+        "passwd",
+        "pwd",
+        "private",
     ]
     .iter()
     .any(|needle| norm.contains(needle))
@@ -804,6 +812,30 @@ mod tests {
         let r = redact_text(input);
         assert!(r.hits.is_empty(), "false hit on {input:?}: {:?}", r.hits);
         assert_eq!(r.text, input);
+    }
+
+    #[test]
+    fn structural_secret_synonyms_are_always_redacted() {
+        for key in [
+            "private_key",
+            "Private-Key",
+            "bearer",
+            "Bearer",
+            "cookie",
+            "session_cookie",
+            "passwd",
+            "pwd",
+            "key",
+            "auth",
+            "session",
+        ] {
+            assert!(is_secret_key(key), "missed structural secret synonym");
+            let value = serde_json::json!({key: "opaque confidential value"});
+            let redacted = redact_json(&value).0;
+            assert!(!serde_json::to_string(&redacted)
+                .unwrap()
+                .contains("opaque confidential value"));
+        }
     }
 
     #[test]
