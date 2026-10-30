@@ -40,9 +40,9 @@ use std::path::{Path, PathBuf};
 /// Env var overriding the eval-private dir for the labels page.
 pub const EVAL_DIR_ENV: &str = "ANCIENTOS_EVAL_PRIVATE_DIR";
 /// Env var holding the `remove_bookmark` binary path.
-pub const REMOVE_BIN_ENV: &str = "ANCIENTOS_REMOVE_BOOKMARK_BIN";
-/// CLI binary name looked up on `PATH` when [`REMOVE_BIN_ENV`] is unset.
-pub const REMOVE_BIN_NAME: &str = "remove_bookmark";
+pub const REMOVE_BIN_ENV: &str = "ANCIENTOS_REMOVE_BOOKMARK_CMD";
+/// CLI binary name used in safe error messages.
+pub const REMOVE_BIN_NAME: &str = "bookmark remover";
 /// Queries + posts file, relative to the eval-private dir.
 pub const QUERIES_REL: &str = "nathan/label-queries.json";
 /// Seed text file, relative to the eval-private dir.
@@ -676,60 +676,6 @@ pub fn load_classify(dir: &Path) -> BTreeMap<String, BTreeSet<String>> {
     out
 }
 
-/// Status ids with a successful (`ok`) removal row.
-fn removed_ids(dir: &Path) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let Ok(text) = std::fs::read_to_string(dir.join(REMOVALS_FILE)) else {
-        return out;
-    };
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if v.get("outcome").and_then(serde_json::Value::as_str) != Some(OUTCOME_OK) {
-            continue;
-        }
-        if let Some(id) = v.get("post_id").and_then(serde_json::Value::as_str) {
-            if !id.is_empty() {
-                out.insert(id.to_string());
-            }
-        }
-    }
-    out
-}
-
-/// Append one removal-attempt row; errors name the relative file only.
-fn log_removal(
-    dir: &Path,
-    post_id: &str,
-    post_key: &str,
-    outcome: &str,
-    detail: &str,
-    now: u64,
-) -> Result<(), String> {
-    use std::io::Write;
-    let mut row = serde_json::json!({
-        "post_id": post_id,
-        "post_key": post_key,
-        "at": now,
-        "outcome": outcome,
-    });
-    if !detail.is_empty() {
-        let short: String = detail.chars().take(REMOVAL_DETAIL_CHARS).collect();
-        row["detail"] = serde_json::Value::String(short);
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(REMOVALS_FILE))
-        .map_err(|e| format!("{REMOVALS_FILE}: {e}"))?;
-    writeln!(f, "{row}").map_err(|e| format!("{REMOVALS_FILE}: {e}"))?;
-    Ok(())
-}
-
 /// Resolve the `remove_bookmark` binary: the explicit path when given, else
 /// the first `PATH` entry containing [`REMOVE_BIN_NAME`] (empty `PATH`
 /// segments are skipped, never treated as the working dir).
@@ -755,32 +701,31 @@ pub fn resolve_remove_bin(
     ))
 }
 
-/// Outcome of one CLI run: exit code or failure reason plus stderr text.
+/// Outcome of one CLI run without retaining potentially sensitive output.
 struct CliRun {
     /// `Some(code)` when the CLI exited, `None` on spawn failure/timeout.
     code: Option<i32>,
-    /// Stderr (or the spawn/timeout note), trimmed.
-    detail: String,
     /// True only when the CLI ran to completion (whatever it exited).
     ran: bool,
 }
 
 /// Run `bin --post-id <id>` with no shell, killing it after
 /// [`REMOVE_TIMEOUT_SECS`] seconds.
-fn run_remove_cli(bin: &Path, id: &str) -> CliRun {
+fn run_remove_cli(bin: &Path, id: &str, request_id: &str) -> CliRun {
     use std::process::Stdio;
     let mut child = match std::process::Command::new(bin)
         .arg("--post-id")
         .arg(id)
+        .arg("--request-id")
+        .arg(request_id)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
     {
-        Err(e) => {
+        Err(_) => {
             return CliRun {
                 code: None,
-                detail: format!("spawn failed: {e}"),
                 ran: false,
             }
         }
@@ -791,25 +736,15 @@ fn run_remove_cli(bin: &Path, id: &str) -> CliRun {
     let budget = std::time::Duration::from_secs(REMOVE_TIMEOUT_SECS);
     loop {
         match child.try_wait() {
-            Err(e) => {
+            Err(_) => {
                 return CliRun {
                     code: None,
-                    detail: format!("wait failed: {e}"),
                     ran: false,
                 }
             }
             Ok(Some(status)) => {
-                let mut err = String::new();
-                if let Some(mut s) = child.stderr.take() {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    if s.read_to_end(&mut buf).is_ok() {
-                        err = String::from_utf8_lossy(&buf).trim().to_string();
-                    }
-                }
                 return CliRun {
                     code: status.code(),
-                    detail: err,
                     ran: true,
                 };
             }
@@ -819,7 +754,6 @@ fn run_remove_cli(bin: &Path, id: &str) -> CliRun {
                     let _ = child.wait();
                     return CliRun {
                         code: None,
-                        detail: format!("timed out after {REMOVE_TIMEOUT_SECS}s"),
                         ran: false,
                     };
                 }
@@ -828,6 +762,71 @@ fn run_remove_cli(bin: &Path, id: &str) -> CliRun {
             }
         }
     }
+}
+
+/// Check that a request id has the canonical UUID shape.
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// Check that the configured remover is executable without following PATH.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// Return the saved result for a duplicate request UUID without invoking the CLI.
+fn prior_request(dir: &Path, request_id: &str) -> Option<Result<RemoveOutcome, String>> {
+    let text = std::fs::read_to_string(dir.join(REMOVALS_FILE)).ok()?;
+    for line in text.lines().rev() {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if v["request_id"].as_str() == Some(request_id) {
+            return Some(match v["outcome"].as_str()? {
+                "removed" => Ok(RemoveOutcome::Removed),
+                "already_absent" => Ok(RemoveOutcome::AlreadyRemoved),
+                "refused_or_not_found" => {
+                    Err("refused or not found on X (previous request result)".to_string())
+                }
+                _ => Err("removal failed (previous request result)".to_string()),
+            });
+        }
+    }
+    None
+}
+
+/// Append the required sanitized audit record for one remover attempt.
+fn log_attempt(
+    dir: &Path,
+    post_id: &str,
+    request_id: &str,
+    outcome: &str,
+    exit_code: Option<i32>,
+    now: u64,
+) -> Result<(), String> {
+    use std::io::Write;
+    let row = serde_json::json!({"timestamp": now, "post_id": post_id, "request_id": request_id, "outcome": outcome, "exit_code": exit_code});
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(REMOVALS_FILE))
+        .map_err(|_| "removal audit log unavailable".to_string())?;
+    writeln!(f, "{row}").map_err(|_| "removal audit log unavailable".to_string())
 }
 
 /// Outcome of [`remove_one`].
@@ -839,18 +838,16 @@ pub enum RemoveOutcome {
     AlreadyRemoved,
 }
 
-/// Remove one post via Social's CLI: resolve its status id from the posts
-/// map (must be numeric), skip without calling when already removed, else
-/// run `remove_bookmark --post-id <id>` once and log the attempt. Any
-/// failure (unknown key, bad id, missing CLI, spawn error, timeout,
-/// non-zero exit) returns `Err` with the bookmark and label untouched;
-/// messages name no paths.
+/// Remove exactly one post via Social's configured CLI and audit the result.
+/// Request UUIDs replay a prior result without invoking the CLI again;
+/// failures leave labels unchanged and return sanitized messages.
 pub fn remove_one(
     dir: &Path,
     post_key: &str,
     explicit_bin: Option<&Path>,
     path_env: Option<&str>,
     now: u64,
+    request_id: &str,
 ) -> Result<RemoveOutcome, String> {
     let queries = load_queries(dir)?;
     let post = queries
@@ -859,36 +856,47 @@ pub fn remove_one(
         .ok_or_else(|| format!("unknown post {post_key:?}"))?;
     let id = status_id_of_url(&post.url)
         .ok_or_else(|| format!("post {post_key:?} has no numeric X id"))?;
-    if removed_ids(dir).contains(&id) {
-        return Ok(RemoveOutcome::AlreadyRemoved);
+    if !id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("post id must contain digits only".to_string());
     }
-    let bin = match resolve_remove_bin(explicit_bin, path_env) {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = log_removal(dir, &id, post_key, "error:cli-missing", "", now);
-            return Err(e);
-        }
+    if !is_uuid(request_id) {
+        return Err("invalid request id".to_string());
+    }
+    if let Some(prior) = prior_request(dir, request_id) {
+        return prior;
+    }
+    let bin = match explicit_bin {
+        Some(path) if !path.as_os_str().is_empty() => path.to_path_buf(),
+        Some(_) => return Err("remover is not configured".to_string()),
+        None => PathBuf::from(
+            path_env
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "remover is not configured".to_string())?,
+        ),
     };
-    let run = run_remove_cli(&bin, &id);
+    if !bin.is_file() || !is_executable(&bin) {
+        return Err("remover is not executable".to_string());
+    }
+    let run = run_remove_cli(&bin, &id, request_id);
     if !run.ran {
-        let _ = log_removal(dir, &id, post_key, "error:cli-failed", &run.detail, now);
-        return Err(format!("{REMOVE_BIN_NAME} failed: {}", run.detail));
+        let _ = log_attempt(dir, &id, request_id, "failed", None, now);
+        return Err(format!("{REMOVE_BIN_NAME} failed"));
     }
     match run.code {
         Some(0) => {
-            log_removal(dir, &id, post_key, OUTCOME_OK, "", now)?;
+            log_attempt(dir, &id, request_id, "removed", Some(0), now)?;
             Ok(RemoveOutcome::Removed)
         }
+        Some(2) => {
+            log_attempt(dir, &id, request_id, "refused_or_not_found", Some(2), now)?;
+            Err("refused or not found on X".to_string())
+        }
         Some(code) => {
-            let outcome = format!("error:exit-{code}");
-            let _ = log_removal(dir, &id, post_key, &outcome, &run.detail, now);
-            if run.detail.is_empty() {
-                return Err(format!("{REMOVE_BIN_NAME} exited {code}"));
-            }
-            Err(format!("{REMOVE_BIN_NAME} exited {code}: {}", run.detail))
+            log_attempt(dir, &id, request_id, "failed", Some(code), now)?;
+            Err(format!("removal failed (exit code {code})"))
         }
         None => {
-            let _ = log_removal(dir, &id, post_key, "error:signal", &run.detail, now);
+            let _ = log_attempt(dir, &id, request_id, "failed", None, now);
             Err(format!("{REMOVE_BIN_NAME} died by signal"))
         }
     }
@@ -1262,18 +1270,30 @@ mod tests {
         let dir = eval_dir();
         let calls = dir.path().join("calls.txt");
         let bin = fake_remove_bin(dir.path(), &calls, 0, "");
-        let out = remove_one(dir.path(), "7", Some(&bin), None, 100).unwrap();
+        let out = remove_one(
+            dir.path(),
+            "7",
+            Some(&bin),
+            None,
+            100,
+            "00000000-0000-4000-8000-000000000001",
+        )
+        .unwrap();
         assert_eq!(out, RemoveOutcome::Removed);
         assert_eq!(
             recorded_calls(&calls),
-            vec!["--post-id 9000000000000000007"]
+            vec!["--post-id 9000000000000000007 --request-id 00000000-0000-4000-8000-000000000001"]
         );
         let rows = removal_rows(dir.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["post_id"], "9000000000000000007");
-        assert_eq!(rows[0]["post_key"], "7");
-        assert_eq!(rows[0]["at"], 100);
-        assert_eq!(rows[0]["outcome"], "ok");
+        assert_eq!(
+            rows[0]["request_id"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(rows[0]["timestamp"], 100);
+        assert_eq!(rows[0]["outcome"], "removed");
+        assert_eq!(rows[0]["exit_code"], 0);
         assert!(rows[0].get("detail").is_none());
         assert!(load_labels(dir.path()).unwrap().is_empty());
     }
@@ -1286,31 +1306,54 @@ mod tests {
         let calls = dir.path().join("calls.txt");
         let bin = fake_remove_bin(dir.path(), &calls, 0, "");
         assert_eq!(
-            remove_one(dir.path(), "7", Some(&bin), None, 100).unwrap(),
+            remove_one(
+                dir.path(),
+                "7",
+                Some(&bin),
+                None,
+                100,
+                "00000000-0000-4000-8000-000000000001"
+            )
+            .unwrap(),
             RemoveOutcome::Removed
         );
         assert_eq!(
-            remove_one(dir.path(), "7", Some(&bin), None, 200).unwrap(),
-            RemoveOutcome::AlreadyRemoved
+            remove_one(
+                dir.path(),
+                "7",
+                Some(&bin),
+                None,
+                200,
+                "00000000-0000-4000-8000-000000000001"
+            )
+            .unwrap(),
+            RemoveOutcome::Removed
         );
         assert_eq!(recorded_calls(&calls).len(), 1);
         assert_eq!(removal_rows(dir.path()).len(), 1);
     }
 
-    /// A non-zero exit keeps the bookmark, reports stderr, and allows retry.
+    /// A non-zero exit keeps the bookmark, hides child output, and allows retry.
     #[test]
     #[cfg(unix)]
     fn remove_nonzero_exit_logs_error_and_retries() {
         let dir = eval_dir();
         let calls = dir.path().join("calls.txt");
-        let failing = fake_remove_bin(dir.path(), &calls, 3, "synthetic boom");
-        let err = remove_one(dir.path(), "7", Some(&failing), None, 100).unwrap_err();
-        assert!(err.contains("exited 3"), "{err}");
-        assert!(err.contains("synthetic boom"), "{err}");
+        let failing = fake_remove_bin(dir.path(), &calls, 1, "synthetic boom");
+        let err = remove_one(
+            dir.path(),
+            "7",
+            Some(&failing),
+            None,
+            100,
+            "00000000-0000-4000-8000-000000000002",
+        )
+        .unwrap_err();
+        assert!(err.contains("exit code 1"), "{err}");
         let rows = removal_rows(dir.path());
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["outcome"], "error:exit-3");
-        assert_eq!(rows[0]["detail"], "synthetic boom");
+        assert_eq!(rows[0]["outcome"], "failed");
+        assert_eq!(rows[0]["exit_code"], 1);
         // A failed attempt does not suppress the next one.
         let calls2 = dir.path().join("calls2.txt");
         let succeeding = write_executable(
@@ -1318,7 +1361,15 @@ mod tests {
             "ok_bin",
             &format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 0\n", calls2.display()),
         );
-        let out = remove_one(dir.path(), "7", Some(&succeeding), None, 200).unwrap();
+        let out = remove_one(
+            dir.path(),
+            "7",
+            Some(&succeeding),
+            None,
+            200,
+            "00000000-0000-4000-8000-000000000003",
+        )
+        .unwrap();
         assert_eq!(out, RemoveOutcome::Removed);
         assert_eq!(removal_rows(dir.path()).len(), 2);
     }
@@ -1329,18 +1380,93 @@ mod tests {
     fn remove_missing_cli_fails_closed_and_logs() {
         let dir = eval_dir();
         let missing = dir.path().join("no-such-bin");
-        let err = remove_one(dir.path(), "7", Some(&missing), None, 100).unwrap_err();
-        assert!(err.contains(REMOVE_BIN_NAME), "{err}");
+        let err = remove_one(
+            dir.path(),
+            "7",
+            Some(&missing),
+            None,
+            100,
+            "00000000-0000-4000-8000-000000000004",
+        )
+        .unwrap_err();
+        assert!(err.contains("not executable"), "{err}");
         let rows = removal_rows(dir.path());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["outcome"], "error:cli-failed");
+        assert_eq!(rows.len(), 0);
         assert!(load_labels(dir.path()).unwrap().is_empty());
         // Nothing on PATH either: same fail-closed shape.
-        let err = remove_one(dir.path(), "9", None, Some("/nonexistent-dir-xyz"), 200).unwrap_err();
-        assert!(err.contains(REMOVE_BIN_ENV), "{err}");
+        let err = remove_one(
+            dir.path(),
+            "9",
+            None,
+            Some("/nonexistent-dir-xyz"),
+            200,
+            "00000000-0000-4000-8000-000000000005",
+        )
+        .unwrap_err();
+        assert!(err.contains("not executable"), "{err}");
+        assert!(removal_rows(dir.path()).is_empty());
+    }
+
+    /// Unset, empty, and non-executable configuration never invokes a remover.
+    #[test]
+    #[cfg(unix)]
+    fn remove_configuration_fails_closed() {
+        let dir = eval_dir();
+        let calls = dir.path().join("calls.txt");
+        let valid = fake_remove_bin(dir.path(), &calls, 0, "");
+        let id = "00000000-0000-4000-8000-000000000008";
+        assert!(remove_one(dir.path(), "7", None, None, 100, id).is_err());
+        assert!(remove_one(dir.path(), "7", Some(Path::new("")), None, 100, id).is_err());
+        let nonexec = dir.path().join("nonexec");
+        std::fs::write(&nonexec, "not executable").unwrap();
+        assert!(remove_one(dir.path(), "7", Some(&nonexec), None, 100, id).is_err());
+        assert!(remove_one(dir.path(), "7", None, Some(""), 100, id).is_err());
+        assert!(recorded_calls(&calls).is_empty());
+        assert!(valid.is_file());
+    }
+
+    /// Social exit 2 logs refusal/not-found and returns an error without changing labels.
+    #[test]
+    #[cfg(unix)]
+    fn exit_two_is_refused_or_not_found() {
+        let dir = eval_dir();
+        let calls = dir.path().join("calls.txt");
+        let bin = fake_remove_bin(dir.path(), &calls, 2, "private output");
+        let err = remove_one(
+            dir.path(),
+            "7",
+            Some(&bin),
+            None,
+            100,
+            "00000000-0000-4000-8000-000000000009",
+        )
+        .unwrap_err();
+        assert!(err.contains("refused or not found on X"), "{err}");
         let rows = removal_rows(dir.path());
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1]["outcome"], "error:cli-missing");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["outcome"], "refused_or_not_found");
+        assert_eq!(rows[0]["exit_code"], 2);
+        assert!(load_labels(dir.path()).unwrap().is_empty());
+        let line = std::fs::read_to_string(dir.path().join(REMOVALS_FILE)).unwrap();
+        assert!(!line.contains("private output"));
+    }
+
+    /// Replaying an exit-2 request id returns an error and does not call again.
+    #[test]
+    #[cfg(unix)]
+    fn exit_two_request_id_dedupe_does_not_report_success() {
+        let dir = eval_dir();
+        let calls = dir.path().join("calls.txt");
+        let bin = fake_remove_bin(dir.path(), &calls, 2, "");
+        let id = "00000000-0000-4000-8000-000000000010";
+        assert!(remove_one(dir.path(), "7", Some(&bin), None, 100, id).is_err());
+        let replay = remove_one(dir.path(), "7", Some(&bin), None, 200, id).unwrap_err();
+        assert!(replay.contains("refused or not found on X"), "{replay}");
+        assert_eq!(recorded_calls(&calls).len(), 1);
+        let rows = removal_rows(dir.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["outcome"], "refused_or_not_found");
+        assert!(load_labels(dir.path()).unwrap().is_empty());
     }
 
     /// Unknown keys and non-numeric ids never reach the CLI or the log.
@@ -1350,8 +1476,24 @@ mod tests {
         let dir = eval_dir();
         let calls = dir.path().join("calls.txt");
         let bin = fake_remove_bin(dir.path(), &calls, 0, "");
-        assert!(remove_one(dir.path(), "zzz", Some(&bin), None, 100).is_err());
-        assert!(remove_one(dir.path(), "11", Some(&bin), None, 100).is_err());
+        assert!(remove_one(
+            dir.path(),
+            "zzz",
+            Some(&bin),
+            None,
+            100,
+            "00000000-0000-4000-8000-000000000006"
+        )
+        .is_err());
+        assert!(remove_one(
+            dir.path(),
+            "11",
+            Some(&bin),
+            None,
+            100,
+            "00000000-0000-4000-8000-000000000007"
+        )
+        .is_err());
         assert!(recorded_calls(&calls).is_empty());
         assert!(!dir.path().join(REMOVALS_FILE).exists());
     }

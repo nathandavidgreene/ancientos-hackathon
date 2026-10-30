@@ -867,6 +867,7 @@ dependencies = [
  "ancientos-core",
  "ancientos-eval",
  "bookmarks-agent",
+ "getrandom 0.2.17",
  "muse-runs",
  "serde_json",
  "tempfile",

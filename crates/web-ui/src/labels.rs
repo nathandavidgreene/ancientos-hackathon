@@ -203,6 +203,7 @@ fn card_html(
          value=\"not\"{not}> Not</label></p>\
          <form method=\"post\" action=\"/labels/delete\">\
          <input type=\"hidden\" name=\"post\" value=\"{key}\">\
+         <input type=\"hidden\" name=\"request_id\" value=\"{request_id}\">\
          <button type=\"submit\">Delete</button></form>\
          </div>",
         escape(key),
@@ -217,6 +218,7 @@ fn card_html(
         form = SAVE_FORM_ID,
         rel = if rel { " checked" } else { "" },
         not = if not { " checked" } else { "" },
+        request_id = request_uuid(),
     )
 }
 
@@ -367,6 +369,14 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
             crate::error_page("Bad request", "Unknown post.", state),
         );
     }
+    let request_id = form.get("request_id").map(String::as_str).unwrap_or("");
+    let post_id = labels::status_id_of_url(&queries.posts[key].url).unwrap_or_default();
+    if post_id.is_empty() || !post_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Response::status(
+            400,
+            crate::error_page("Bad request", "Post id must contain digits only.", state),
+        );
+    }
     let now = now_secs();
     let path_env = std::env::var("PATH").ok();
     match labels::remove_one(
@@ -375,6 +385,7 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
         state.labels_remove_bin.as_deref(),
         path_env.as_deref(),
         now,
+        request_id,
     ) {
         Ok(_) => match labels::save_labels(dir, &[(key.to_string(), Label::Delete)], now) {
             Ok(_) => Response::redirect("/labels".to_string()),
@@ -386,6 +397,23 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
         },
         Err(e) => failed("Delete failed", &format!("{e} Bookmark kept."), state),
     }
+}
+
+/// Generate a fresh UUID v4 for a rendered Delete form.
+fn request_uuid() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("operating system random source available");
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 /// Content type for a thumbnail file name; `None` for anything but
@@ -587,7 +615,11 @@ mod tests {
         );
         assert_eq!(
             crate::handle(
-                &Request::post("/labels/delete", "post=7").with_cookie(COOKIE),
+                &Request::post(
+                    "/labels/delete",
+                    "post=7&request_id=00000000-0000-4000-8000-000000000001"
+                )
+                .with_cookie(COOKIE),
                 &s
             )
             .status,
@@ -615,12 +647,24 @@ mod tests {
             authed(Request::post("/labels/save", "label-7=relevant")),
             403
         );
-        assert_eq!(authed(Request::post("/labels/delete", "post=7")), 403);
+        assert_eq!(
+            authed(Request::post(
+                "/labels/delete",
+                "post=7&request_id=00000000-0000-4000-8000-000000000001"
+            )),
+            403
+        );
         assert_eq!(authed(Request::get("/labels/thumb/a_0.jpg")), 403);
         for bad in ["ap_k=wrong-token-00000000", "ap_k=", "other=x"] {
             assert_eq!(authed(Request::get("/labels").with_cookie(bad)), 403);
             assert_eq!(
-                authed(Request::post("/labels/delete", "post=7").with_cookie(bad)),
+                authed(
+                    Request::post(
+                        "/labels/delete",
+                        "post=7&request_id=00000000-0000-4000-8000-000000000001"
+                    )
+                    .with_cookie(bad)
+                ),
                 403
             );
         }
@@ -839,14 +883,18 @@ mod tests {
         let calls = data.path().join("calls.txt");
         s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
         let resp = crate::handle(
-            &Request::post("/labels/delete", "post=7").with_cookie(COOKIE),
+            &Request::post(
+                "/labels/delete",
+                "post=7&request_id=00000000-0000-4000-8000-000000000001",
+            )
+            .with_cookie(COOKIE),
             &s,
         );
         assert_eq!(resp.status, 303);
         assert_eq!(resp.location.as_deref(), Some("/labels"));
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
-            format!("--post-id {ID7}\n")
+            format!("--post-id {ID7} --request-id 00000000-0000-4000-8000-000000000001\n")
         );
         let stored = labels::load_labels(eval.path()).unwrap();
         assert_eq!(stored["7"].label, Label::Delete);
@@ -857,7 +905,7 @@ mod tests {
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["outcome"], "ok");
+        assert_eq!(rows[0]["outcome"], "removed");
         assert_eq!(rows[0]["post_id"], ID7);
     }
 
@@ -870,13 +918,18 @@ mod tests {
         let mut s = labels_state(data.path(), eval.path());
         labels::save_labels(eval.path(), &[("7".to_string(), Label::Relevant)], 50).unwrap();
         let calls = data.path().join("calls.txt");
-        s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 3, "synthetic boom"));
+        s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 1, "synthetic boom"));
         let resp = crate::handle(
-            &Request::post("/labels/delete", "post=7").with_cookie(COOKIE),
+            &Request::post(
+                "/labels/delete",
+                "post=7&request_id=00000000-0000-4000-8000-000000000001",
+            )
+            .with_cookie(COOKIE),
             &s,
         );
         assert_eq!(resp.status, 500);
-        assert!(resp.body.contains("synthetic boom"), "{}", resp.body);
+        assert!(resp.body.contains("exit code 1"), "{}", resp.body);
+        assert!(!resp.body.contains("synthetic boom"), "{}", resp.body);
         assert!(resp.body.contains("kept"), "{}", resp.body);
         let stored = labels::load_labels(eval.path()).unwrap();
         assert_eq!(stored["7"].label, Label::Relevant);
@@ -893,14 +946,18 @@ mod tests {
         s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
         for _ in 0..2 {
             let resp = crate::handle(
-                &Request::post("/labels/delete", "post=7").with_cookie(COOKIE),
+                &Request::post(
+                    "/labels/delete",
+                    "post=7&request_id=00000000-0000-4000-8000-000000000001",
+                )
+                .with_cookie(COOKIE),
                 &s,
             );
             assert_eq!(resp.status, 303);
         }
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
-            format!("--post-id {ID7}\n")
+            format!("--post-id {ID7} --request-id 00000000-0000-4000-8000-000000000001\n")
         );
     }
 
@@ -912,11 +969,15 @@ mod tests {
         let mut s = labels_state(data.path(), eval.path());
         s.labels_remove_bin = Some(data.path().join("no-such-bin"));
         let resp = crate::handle(
-            &Request::post("/labels/delete", "post=7").with_cookie(COOKIE),
+            &Request::post(
+                "/labels/delete",
+                "post=7&request_id=00000000-0000-4000-8000-000000000001",
+            )
+            .with_cookie(COOKIE),
             &s,
         );
         assert_eq!(resp.status, 500);
-        assert!(resp.body.contains(labels::REMOVE_BIN_NAME), "{}", resp.body);
+        assert!(resp.body.contains("not executable"), "{}", resp.body);
         assert!(
             !resp.body.contains(&data.path().display().to_string()),
             "{}",
