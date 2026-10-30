@@ -12,7 +12,7 @@
 //!    counters once; a denied, pending or expired request keeps it tripped.
 //!
 //! Core knows no app: the caller passes its gate and agent name.
-use crate::approvals::{self, ApprovalError, ApprovalRequest, Status};
+use crate::approvals::{self, ApprovalError, ApprovalRequest, ReleaseToken, Status};
 use crate::gate::Gate;
 use crate::log::DecisionLog;
 use std::collections::HashMap;
@@ -174,22 +174,29 @@ impl LoopGuard {
         })
     }
 
-    /// Reset counters if `request_id` is an approved resume for this loop
-    /// (the approval is released, so it works once). Returns `Ok(false)` and
-    /// stays tripped otherwise.
+    /// Reset counters, consuming the resume approval's [`ReleaseToken`] by
+    /// value: without a token the loop cannot resume. The token's approval
+    /// must be a [`RESUME_ACTION`] request for this loop and currently
+    /// Approved; otherwise returns `Ok(false)` and stays tripped (the token
+    /// is dropped, the approval is untouched and stays claimable). A token
+    /// whose hash no longer matches its request, or a request lost to a
+    /// tampered log, is an error. The approval is released, so one token
+    /// resumes once.
     pub fn resume_if_approved(
         &mut self,
         log: &mut DecisionLog,
-        request_id: &str,
+        token: ReleaseToken,
         now: u64,
     ) -> Result<bool, ApprovalError> {
-        let a = approvals::get(log, request_id)?;
+        let a = approvals::get(log, token.approval_id())?;
+        if token.payload_hash() != a.request.payload_hash {
+            return Err(ApprovalError::HashMismatch(a.request.id));
+        }
         let ours = a.request.action == RESUME_ACTION
             && a.request.payload.get("loop").and_then(|v| v.as_str()) == Some(self.name.as_str());
         if !ours || a.status_at(now) != Status::Approved {
             return Ok(false);
         }
-        let token = approvals::claim_release_token(log, request_id, &a.request.payload_hash)?;
         approvals::release(log, token, &a.request.payload)?;
         self.started_at = now;
         self.steps = 0;
@@ -251,6 +258,11 @@ mod tests {
         g
     }
 
+    /// Test helper: claim the release token for an approved resume request.
+    fn claim(log: &DecisionLog, req: &ApprovalRequest) -> ReleaseToken {
+        approvals::claim_release_token(log, &req.id, &req.payload_hash).unwrap()
+    }
+
     #[test]
     fn step_budget_trips_and_stays_tripped() {
         let mut g = LoopGuard::new("t", small(), 0);
@@ -289,6 +301,7 @@ mod tests {
         assert!(LoopGuard::new("t", b, 0).step("a", false, 0).is_err());
     }
 
+    /// Resume consumes a claimed token and works exactly once.
     #[test]
     fn resume_needs_human_approval_and_works_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -305,20 +318,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(req.action, RESUME_ACTION);
-        // Pending: stays tripped.
-        assert!(!g.resume_if_approved(&mut log, &req.id, 11).unwrap());
+        // Pending: no token exists, so there is nothing to resume with.
+        assert!(approvals::claim_release_token(&log, &req.id, &req.payload_hash).is_err());
         assert!(g.step("z", false, 11).is_err());
         approvals::approve(&mut log, &req.id, &req.payload_hash, "human", 12).unwrap();
-        assert!(g.resume_if_approved(&mut log, &req.id, 13).unwrap());
+        let token = claim(&log, &req);
+        assert!(g.resume_if_approved(&mut log, token, 13).unwrap());
         g.step("z", true, 13).unwrap();
-        // Released: cannot be reused.
+        // Released: no second token, so a still-tripped guard cannot resume.
+        assert!(approvals::claim_release_token(&log, &req.id, &req.payload_hash).is_err());
         let mut g2 = LoopGuard::new("cascade", small(), 0);
-        g2.step("q", false, 500).unwrap_err();
-        assert!(!g2.resume_if_approved(&mut log, &req.id, 14).unwrap());
+        assert!(g2.step("q", false, 500).is_err());
         let kinds: Vec<String> = log.verify().unwrap().into_iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&TRIPPED_KIND.to_string()));
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| k.as_str() == "approval.released")
+                .count(),
+            1
+        );
     }
 
+    /// Denied resumes yield no token; a foreign loop's token is refused.
     #[test]
     fn denied_or_foreign_resume_keeps_tripped() {
         let dir = tempfile::tempdir().unwrap();
@@ -329,10 +351,35 @@ mod tests {
             .unwrap()
             .unwrap();
         approvals::deny(&mut log, &req.id, &req.payload_hash, "human", "no", 201).unwrap();
-        assert!(!g.resume_if_approved(&mut log, &req.id, 202).unwrap());
+        // Denied: no token exists and the guard stays tripped.
+        assert!(approvals::claim_release_token(&log, &req.id, &req.payload_hash).is_err());
+        assert!(g.step("b", false, 202).is_err());
+        // A token approved for another loop is refused, and the approval is
+        // kept: the right loop can still claim and resume afterwards.
+        let req2 = propose_resume(&mut log, &gate(), "a", &g, 203)
+            .unwrap()
+            .unwrap();
+        approvals::approve(&mut log, &req2.id, &req2.payload_hash, "human", 204).unwrap();
         let mut other = LoopGuard::new("other", small(), 0);
         other.step("a", false, 200).unwrap_err();
-        assert!(!other.resume_if_approved(&mut log, &req.id, 202).unwrap());
+        let foreign = claim(&log, &req2);
+        assert!(!other.resume_if_approved(&mut log, foreign, 205).unwrap());
+        assert!(other.step("b", false, 205).is_err());
+        let token = claim(&log, &req2);
+        assert!(g.resume_if_approved(&mut log, token, 206).unwrap());
+        g.step("c", false, 206).unwrap();
+    }
+
+    /// `resume_if_approved` takes the release token by value (compile-time).
+    #[test]
+    fn resume_takes_release_token_by_value() {
+        // Compiles only if `resume_if_approved` takes `ReleaseToken` by value.
+        let _sig: fn(
+            &mut LoopGuard,
+            &mut DecisionLog,
+            ReleaseToken,
+            u64,
+        ) -> Result<bool, ApprovalError> = LoopGuard::resume_if_approved;
     }
 
     #[test]

@@ -26,7 +26,7 @@
 //! The model call is behind `ANCIENTOS_ALLOW_PAID=1` plus a per-run item cap
 //! (`ANCIENTOS_MEDIA_MAX_ITEMS`); without both, [`PaidConfig::from_env`]
 //! refuses. No live backend ships yet; tests use [`MockBackend`].
-use ancientos_core::approvals::{self, ApprovalRequest};
+use ancientos_core::approvals::{self, ApprovalRequest, ReleaseToken};
 use ancientos_core::gate::{Gate, Risk};
 use ancientos_core::log::DecisionLog;
 use serde::{Deserialize, Serialize};
@@ -520,16 +520,18 @@ pub fn propose_store(
 }
 
 /// Release an approved store request and return the findings to write.
-/// Fails unless the log shows a human approval for exactly these findings.
+/// Consumes the [`ReleaseToken`] by value: without a token nothing is
+/// handed back. Fails (nothing released) unless the findings hash exactly
+/// to the token's approved payload and the log still shows that approval.
 pub fn release_store(
     log: &mut DecisionLog,
-    approval_id: &str,
+    token: ReleaseToken,
     findings: &[Finding],
 ) -> Result<Vec<Finding>, String> {
     let payload = store_payload(findings);
-    let hash = approvals::canonical_hash(&approvals::redact(&payload));
-    let token =
-        approvals::claim_release_token(log, approval_id, &hash).map_err(|e| e.to_string())?;
+    if approvals::canonical_hash(&approvals::redact(&payload)) != token.payload_hash() {
+        return Err("findings do not match the approved payload (refused)".to_string());
+    }
     approvals::release(log, token, &payload).map_err(|e| e.to_string())?;
     Ok(findings.to_vec())
 }
@@ -740,6 +742,12 @@ mod tests {
         assert_eq!(again.verify().unwrap().len(), 2);
     }
 
+    /// Test helper: claim the release token for an approved store request.
+    fn claim(log: &DecisionLog, r: &ApprovalRequest) -> ReleaseToken {
+        approvals::claim_release_token(log, &r.id, &r.payload_hash).unwrap()
+    }
+
+    /// Store release consumes a claimed token and runs exactly once.
     #[test]
     fn store_needs_human_approval_then_releases_once() {
         // Post-model mute check fails closed without config; set a
@@ -760,21 +768,26 @@ mod tests {
         .unwrap();
         let gate = store_gate();
         let r = propose_store(&mut log, &gate, &rep.accepted, NOW).unwrap();
+        // Pending: no token exists, so there is nothing to release with.
         assert!(
-            release_store(&mut log, &r.id, &rep.accepted).is_err(),
+            approvals::claim_release_token(&log, &r.id, &r.payload_hash).is_err(),
             "pending must not release"
         );
         approvals::approve(&mut log, &r.id, &r.payload_hash, "nathan", NOW + 1).unwrap();
+        let wrong = claim(&log, &r);
         assert!(
-            release_store(&mut log, &r.id, &rep.accepted[..0]).is_err(),
+            release_store(&mut log, wrong, &rep.accepted[..0]).is_err(),
             "other payload"
         );
+        // The refused token was dropped without releasing: the approval is
+        // kept and a fresh claim still releases.
+        let token = claim(&log, &r);
         assert_eq!(
-            release_store(&mut log, &r.id, &rep.accepted).unwrap().len(),
+            release_store(&mut log, token, &rep.accepted).unwrap().len(),
             1
         );
         assert!(
-            release_store(&mut log, &r.id, &rep.accepted).is_err(),
+            approvals::claim_release_token(&log, &r.id, &r.payload_hash).is_err(),
             "exactly once"
         );
         assert!(propose_store(&mut log, &gate, &[], NOW).is_err());
@@ -782,6 +795,15 @@ mod tests {
             propose_store(&mut log, &Gate::new(), &rep.accepted, NOW).is_err(),
             "empty gate denies"
         );
+    }
+
+    /// `release_store` takes the release token by value (compile-time).
+    #[allow(clippy::type_complexity)]
+    #[test]
+    fn release_store_takes_release_token_by_value() {
+        // Compiles only if `release_store` takes `ReleaseToken` by value.
+        let _sig: fn(&mut DecisionLog, ReleaseToken, &[Finding]) -> Result<Vec<Finding>, String> =
+            release_store;
     }
 
     /// Test helper: accepted finding with synthetic provenance.

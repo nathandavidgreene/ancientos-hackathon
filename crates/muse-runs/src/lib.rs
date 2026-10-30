@@ -10,8 +10,9 @@
 //!    sha256, so an approval covers exactly that prompt.
 //! 2. A person calls [`approve`] or [`deny`] (here, or on web-ui's
 //!    `/approvals` page, which lists every pending request in the log).
-//! 3. [`run`] executes `scripts/muse_run.sh` only for an approved run, only
-//!    with `ANCIENTOS_ALLOW_PAID=1` (every live Muse Code run is billed), and
+//! 3. [`run`] takes the run approval's [`ReleaseToken`]
+//!    by value and executes `scripts/muse_run.sh` only with
+//!    `ANCIENTOS_ALLOW_PAID=1` (every live Muse Code run is billed), and
 //!    only if the prompt file still hashes to the approved sha256. It then
 //!    appends `approval.released` before starting and `muse_runs.finished`
 //!    with the exit code after. A refused run appends nothing and the
@@ -19,7 +20,7 @@
 //!
 //! This crate only touches requests whose agent is [`AGENT`] and whose action
 //! is [`RUN_ACTION`]; anything else in the log is refused (fail closed).
-use ancientos_core::approvals::{self, Approval, ApprovalRequest, Status};
+use ancientos_core::approvals::{self, Approval, ApprovalRequest, ReleaseToken, Status};
 use ancientos_core::gate::{Gate, Risk};
 use ancientos_core::log::DecisionLog;
 use sha2::{Digest, Sha256};
@@ -186,14 +187,18 @@ pub struct Runner {
 }
 
 /// Execute one approved run exactly once and return the script's exit code.
-/// Refused (nothing appended, approval kept) unless the run is Approved, the
-/// paid switch is on, the prompt still matches its approved sha256 and the
-/// script exists. Then appends `approval.released`, runs the script with
+/// Consumes the run approval's [`ReleaseToken`] by value: without a token
+/// the script cannot run. Refused (nothing appended, approval kept) unless
+/// the token's approval belongs to this app, the paid switch is on, the
+/// prompt still matches its approved sha256 and the script exists. Then
+/// appends `approval.released`, runs the script with
 /// `<log-no> <summary> <prompt-file>`, and appends `muse_runs.finished`.
-pub fn run(log: &mut DecisionLog, id: &str, runner: &Runner) -> Result<i32, String> {
-    let a = own(log, id)?;
-    let token = approvals::claim_release_token(log, id, &a.request.payload_hash)
-        .map_err(|e| e.to_string())?;
+pub fn run(log: &mut DecisionLog, token: ReleaseToken, runner: &Runner) -> Result<i32, String> {
+    let a = own(log, token.approval_id())?;
+    let id = a.request.id.clone();
+    if token.payload_hash() != a.request.payload_hash {
+        return Err(format!("'{id}' token does not match its request (refused)"));
+    }
     if !runner.allow_paid {
         return Err(format!(
             "Muse Code runs are paid: set {PAID_ENV_VAR}=1 to run (fail closed; approval kept)"
@@ -315,7 +320,12 @@ pub fn cli(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<i32,
                 repo,
                 allow_paid: env(PAID_ENV_VAR).as_deref() == Some("1"),
             };
-            let code = run(&mut log, id, &runner)?;
+            // Claim first: only an approved run yields a token, and `run`
+            // consumes it, so the script cannot start without one.
+            let a = own(&log, id)?;
+            let token = approvals::claim_release_token(&log, id, &a.request.payload_hash)
+                .map_err(|e| e.to_string())?;
+            let code = run(&mut log, token, &runner)?;
             println!("ran {id}: exit {code}");
             return Ok(code);
         }
@@ -355,6 +365,12 @@ mod tests {
             repo: dir.path().to_path_buf(),
             allow_paid,
         }
+    }
+
+    /// Test helper: claim the release token for an approved run.
+    fn claim(log: &DecisionLog, id: &str) -> ReleaseToken {
+        let a = own(log, id).unwrap();
+        approvals::claim_release_token(log, id, &a.request.payload_hash).unwrap()
     }
 
     impl Fx {
@@ -417,13 +433,18 @@ mod tests {
         assert_eq!(runs(&fx.log, NOW).unwrap().len(), 1);
     }
 
+    /// An approved paid run consumes its token and executes the stub once.
     #[test]
     fn approved_paid_run_executes_stub_once_and_logs_each_step() {
         let mut fx = Fx::new();
         let spec = spec_of(&fx.dir);
         let id = propose(&mut fx.log, &spec, NOW).unwrap().id;
         approve(&mut fx.log, &id, "nathan", NOW + 1).unwrap();
-        assert_eq!(run(&mut fx.log, &id, &runner_of(&fx.dir, true)).unwrap(), 0);
+        let token = claim(&fx.log, &id);
+        assert_eq!(
+            run(&mut fx.log, token, &runner_of(&fx.dir, true)).unwrap(),
+            0
+        );
         assert_eq!(
             fx.calls(),
             vec![
@@ -441,20 +462,28 @@ mod tests {
                 FINISHED_KIND
             ]
         );
-        let err = run(&mut fx.log, &id, &runner_of(&fx.dir, true)).unwrap_err();
-        assert!(err.contains("already released"), "{err}");
+        // Released: no second token exists, so the stub cannot run again.
+        let a = own(&fx.log, &id).unwrap();
+        let err =
+            approvals::claim_release_token(&fx.log, &id, &a.request.payload_hash).unwrap_err();
+        assert!(err.to_string().contains("already released"), "{err}");
         assert_eq!(fx.calls().len(), 3, "stub ran exactly once");
     }
 
+    /// Pending or denied runs yield no token, so the stub never runs.
     #[test]
     fn pending_or_denied_runs_never_execute() {
         let mut fx = Fx::new();
         let id = propose(&mut fx.log, &spec_of(&fx.dir), NOW).unwrap().id;
-        let err = run(&mut fx.log, &id, &runner_of(&fx.dir, true)).unwrap_err();
-        assert!(err.contains("not approved"), "{err}");
+        let a = own(&fx.log, &id).unwrap();
+        let err =
+            approvals::claim_release_token(&fx.log, &id, &a.request.payload_hash).unwrap_err();
+        assert!(err.to_string().contains("not approved"), "{err}");
         deny(&mut fx.log, &id, "nathan", "not today", NOW + 1).unwrap();
-        let err = run(&mut fx.log, &id, &runner_of(&fx.dir, true)).unwrap_err();
-        assert!(err.contains("denied"), "{err}");
+        let a = own(&fx.log, &id).unwrap();
+        let err =
+            approvals::claim_release_token(&fx.log, &id, &a.request.payload_hash).unwrap_err();
+        assert!(err.to_string().contains("denied"), "{err}");
         assert!(fx.calls().is_empty());
         assert_eq!(
             fx.kinds(),
@@ -462,42 +491,56 @@ mod tests {
         );
     }
 
+    /// Paid-off refusal drops the token without releasing; a fresh claim runs.
     #[test]
     fn paid_switch_off_refuses_and_keeps_the_approval() {
         let mut fx = Fx::new();
         let id = propose(&mut fx.log, &spec_of(&fx.dir), NOW).unwrap().id;
         approve(&mut fx.log, &id, "nathan", NOW + 1).unwrap();
-        let err = run(&mut fx.log, &id, &runner_of(&fx.dir, false)).unwrap_err();
+        let token = claim(&fx.log, &id);
+        let err = run(&mut fx.log, token, &runner_of(&fx.dir, false)).unwrap_err();
         assert!(err.contains(PAID_ENV_VAR), "{err}");
         assert!(fx.calls().is_empty());
         assert_eq!(fx.kinds().len(), 2, "refusal appends nothing");
-        assert_eq!(run(&mut fx.log, &id, &runner_of(&fx.dir, true)).unwrap(), 0);
+        let token = claim(&fx.log, &id);
+        assert_eq!(
+            run(&mut fx.log, token, &runner_of(&fx.dir, true)).unwrap(),
+            0
+        );
     }
 
+    /// A prompt edited after approval is refused and the stub never runs.
     #[test]
     fn prompt_edited_after_approval_is_refused() {
         let mut fx = Fx::new();
         let id = propose(&mut fx.log, &spec_of(&fx.dir), NOW).unwrap().id;
         approve(&mut fx.log, &id, "nathan", NOW + 1).unwrap();
         std::fs::write(fx.dir.path().join("prompt.md"), "do something else\n").unwrap();
-        let err = run(&mut fx.log, &id, &runner_of(&fx.dir, true)).unwrap_err();
+        let token = claim(&fx.log, &id);
+        let err = run(&mut fx.log, token, &runner_of(&fx.dir, true)).unwrap_err();
         assert!(err.contains("changed since approval"), "{err}");
         assert!(fx.calls().is_empty());
         assert_eq!(fx.kinds().len(), 2);
     }
 
+    /// A nonzero stub exit is returned and recorded in the log.
     #[test]
     fn nonzero_exit_is_returned_and_logged() {
         let mut fx = Fx::new();
         std::fs::write(fx.dir.path().join("exit.txt"), "3").unwrap();
         let id = propose(&mut fx.log, &spec_of(&fx.dir), NOW).unwrap().id;
         approve(&mut fx.log, &id, "nathan", NOW + 1).unwrap();
-        assert_eq!(run(&mut fx.log, &id, &runner_of(&fx.dir, true)).unwrap(), 3);
+        let token = claim(&fx.log, &id);
+        assert_eq!(
+            run(&mut fx.log, token, &runner_of(&fx.dir, true)).unwrap(),
+            3
+        );
         let last = fx.log.verify().unwrap().pop().unwrap();
         assert_eq!(last.kind, FINISHED_KIND);
         assert_eq!(last.payload["exit_code"], 3);
     }
 
+    /// Another app's approval cannot run here, even with a live token.
     #[test]
     fn other_apps_requests_are_refused() {
         let mut fx = Fx::new();
@@ -516,9 +559,24 @@ mod tests {
         .unwrap();
         let err = approve(&mut fx.log, &req.id, "nathan", NOW).unwrap_err();
         assert!(err.contains("not a muse-runs request"), "{err}");
-        assert!(run(&mut fx.log, &req.id, &runner_of(&fx.dir, true)).is_err());
+        // Approved at the core level and claimed: `run` still refuses it.
+        approvals::approve(&mut fx.log, &req.id, &req.payload_hash, "nathan", NOW).unwrap();
+        let token = approvals::claim_release_token(&fx.log, &req.id, &req.payload_hash).unwrap();
+        let err = run(&mut fx.log, token, &runner_of(&fx.dir, true)).unwrap_err();
+        assert!(err.contains("not a muse-runs request"), "{err}");
+        assert!(fx.calls().is_empty());
         assert!(runs(&fx.log, NOW).unwrap().is_empty());
-        assert_eq!(fx.kinds().len(), 1);
+        assert_eq!(
+            fx.kinds(),
+            vec![approvals::REQUESTED_KIND, approvals::APPROVED_KIND]
+        );
+    }
+
+    /// `run` takes the release token by value (compile-time).
+    #[test]
+    fn run_takes_release_token_by_value() {
+        // Compiles only if `run` takes `ReleaseToken` by value.
+        let _sig: fn(&mut DecisionLog, ReleaseToken, &Runner) -> Result<i32, String> = run;
     }
 
     #[test]

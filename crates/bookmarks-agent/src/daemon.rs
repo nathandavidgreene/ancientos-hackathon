@@ -12,11 +12,13 @@
 //! (both [`Risk::High`](ancientos_core::gate::Risk) in the single
 //! [`app_gate`](crate::app_gate) policy) instead of
 //! calling Muse. A paid walkthrough runs only after a human approves the
-//! exact payload and the daemon claims and releases it
-//! ([`claim_release_token`](ancientos_core::approvals::claim_release_token)
-//! plus [`release`](ancientos_core::approvals::release), exactly once),
-//! through the existing deeper paid path (which still requires
-//! `ANCIENTOS_ALLOW_PAID=1`). Denied or expired proposals never execute.
+//! exact payload: the daemon claims the release token
+//! ([`claim_release_token`](ancientos_core::approvals::claim_release_token))
+//! and moves it into the paid executor, which releases it
+//! ([`release`](ancientos_core::approvals::release), exactly once) before
+//! running the existing deeper paid path (which still requires
+//! `ANCIENTOS_ALLOW_PAID=1`). Denied, expired or already-released proposals
+//! never execute; a released-but-unfinished job needs a fresh approval.
 //!
 //! Clocks: `--now <rfc3339>` fixes the wall clock for deterministic runs
 //! (log timestamps, brief dates, due checks); without it the system clock
@@ -363,12 +365,13 @@ fn is_job_approval(a: &approvals::Approval, action: &str, payload_hash: &str) ->
 ///   [`DEEPER_PROPOSED_KIND`](crate::deeper::DEEPER_PROPOSED_KIND). It
 ///   executes only later, when an approved request for that exact payload
 ///   exists: the daemon claims the [`ReleaseToken`](approvals::ReleaseToken)
-///   from the human decision, calls [`release`](approvals::release)
-///   (exactly once per approval) and runs the existing deeper paid path
-///   (which still requires `ANCIENTOS_ALLOW_PAID=1`). A request that is
-///   already released executes without a second release (crash recovery).
-///   Denied proposals are skipped forever; expired ones get one fresh
-///   proposal (the expired request itself never executes).
+///   from the human decision and moves it into the paid executor, which
+///   calls [`release`](approvals::release) (exactly once per approval)
+///   before running the existing deeper paid path (which still requires
+///   `ANCIENTOS_ALLOW_PAID=1`). A request that is already released never
+///   executes again: a job whose release happened but which never finished
+///   gets one fresh proposal, like an expired one. Denied proposals are
+///   skipped forever.
 ///
 /// Every due job is attempted; failures are collected and returned as one
 /// `Err` listing the failed post ids (other jobs and agents still run).
@@ -487,29 +490,27 @@ fn paid_job_step(
     let approved = decided
         .iter()
         .find(|a| a.status == approvals::Status::Approved);
-    let released = decided
-        .iter()
-        .any(|a| a.status == approvals::Status::Released);
     let denied = decided
         .iter()
         .any(|a| a.status == approvals::Status::Denied);
-    if released {
-        // Already released (a previous tick released then failed before
-        // marking done): execute without a second release.
-        return execute_paid(ctx, job, now, fetch_thread, fetch_post, call);
-    }
     if let Some(a) = approved {
         let id = a.request.id.clone();
         let hash = a.request.payload_hash.clone();
-        let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+        let log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
         let token = match approvals::claim_release_token(&log, &id, &hash) {
             Ok(t) => t,
             Err(e) => return Ok(PaidStep::Failed(format!("claim failed: {e}"))),
         };
-        if let Err(e) = approvals::release(&mut log, token, payload) {
-            return Ok(PaidStep::Failed(format!("release failed: {e}")));
-        }
-        return execute_paid(ctx, job, now, fetch_thread, fetch_post, call);
+        return execute_paid(
+            token,
+            ctx,
+            job,
+            payload,
+            now,
+            fetch_thread,
+            fetch_post,
+            call,
+        );
     }
     if !pending.is_empty() {
         ensure_proposed(ctx, job, pending[0].request.id.clone(), now)?;
@@ -519,9 +520,11 @@ fn paid_job_step(
         // A human said no: never execute, never re-propose.
         return Ok(PaidStep::SkippedDenied);
     }
-    // Nothing pending/approved/released (new job, or the old request
-    // expired): propose a fresh approval. The expired request itself is
-    // never executed.
+    // Nothing usable (a new job, an expired request, or a released request
+    // whose job never finished): propose a fresh approval. The old request
+    // itself is never executed: every execution consumes a fresh token in
+    // `execute_paid`, so a retry after a crash or a failed paid run needs a
+    // fresh human approval.
     let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
     let req = match approvals::request(
         &mut log,
@@ -562,16 +565,28 @@ fn ensure_proposed(
     Ok(())
 }
 
-/// Run the paid walkthrough after a successful release and mark the job
-/// done. Returns [`PaidStep::Executed`] or [`PaidStep::Failed`].
+/// Run the paid walkthrough for one approved job and mark the job done.
+/// Consumes the job approval's [`ReleaseToken`](approvals::ReleaseToken) by
+/// value together with the exact approved `payload`: the token is released
+/// first (exactly once per approval, so a second execution with another
+/// token fails here), and only then does the paid path run. Without a token
+/// this function cannot be called. Returns [`PaidStep::Executed`] or
+/// [`PaidStep::Failed`].
+#[allow(clippy::too_many_arguments)]
 fn execute_paid(
+    token: approvals::ReleaseToken,
     ctx: &AgentCtx,
     job: &crate::deeper::QueuedJob,
+    payload: &serde_json::Value,
     now: u64,
     fetch_thread: &crate::delegate::ThreadFetcher<'_>,
     fetch_post: &crate::deeper::PostFetcher<'_>,
     call: &crate::deeper::DeeperMuseCaller<'_>,
 ) -> Result<PaidStep, String> {
+    let mut log = DecisionLog::open(&ctx.log_path).map_err(|e| e.to_string())?;
+    if let Err(e) = approvals::release(&mut log, token, payload) {
+        return Ok(PaidStep::Failed(format!("release failed: {e}")));
+    }
     match crate::deeper::run_with(
         &job.post_id,
         true,
@@ -1292,6 +1307,96 @@ mod tests {
             1,
             "released exactly once"
         );
+    }
+
+    /// `execute_paid` takes the release token by value (compile-time).
+    #[allow(clippy::type_complexity)]
+    #[test]
+    fn execute_paid_takes_release_token_by_value() {
+        // Compiles only if `execute_paid` takes `ReleaseToken` by value.
+        let _sig: for<'a, 'b, 'c> fn(
+            approvals::ReleaseToken,
+            &AgentCtx,
+            &crate::deeper::QueuedJob,
+            &serde_json::Value,
+            u64,
+            &crate::delegate::ThreadFetcher<'a>,
+            &crate::deeper::PostFetcher<'b>,
+            &crate::deeper::DeeperMuseCaller<'c>,
+        ) -> Result<PaidStep, String> = execute_paid;
+    }
+
+    /// A released-but-unfinished job needs a fresh approval to execute.
+    #[test]
+    fn released_without_done_needs_fresh_approval_to_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir, false);
+        queue_job(&ctx, "100", NOW, NOW);
+        let calls = Cell::new(0usize);
+        let fetch_thread = |id: &str| Ok(mock_thread(id));
+        let fetch_post = |id: &str| Ok(mock_thread(id).posts[0].clone());
+        let call = |_: &str, _: Option<&str>| {
+            calls.set(calls.get() + 1);
+            Ok((
+                "1. Install WordCraft now\n2. Open a page daily\n".to_string(),
+                "mock-spark".to_string(),
+                None,
+                None,
+            ))
+        };
+        // Tick 1 proposes.
+        let t1 =
+            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert_eq!(t1.proposed, vec!["100".to_string()]);
+        // A human approves; the executor releases, then the process dies
+        // before marking done (simulated by releasing directly).
+        let mut log = DecisionLog::open(&ctx.log_path).unwrap();
+        let req = approvals::pending(&log, NOW).unwrap();
+        assert_eq!(req.len(), 1);
+        let first_id = req[0].request.id.clone();
+        let hash = req[0].request.payload_hash.clone();
+        let payload = req[0].request.payload.clone();
+        let approved = approvals::approve(&mut log, &first_id, &hash, "human", NOW).unwrap();
+        drop(approved);
+        let token = approvals::claim_release_token(&log, &first_id, &hash).unwrap();
+        approvals::release(&mut log, token, &payload).unwrap();
+        drop(log);
+        // Tick 2 (a second later, so the fresh request gets a new id) must
+        // not execute the released request: it proposes a fresh approval
+        // and the mock is never called.
+        let t2 =
+            deeper_queue_tick_with(&ctx, NOW + 1, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert!(t2.executed_paid.is_empty());
+        assert_eq!(t2.proposed, vec!["100".to_string()]);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            entries_of(&ctx.log_path)
+                .iter()
+                .filter(|e| e.kind == approvals::RELEASED_KIND)
+                .count(),
+            1,
+            "no second release of the old request"
+        );
+        assert!(
+            !entries_of(&ctx.log_path)
+                .iter()
+                .any(|e| e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND),
+            "unfinished jobs are never marked done"
+        );
+        // Approving the fresh request executes exactly once via the mock.
+        let mut log = DecisionLog::open(&ctx.log_path).unwrap();
+        let pending = approvals::pending(&log, NOW + 1).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_ne!(pending[0].request.id, first_id);
+        let fresh_id = pending[0].request.id.clone();
+        let fresh_hash = pending[0].request.payload_hash.clone();
+        approvals::approve(&mut log, &fresh_id, &fresh_hash, "human", NOW + 1).unwrap();
+        drop(log);
+        let t3 =
+            deeper_queue_tick_with(&ctx, NOW + 1, true, &fetch_thread, &fetch_post, &call).unwrap();
+        assert_eq!(t3.executed_paid, vec!["100".to_string()]);
+        assert_eq!(calls.get(), 1);
+        assert!(ctx.deeper_dir.join("100.md").exists());
     }
 
     #[test]

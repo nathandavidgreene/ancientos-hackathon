@@ -12,15 +12,16 @@
 //!    question's sha256, so an approval covers exactly that question.
 //! 2. A person approves or denies it ([`approve`]/[`deny`], web-ui
 //!    `/approvals`, or the phone page `/m`).
-//! 3. [`ask`] calls the model only for an approved request, only with the
-//!    paid switch on, and only if the client is the Wonder route. It
-//!    appends `approval.released` before the call and `wonder.answered`
-//!    (answer text plus its sha256) after. A refused ask appends nothing and
-//!    the approval stays usable; a failed call is logged with its error.
+//! 3. [`ask`] takes the question approval's [`ReleaseToken`]
+//!    by value and calls the model only with the paid switch on, and only
+//!    if the client is the Wonder route. It appends `approval.released`
+//!    before the call and `wonder.answered` (answer text plus its sha256)
+//!    after. A refused ask appends nothing and the approval stays usable; a
+//!    failed call is logged with its error.
 //!
 //! The live client ([`live_client`]) needs `ANCIENTOS_ALLOW_PAID=1` and
 //! `WONDER_MODEL` (no default model id is guessed). Tests use mocks.
-use ancientos_core::approvals::{self, Approval, ApprovalRequest, Status};
+use ancientos_core::approvals::{self, Approval, ApprovalRequest, ReleaseToken, Status};
 use ancientos_core::gate::{Gate, Risk};
 use ancientos_core::log::DecisionLog;
 use ancientos_router::data_class::DataClass;
@@ -158,18 +159,22 @@ pub fn deny(
 }
 
 /// Ask Muse Wonder one approved question, exactly once, and return the
-/// answer. Refused (nothing appended, approval kept) unless the request is
-/// Approved, `allow_paid` is on, the client is the Wonder route, and the
-/// stored question still matches its sha256.
+/// answer. Consumes the question approval's [`ReleaseToken`] by value:
+/// without a token the model is never called. Refused (nothing appended,
+/// approval kept) unless the token's approval belongs to this app,
+/// `allow_paid` is on, the client is the Wonder route, and the stored
+/// question still matches its sha256.
 pub fn ask(
     log: &mut DecisionLog,
-    id: &str,
+    token: ReleaseToken,
     client: &dyn ModelClient,
     allow_paid: bool,
 ) -> Result<String, String> {
-    let a = own(log, id)?;
-    let token = approvals::claim_release_token(log, id, &a.request.payload_hash)
-        .map_err(|e| e.to_string())?;
+    let a = own(log, token.approval_id())?;
+    let id = a.request.id.clone();
+    if token.payload_hash() != a.request.payload_hash {
+        return Err(format!("'{id}' token does not match its request (refused)"));
+    }
     if !allow_paid {
         return Err(format!(
             "Muse Wonder calls are paid: set {PAID_ENV_VAR}=1 (fail closed; approval kept)"
@@ -345,7 +350,11 @@ pub fn cli(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(), 
                 ));
             }
             let client = live_client(env)?;
-            println!("{}", ask(&mut log, id, &client, paid)?);
+            // Claim first: only an approved question yields a token, and
+            // `ask` consumes it, so the model cannot be called without one.
+            let token = approvals::claim_release_token(&log, id, &a.request.payload_hash)
+                .map_err(|e| e.to_string())?;
+            println!("{}", ask(&mut log, token, &client, paid)?);
         }
         ["show", id] => match answer_of(&log, id)? {
             Some(a) => println!("{a}"),
@@ -405,6 +414,11 @@ mod tests {
         (dir, log)
     }
 
+    /// Test helper: claim the release token for an approved question.
+    fn claim(log: &DecisionLog, r: &ApprovalRequest) -> ReleaseToken {
+        approvals::claim_release_token(log, &r.id, &r.payload_hash).unwrap()
+    }
+
     /// Test helper: number of log entries.
     fn len(log: &DecisionLog) -> usize {
         log.verify_or_empty().unwrap().len()
@@ -446,22 +460,30 @@ mod tests {
         ));
     }
 
+    /// Ask consumes a claimed token; refusals keep the approval usable.
     #[test]
     fn ask_needs_approval_paid_and_wonder_route() {
         let (_d, mut log) = log();
         let r = propose(&mut log, "what if", Sensitivity::Sanitized, NOW).unwrap();
         let mock = Mock::at(Destination::MuseWonder);
-        assert!(ask(&mut log, &r.id, &mock, true).is_err(), "pending");
+        // Pending: no token exists, so the model cannot be called.
+        assert!(
+            approvals::claim_release_token(&log, &r.id, &r.payload_hash).is_err(),
+            "pending"
+        );
         approve(&mut log, &r.id, "human", NOW + 1).unwrap();
         let before = len(&log);
-        assert!(ask(&mut log, &r.id, &mock, false)
+        let unpaid = claim(&log, &r);
+        assert!(ask(&mut log, unpaid, &mock, false)
             .unwrap_err()
             .contains(PAID_ENV_VAR));
         let spark = Mock::at(Destination::MuseSpark);
-        assert!(ask(&mut log, &r.id, &spark, true).is_err());
+        let rerouted = claim(&log, &r);
+        assert!(ask(&mut log, rerouted, &spark, true).is_err());
         assert_eq!(len(&log), before, "refusals append nothing");
         assert!(mock.seen.borrow().is_empty() && spark.seen.borrow().is_empty());
-        let answer = ask(&mut log, &r.id, &mock, true).unwrap();
+        let token = claim(&log, &r);
+        let answer = ask(&mut log, token, &mock, true).unwrap();
         assert!(answer.contains("what if A"));
         assert_eq!(mock.seen.borrow().len(), 1);
         assert!(mock.seen.borrow()[0].contains("Question: what if"));
@@ -469,18 +491,19 @@ mod tests {
             answer_of(&log, &r.id).unwrap().as_deref(),
             Some(answer.as_str())
         );
-        // Exactly once.
-        assert!(ask(&mut log, &r.id, &mock, true).is_err());
+        // Exactly once: released approvals yield no second token.
+        assert!(approvals::claim_release_token(&log, &r.id, &r.payload_hash).is_err());
         assert_eq!(mock.seen.borrow().len(), 1);
     }
 
+    /// Denied questions yield no token, so the model is never called.
     #[test]
     fn denied_and_foreign_requests_never_call() {
         let (_d, mut log) = log();
         let r = propose(&mut log, "what if", Sensitivity::Sanitized, NOW).unwrap();
         deny(&mut log, &r.id, "human", "no", NOW + 1).unwrap();
         let mock = Mock::at(Destination::MuseWonder);
-        assert!(ask(&mut log, &r.id, &mock, true).is_err());
+        assert!(approvals::claim_release_token(&log, &r.id, &r.payload_hash).is_err());
         let mut g = Gate::new();
         g.register("other.x", Risk::High);
         let other = approvals::request(
@@ -500,6 +523,7 @@ mod tests {
         assert!(mock.seen.borrow().is_empty());
     }
 
+    /// A failed model call is logged with its error and never retried.
     #[test]
     fn failed_call_is_logged_and_not_retried() {
         let (_d, mut log) = log();
@@ -507,7 +531,8 @@ mod tests {
         approve(&mut log, &r.id, "human", NOW + 1).unwrap();
         let mut mock = Mock::at(Destination::MuseWonder);
         mock.fail = true;
-        assert!(ask(&mut log, &r.id, &mock, true)
+        let token = claim(&log, &r);
+        assert!(ask(&mut log, token, &mock, true)
             .unwrap_err()
             .contains("synthetic 500"));
         assert_eq!(answer_of(&log, &r.id).unwrap(), None);
@@ -517,6 +542,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("synthetic 500"));
+    }
+
+    /// `ask` takes the release token by value (compile-time).
+    #[test]
+    fn ask_takes_release_token_by_value() {
+        // Compiles only if `ask` takes `ReleaseToken` by value.
+        let _sig: fn(
+            &mut DecisionLog,
+            ReleaseToken,
+            &dyn ModelClient,
+            bool,
+        ) -> Result<String, String> = ask;
     }
 
     #[test]
