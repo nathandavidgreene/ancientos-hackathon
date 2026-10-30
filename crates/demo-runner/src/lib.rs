@@ -825,6 +825,9 @@ impl Workspace {
     /// can never touch the network. The real `ANCIENTOS_ALLOW_PAID` switch
     /// must stay unset. Returns the pending `deeper.paid` approval.
     pub fn approvals_propose(&self) -> Result<ApprovalsPropose, String> {
+        let _mute = bookmarks_agent::topic_mute::set_terms(
+            bookmarks_agent::topic_mute::MuteList::default(),
+        );
         require_paid_off()?;
         let now = approvals_demo_now();
         let post_id = APPROVALS_DEMO_POST_ID;
@@ -896,6 +899,9 @@ impl Workspace {
     /// exactly once and run the walkthrough through the mock. Fails closed
     /// when nothing is approved yet (the CLI approve step runs first).
     pub fn approvals_release(&self) -> Result<ApprovalsRelease, String> {
+        let _mute = bookmarks_agent::topic_mute::set_terms(
+            bookmarks_agent::topic_mute::MuteList::default(),
+        );
         require_paid_off()?;
         let now = approvals_demo_now();
         let post_id = APPROVALS_DEMO_POST_ID;

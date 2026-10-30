@@ -1281,12 +1281,29 @@ pub fn run_with(
     log: Option<&mut DecisionLog>,
 ) -> Result<DeeperResult, String> {
     validate_post_id(post_id)?;
+    crate::topic_mute::screen_stored_post(
+        post_id,
+        offline_fixture,
+        log_path.parent().unwrap_or(Path::new(".")),
+    )?;
     let (thread, username, quoted, linked, media) = match offline_fixture {
         Some(path) => offline_context(path, post_id)?,
         None => online_context(post_id, fetch_thread, fetch_post)?,
     };
     if thread.is_empty() {
         return Err("thread is empty".to_string());
+    }
+    let mutes = crate::topic_mute::current()?;
+    for post in thread.iter().chain(quoted.iter()).chain(linked.iter()) {
+        if mutes.matches_any(&[
+            &post.text,
+            post.quoted
+                .as_ref()
+                .map(|(_, text)| text.as_str())
+                .unwrap_or(""),
+        ]) {
+            return Err("excluded topic".into());
+        }
     }
     // Highest class across the thread plus quoted/linked posts (and inline
     // quoted text): the paid prompt below carries all of it.
@@ -1682,6 +1699,7 @@ mod tests {
 
     #[test]
     fn linked_ids_find_status_urls() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         assert!(extract_linked_ids("[synthetic] no links here").is_empty());
         assert_eq!(
             extract_linked_ids("[synthetic] see https://x.com/syn/status/123 and https://twitter.com/syn/status/456"),
@@ -1697,6 +1715,7 @@ mod tests {
 
     #[test]
     fn local_fallback_is_deterministic_with_all_sections() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(&dir, "t.jsonl", &thread_fixture());
         let log = dir.path().join("d.jsonl");
@@ -1748,6 +1767,7 @@ mod tests {
 
     #[test]
     fn offline_collects_thread_quoted_and_linked() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(&dir, "t.jsonl", &thread_fixture());
         let res = run_with(
@@ -1826,6 +1846,7 @@ mod tests {
 
     #[test]
     fn non_try_it_fallback_quotes_real_text_without_placeholders() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(&dir, "rich.jsonl", &rich_thread_fixture());
         let run_once = || {
@@ -1891,6 +1912,7 @@ mod tests {
 
     #[test]
     fn non_try_it_fallback_lists_claims_per_post() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(&dir, "rich.jsonl", &rich_thread_fixture());
         let res = run_with(
@@ -1920,6 +1942,7 @@ mod tests {
 
     #[test]
     fn try_it_includes_steps_and_media() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(
             &dir,
@@ -1958,6 +1981,7 @@ mod tests {
 
     #[test]
     fn bad_id_rejected_before_any_write() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         for bad in ["", "abc", "12 3", "../100", "100/", "10\n0", "0x12"] {
             let dir = tempfile::tempdir().unwrap();
             let log = dir.path().join("d.jsonl");
@@ -1983,6 +2007,7 @@ mod tests {
 
     #[test]
     fn fetch_error_writes_nothing() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2011,6 +2036,7 @@ mod tests {
 
     #[test]
     fn quoted_fetch_error_writes_nothing() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2031,6 +2057,7 @@ mod tests {
 
     #[test]
     fn paid_path_uses_caller_and_logs_usage() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2105,6 +2132,7 @@ mod tests {
 
     #[test]
     fn empty_model_output_errors_with_nothing_written() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2133,6 +2161,7 @@ mod tests {
 
     #[test]
     fn paid_path_refuses_non_public_thread_with_zero_calls() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2176,6 +2205,7 @@ mod tests {
 
     #[test]
     fn paid_path_logs_allowed_entry_before_done() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2217,6 +2247,7 @@ mod tests {
 
     #[test]
     fn decision_log_entry_appended_for_local_run() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("sub").join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2255,6 +2286,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_file_is_0600_and_dir_is_0700() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(&dir, "t.jsonl", &thread_fixture());
@@ -2279,6 +2311,7 @@ mod tests {
 
     #[test]
     fn cap_constant_is_3000_with_continue_prompt() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         assert_eq!(DEEPER_MAX_COMPLETION_TOKENS, 3000);
         assert_eq!(
             DEEPER_CONTINUE_PROMPT,
@@ -2289,6 +2322,7 @@ mod tests {
 
     #[test]
     fn continuation_on_length_concatenates_once() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2365,6 +2399,7 @@ mod tests {
 
     #[test]
     fn still_truncated_after_continuation_appends_marker() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2410,6 +2445,7 @@ mod tests {
 
     #[test]
     fn continuation_error_writes_nothing() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("d.jsonl");
         let out_dir = dir.path().join("deeper");
@@ -2448,6 +2484,7 @@ mod tests {
 
     #[test]
     fn strips_tco_links_from_steps() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         assert_eq!(strip_tco_links("see https://t.co/abc123 now"), "see  now");
         assert_eq!(clean_step_text("see https://t.co/abc123 now"), "see now");
         assert_eq!(
@@ -2470,6 +2507,7 @@ mod tests {
 
     #[test]
     fn steps_are_plain_without_markdown_or_quotes() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         assert_eq!(
             clean_step_text("[guide](https://example.com) helps"),
             "guide helps"
@@ -2492,6 +2530,7 @@ mod tests {
 
     #[test]
     fn quoted_text_never_becomes_steps() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(
             &dir,
@@ -2566,6 +2605,7 @@ mod tests {
 
     #[test]
     fn try_it_steps_strip_tco_links_end_to_end() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(
             &dir,
@@ -2600,6 +2640,7 @@ mod tests {
 
     #[test]
     fn non_try_it_steps_are_plain_numbered_lines() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fixture = write_fixture(&dir, "rich.jsonl", &rich_thread_fixture());
         let res = run_with(
@@ -2630,6 +2671,7 @@ mod tests {
 
     #[test]
     fn title_comes_from_first_post_line() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let t = short_title(&[post("1", "[synthetic] Install WordCraft and open a page")]);
         assert_eq!(t, "[synthetic] Install WordCraft and open a page");
         // First non-empty line wins; handles and URLs are stripped.
@@ -2650,6 +2692,7 @@ mod tests {
 
     #[test]
     fn saved_file_starts_with_title_and_quoted_ampersand_heading() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         for (id, fixture_fn) in [
             ("100", thread_fixture()),
             ("demo-3001", rich_thread_fixture()),
@@ -2729,6 +2772,7 @@ mod tests {
 
     #[test]
     fn imperative_conversion_strips_leaders_and_capitalizes() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         assert_eq!(
             to_imperative_form("Install WordCraft now"),
             "Install WordCraft now"
@@ -2762,6 +2806,7 @@ mod tests {
 
     #[test]
     fn step_filter_drops_non_imperative_empty_url_and_duplicates() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let raw = vec![
             "Install WordCraft now".to_string(),
             "install wordcraft now".to_string(), // duplicate (case-insensitive)
@@ -2785,6 +2830,7 @@ mod tests {
 
     #[test]
     fn model_steps_filter_and_renumber() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let content = "## Walkthrough\n1. Install WordCraft now\n2. This is a very interesting post\n3. https://example.com/x\n4. Create a page for notes\n5. create a page for notes\n";
         let out = filter_model_steps(content);
         assert_eq!(
@@ -2801,6 +2847,7 @@ mod tests {
 
     #[test]
     fn paid_section_lists_quoted_and_linked() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let out = quoted_linked_section(&[post("9", "quoted text")], &[]);
         assert!(
             out.contains("## Quoted & linked") && out.contains("(quoted 9) quoted text"),
@@ -2811,6 +2858,7 @@ mod tests {
 
     #[test]
     fn paid_prompt_requires_imperative_grounded_steps() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let prompt = build_paid_prompt(
             &[post("1", "[synthetic] Install WordCraft and open a page")],
             &[],
@@ -2831,6 +2879,7 @@ mod tests {
 
     #[test]
     fn paid_prompt_keeps_titles_and_ancientos_out_of_steps() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let prompt = build_paid_prompt(
             &[post("1", "[synthetic] Install WordCraft and open a page")],
             &[],
@@ -2847,6 +2896,7 @@ mod tests {
 
     #[test]
     fn local_fallback_steps_stay_post_text_only() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         // The local fallback derives steps from post text, so it never
         // forces "AncientOS" into steps; pin that no section mentions it.
         let dir = tempfile::tempdir().unwrap();
@@ -2883,6 +2933,7 @@ mod tests {
 
     #[test]
     fn queue_later_appends_and_folds_to_due() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let (mut log, path) = queue_log(&dir);
         let e = queue_later(&mut log, "100", 2_000, 1_000).unwrap();
@@ -2908,6 +2959,7 @@ mod tests {
 
     #[test]
     fn queue_later_refuses_past_bad_id_and_keeps_first() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let (mut log, path) = queue_log(&dir);
         assert_eq!(
@@ -2927,6 +2979,7 @@ mod tests {
 
     #[test]
     fn queue_fold_tracks_proposed_then_done_and_ignores_strays() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let (mut log, path) = queue_log(&dir);
         queue_later(&mut log, "100", 2_000, 1_000).unwrap();
@@ -2974,6 +3027,7 @@ mod tests {
 
     #[test]
     fn paid_with_paths_needs_the_switch_and_touches_no_network() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let _env = crate::test_support::EnvHold::paid_off();
         let dir = tempfile::tempdir().unwrap();
         let err = run_paid_with_paths(

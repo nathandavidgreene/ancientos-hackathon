@@ -22,6 +22,8 @@ pub fn requests_from_rows(rows: &[MediaRow]) -> Vec<MediaRequest> {
             }
             None => out.push(MediaRequest {
                 post_id: r.post_id.clone(),
+                full_text: r.full_text.clone(),
+                quoted_text: r.quoted_text.clone(),
                 media_keys: vec![r.media_key.clone()],
             }),
         }

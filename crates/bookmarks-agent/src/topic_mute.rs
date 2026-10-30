@@ -86,6 +86,47 @@ pub fn excluded_topic(text: &str) -> Option<String> {
     }
 }
 
+/// Refuse a muted or unavailable stored root before any thread or model fetch.
+/// Empty mute lists need no store read. Explicit fixtures stay isolated from live data.
+pub fn screen_stored_post(
+    post_id: &str,
+    fixture: Option<&std::path::Path>,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    let mutes = current().map_err(|_| "excluded topic: mute config unavailable".to_string())?;
+    if mutes.is_empty() {
+        return Ok(());
+    }
+    let rows = if let Some(path) = fixture {
+        crate::fixture::load(path)
+            .map_err(|_| "excluded topic: post context unavailable".to_string())?
+    } else {
+        let real = dir.join(crate::ingest::BOOKMARKS_FILE_NAME);
+        let path = if real.exists() {
+            real
+        } else {
+            dir.join("store.jsonl")
+        };
+        crate::ingest::Store::load_from(&path)?
+            .by_id
+            .into_values()
+            .collect()
+    };
+    let post = rows
+        .iter()
+        .find(|b| b.post_id == post_id)
+        .ok_or("excluded topic: post context unavailable")?;
+    let alt: Vec<&str> = post
+        .media
+        .iter()
+        .filter_map(|m| m.alt_text.as_deref())
+        .collect();
+    if mutes.is_muted(post, &alt) {
+        return Err("excluded topic".into());
+    }
+    Ok(())
+}
+
 /// Env var holding an inline muted-term list.
 pub const TERMS_ENV_VAR: &str = "ANCIENTOS_MUTED_TERMS";
 /// Env var naming a private file with one muted term per line.

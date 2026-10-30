@@ -93,3 +93,7 @@ of `{post_id, index, kind, path, width, height}` or `{..., skipped: reason}`
 per item — no post text. Muted posts are skipped via the shared
 `topic_mute` list (fail closed when unreadable), downloads are incremental
 and bounded to X media hosts only, and no paid calls are made.
+
+Media rows must include original `full_text` and, when applicable, `quoted_text`.
+Missing post context fails closed. Post text, quoted text, and alt text are
+screened against mutes before resolution or any backend call.

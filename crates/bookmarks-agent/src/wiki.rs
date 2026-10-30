@@ -1288,6 +1288,15 @@ fn log_refused_egress(log_path: &Path, class: DataClass) {
 /// compiles instead, so an ingest always produces cited pages. Paid calls
 /// are incremental: an unchanged (reused) raw never triggers a model call.
 pub fn ingest_with(input: &IngestInput, ctx: &IngestCtx<'_>) -> Result<IngestReport, String> {
+    let mutes = crate::topic_mute::current()?;
+    let mut texts: Vec<&str> = vec![&input.text];
+    texts.extend(input.thread.iter().map(String::as_str));
+    texts.extend(input.delegate_notes.as_deref());
+    texts.extend(input.cards.iter().map(|c| c.idea.as_str()));
+    if mutes.matches_any(&texts) {
+        return Err("excluded topic".into());
+    }
+
     if !valid_id(&input.post_id) {
         return Err(format!("invalid post id for ingest: {:?}", input.post_id));
     }
@@ -1629,6 +1638,15 @@ pub fn ingest_post(post_id: &str) -> Result<IngestReport, String> {
         .iter()
         .find(|b| b.post_id == post_id)
         .ok_or_else(|| format!("post {post_id} is not in the merged store"))?;
+    let mutes = crate::topic_mute::current()?;
+    let alt: Vec<&str> = bookmark
+        .media
+        .iter()
+        .filter_map(|m| m.alt_text.as_deref())
+        .collect();
+    if mutes.is_muted(bookmark, &alt) {
+        return Err("excluded topic".into());
+    }
     let root = thread_post_of(bookmark);
     let candidates: Vec<crate::unroll::ThreadPost> = merged
         .rows
@@ -2476,6 +2494,20 @@ mod tests {
             muse: None,
             local: None,
         }
+    }
+
+    #[test]
+    fn muted_wiki_input_is_refused_before_backend_or_write() {
+        let (_dir, wiki, log) = setup();
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new(["zorblax"]));
+        let mut input = public_input("demo-123");
+        input.text = "zorblax".into();
+        let backend = |_: &str| -> Result<_, String> { panic!("muted input reached backend") };
+        let mut context = ctx(&wiki, &log, true);
+        context.muse = Some(&backend);
+        assert!(ingest_with(&input, &context)
+            .unwrap_err()
+            .contains("excluded topic"));
     }
 
     #[test]

@@ -1224,6 +1224,7 @@ mod tests {
 
     #[test]
     fn config_defaults_and_env_override() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let _lock = crate::test_support::lock_env();
         for var in [
             BRIEF_SECS_ENV,
@@ -1260,6 +1261,7 @@ mod tests {
 
     #[test]
     fn scheduler_runs_due_and_skips_not_due() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let _env = crate::test_support::EnvHold::paid_off();
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(&dir);
@@ -1278,6 +1280,7 @@ mod tests {
 
     #[test]
     fn once_is_deterministic_across_dirs() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let _env = crate::test_support::EnvHold::paid_off();
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
@@ -1299,6 +1302,7 @@ mod tests {
 
     #[test]
     fn agent_error_isolated_and_logged() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let _env = crate::test_support::EnvHold::paid_off();
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(&dir, false);
@@ -1334,6 +1338,7 @@ mod tests {
 
     #[test]
     fn brief_paid_proposes_without_model_call() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, true);
         // run_local_full takes no model at all: paid mode cannot call one.
@@ -1392,6 +1397,7 @@ mod tests {
 
     #[test]
     fn deeper_paid_propose_makes_no_fetch_or_model_call() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         queue_job(&ctx, "100", NOW, NOW);
@@ -1431,6 +1437,7 @@ mod tests {
 
     #[test]
     fn approved_released_once_then_executed_via_mock() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         queue_job(&ctx, "100", NOW, NOW);
@@ -1500,6 +1507,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     #[test]
     fn execute_paid_takes_release_token_by_value() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         // Compiles only if `execute_paid` takes `ReleaseToken` by value.
         let _sig: for<'a, 'b, 'c> fn(
             approvals::ReleaseToken,
@@ -1549,6 +1557,7 @@ mod tests {
     /// Paid execution logs job.started then job.done keyed by approval id.
     #[test]
     fn paid_execution_logs_started_then_done_for_approval() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         queue_job(&ctx, "100", NOW, NOW);
@@ -1591,6 +1600,7 @@ mod tests {
     /// A released-but-unfinished job needs a fresh approval to execute.
     #[test]
     fn released_without_done_needs_fresh_approval_to_execute() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         queue_job(&ctx, "100", NOW, NOW);
@@ -1665,6 +1675,7 @@ mod tests {
     /// released-not-done and never retries silently.
     #[test]
     fn crash_between_release_and_done_surfaces_released_not_done() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         queue_job(&ctx, "100", NOW, NOW);
@@ -1716,6 +1727,7 @@ mod tests {
     /// re-running the side effect.
     #[test]
     fn done_job_without_queue_marker_never_executes_twice() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         queue_job(&ctx, "100", NOW, NOW);
@@ -1764,6 +1776,7 @@ mod tests {
 
     #[test]
     fn denied_and_expired_never_execute() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         queue_job(&ctx, "100", NOW, NOW);
@@ -1864,6 +1877,7 @@ mod tests {
 
     #[test]
     fn queued_local_job_runs_only_after_its_time() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(&dir, false);
         let fixture = dir.path().join("thread.jsonl");
@@ -1891,6 +1905,7 @@ mod tests {
 
     #[test]
     fn digest_never_records_and_follows_weekly_rule() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         let mut log = DecisionLog::open(&ctx.log_path).unwrap();
@@ -1912,6 +1927,7 @@ mod tests {
 
     #[test]
     fn try_followup_logs_count_and_ids() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, false);
         let mut log = DecisionLog::open(&ctx.log_path).unwrap();
@@ -1932,6 +1948,7 @@ mod tests {
 
     #[test]
     fn tick_entries_carry_no_secrets_or_post_text() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let _env = crate::test_support::EnvHold::paid_off();
         let dir = tempfile::tempdir().unwrap();
         let marker = "synthetic-secret-marker-zzz";
@@ -1975,6 +1992,7 @@ mod tests {
 
     #[test]
     fn loop_respects_max_ticks_and_stop_flag() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let _env = crate::test_support::EnvHold::paid_off();
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(&dir);
@@ -1992,6 +2010,7 @@ mod tests {
 
     #[test]
     fn wiki_lint_tick_proposes_without_editing() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let _env = crate::test_support::EnvHold::paid_off();
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, true);
@@ -2033,6 +2052,7 @@ mod tests {
 
     #[test]
     fn daemon_paid_actions_share_the_single_gate_policy() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         use ancientos_core::gate::{Proposal, Verdict};
         // The daemon imports the gate's constants (one place): both actions
         // need a human, and anything unregistered fails closed.

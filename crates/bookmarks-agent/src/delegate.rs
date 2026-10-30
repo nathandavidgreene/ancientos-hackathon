@@ -168,6 +168,11 @@ pub fn run_with(
     date: &str,
     log: Option<&mut DecisionLog>,
 ) -> Result<DelegateResult, String> {
+    crate::topic_mute::screen_stored_post(
+        post_id,
+        None,
+        log_path.parent().unwrap_or(Path::new(".")),
+    )?;
     if !allow_paid {
         return Err("paid calls are disabled (set ANCIENTOS_ALLOW_PAID=1 to enable)".to_string());
     }
@@ -177,6 +182,18 @@ pub fn run_with(
     let thread = fetch(post_id)?;
     if thread.posts.is_empty() {
         return Err("thread fetch returned no posts".to_string());
+    }
+    let mutes = crate::topic_mute::current()?;
+    for post in thread.posts.iter() {
+        if mutes.matches_any(&[
+            &post.text,
+            post.quoted
+                .as_ref()
+                .map(|(_, text)| text.as_str())
+                .unwrap_or(""),
+        ]) {
+            return Err("excluded topic".into());
+        }
     }
     let class = {
         let mut classes = Vec::new();
@@ -278,6 +295,7 @@ mod tests {
 
     #[test]
     fn prompt_strips_handles_and_urls_with_full_length() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let long = format!("see https://t.co/abc @syn_handle {}", "word ".repeat(100));
         let prompt = build_prompt(&[post("p1", &long), post("p2", "synthetic second post")]);
         assert!(prompt.contains("## Setups"), "{prompt}");
@@ -299,6 +317,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_sanitized_quoted_text_after_each_post() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let mut p1 = post("p1", "synthetic setup 1 https://t.co/root");
         p1.quoted = Some((
             "syn_quoted".into(),
@@ -330,6 +349,7 @@ mod tests {
 
     #[test]
     fn post_url_prefers_username() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         assert_eq!(
             post_url("123", Some("syn_user")),
             "https://x.com/syn_user/status/123"
@@ -340,6 +360,7 @@ mod tests {
 
     #[test]
     fn inspiration_appends_sections_without_rewriting() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join(INSPIRATION_FILE_NAME);
         append_inspiration(
@@ -376,6 +397,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn inspiration_file_is_0600_and_dir_is_0700() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join(INSPIRATION_FILE_NAME);
         append_inspiration(&path, "2026-10-26", "https://x.com/i/status/1", "synthetic").unwrap();
@@ -391,6 +413,7 @@ mod tests {
 
     #[test]
     fn run_with_writes_inspiration_and_metadata_log() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
         let insp_path = dir.path().join(INSPIRATION_FILE_NAME);
@@ -458,6 +481,7 @@ mod tests {
 
     #[test]
     fn run_with_root_only_fallback_still_succeeds() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let fetch_fn = |_: &str| Ok(fetch(vec![post("p9", "synthetic old root")], false));
         let call_fn = |_: &str| Ok(("## Setups\nnone".into(), "m".into(), None));
@@ -481,6 +505,7 @@ mod tests {
 
     #[test]
     fn run_with_logs_search_note_in_delegate_done() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
         let insp_path = dir.path().join(INSPIRATION_FILE_NAME);
@@ -519,6 +544,7 @@ mod tests {
 
     #[test]
     fn run_with_fails_closed() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
         let insp_path = dir.path().join(INSPIRATION_FILE_NAME);
@@ -587,6 +613,7 @@ mod tests {
 
     #[test]
     fn run_with_refuses_non_public_thread_with_zero_calls() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
         let insp_path = dir.path().join(INSPIRATION_FILE_NAME);
@@ -629,6 +656,7 @@ mod tests {
 
     #[test]
     fn run_with_logs_allowed_entry_before_done() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("d.jsonl");
         let insp_path = dir.path().join(INSPIRATION_FILE_NAME);

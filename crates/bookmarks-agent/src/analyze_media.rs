@@ -62,6 +62,12 @@ pub struct Variant {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaRow {
     pub post_id: String,
+    /// Original post text; required before media processing.
+    #[serde(default)]
+    pub full_text: Option<String>,
+    /// Original quoted-post text, when present.
+    #[serde(default)]
+    pub quoted_text: Option<String>,
     pub media_key: String,
     /// `photo`, `video`, or `animated_gif`.
     #[serde(rename = "type")]
@@ -96,6 +102,12 @@ where
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaRequest {
     pub post_id: String,
+    /// Original post text; required before media processing.
+    #[serde(default)]
+    pub full_text: Option<String>,
+    /// Original quoted-post text, when present.
+    #[serde(default)]
+    pub quoted_text: Option<String>,
     pub media_keys: Vec<String>,
 }
 
@@ -422,6 +434,28 @@ pub fn analyze(
     backend: &dyn MediaBackend,
     paid: PaidConfig,
 ) -> Result<Report, String> {
+    let mutes = crate::topic_mute::current()?;
+    let text = req
+        .full_text
+        .as_deref()
+        .ok_or("post text unavailable (excluded topic)")?;
+    let mut texts = vec![text, req.quoted_text.as_deref().unwrap_or("")];
+    texts.extend(
+        rows.iter()
+            .filter(|r| r.post_id == req.post_id)
+            .filter_map(|r| r.alt_text.as_deref()),
+    );
+    if mutes.matches_any(&texts) {
+        log.append(
+            MUTED_KIND,
+            serde_json::json!({"post_id": req.post_id, "stage": "prescreen"}),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(Report {
+            muted: true,
+            ..Report::default()
+        });
+    }
     let (items, mut skipped) = resolve(req, rows);
     if items.len() > paid.max_items {
         return Err(format!(
@@ -559,6 +593,8 @@ mod tests {
     fn req(post: &str, keys: &[&str]) -> MediaRequest {
         MediaRequest {
             post_id: post.into(),
+            full_text: Some("[synthetic] public post".into()),
+            quoted_text: None,
             media_keys: keys.iter().map(|k| k.to_string()).collect(),
         }
     }
@@ -685,6 +721,34 @@ mod tests {
         assert_eq!(rep.skipped.len(), 1);
         let kinds: Vec<_> = log.verify().unwrap().into_iter().map(|e| e.kind).collect();
         assert_eq!(kinds, vec![REJECTED_KIND, SKIPPED_KIND]);
+    }
+
+    #[test]
+    fn muted_post_quote_and_alt_never_call_backend() {
+        struct Never;
+        impl MediaBackend for Never {
+            /// Any invocation proves the prescreen ran too late.
+            fn analyze(&self, _: &ResolvedMedia) -> Result<Vec<RawFinding>, String> {
+                panic!("muted media reached backend")
+            }
+        }
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::new(["zorblax"]));
+        for source in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut log = DecisionLog::open(dir.path().join("log")).unwrap();
+            let mut rows = parse_rows(FIXTURE).unwrap();
+            let mut request = req("demo-9001", &["3_demo_photo"]);
+            match source {
+                0 => request.full_text = Some("zorblax".into()),
+                1 => request.quoted_text = Some("zorblax".into()),
+                _ => rows[0].alt_text = Some("zorblax".into()),
+            }
+            assert!(
+                analyze(&mut log, &request, &rows, &Never, paid(10))
+                    .unwrap()
+                    .muted
+            );
+        }
     }
 
     #[test]

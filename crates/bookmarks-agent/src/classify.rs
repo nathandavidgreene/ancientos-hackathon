@@ -205,6 +205,8 @@ pub fn matched_categories(scores: &BTreeMap<String, f64>, queries: &[LabelQuery]
 pub fn media_rows_for(post: &Bookmark) -> (MediaRequest, Vec<MediaRow>) {
     let mut req = MediaRequest {
         post_id: post.post_id.clone(),
+        full_text: Some(post.text.clone()),
+        quoted_text: post.quoted_text.clone(),
         media_keys: Vec::with_capacity(post.media.len()),
     };
     let mut rows = Vec::with_capacity(post.media.len());
@@ -213,6 +215,8 @@ pub fn media_rows_for(post: &Bookmark) -> (MediaRequest, Vec<MediaRow>) {
         req.media_keys.push(key.clone());
         rows.push(MediaRow {
             post_id: post.post_id.clone(),
+            full_text: Some(post.text.clone()),
+            quoted_text: post.quoted_text.clone(),
             media_key: key,
             kind: m.kind.clone(),
             url: m.url.clone(),
