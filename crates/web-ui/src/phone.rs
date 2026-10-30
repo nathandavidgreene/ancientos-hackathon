@@ -103,10 +103,27 @@ fn authorized(state: &State, cookie: Option<&str>, k: Option<&String>) -> bool {
 
 /// `Set-Cookie` value remembering `token` for [`COOKIE_MAX_AGE`] seconds.
 fn login_cookie(token: &str) -> String {
+    login_cookie_scoped(token, "/m")
+}
+
+/// `Set-Cookie` value remembering `token` for [`COOKIE_MAX_AGE`] seconds,
+/// scoped to `path` (the labels page logs in separately under `/labels`).
+pub fn login_cookie_scoped(token: &str, path: &str) -> String {
     format!(
-        "{COOKIE_NAME}={}; HttpOnly; Secure; SameSite=Strict; Path=/m; Max-Age={COOKIE_MAX_AGE}",
+        "{COOKIE_NAME}={}; HttpOnly; Secure; SameSite=Strict; Path={path}; Max-Age={COOKIE_MAX_AGE}",
         percent_encode(token)
     )
+}
+
+/// True when `given` matches the configured token (constant-time).
+pub fn token_valid(state: &State, given: &str) -> bool {
+    token_ok(state, Some(given))
+}
+
+/// True when the request's [`COOKIE_NAME`] cookie matches the configured
+/// token (constant-time, see `token_ok`).
+pub fn cookie_authorized(state: &State, req: &Request) -> bool {
+    token_ok(state, cookie_token(req.cookie.as_deref()).as_deref())
 }
 
 /// Full mobile page with the given title and body.

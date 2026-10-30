@@ -2120,8 +2120,10 @@ mod tests {
         assert_eq!(d.explanation.confidence, Some(0.9f32));
     }
 
+    /// Muse explanation is sanitized and capped; sets META_API_KEY via EnvGuard so the test cannot hang on a missing key.
     #[test]
     fn muse_explanation_uses_sanitized_capped_reason() {
+        let _env = EnvGuard::set(&[("META_API_KEY", Some("test-key"))]);
         // With a model reason: surfaced, one line.
         let (jev_url, _, jev_handle) = mock_server(200, &jev_noul_body(0.1));
         let (muse_url, _, muse_handle) = mock_server(

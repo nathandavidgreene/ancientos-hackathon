@@ -19,6 +19,7 @@ pub mod feedback;
 pub mod fixture;
 pub mod idea_card;
 pub mod ingest;
+pub mod labels;
 pub mod language;
 pub mod link_context;
 pub mod liveness;

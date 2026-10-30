@@ -17,6 +17,7 @@
 //! `/hidden-authors`) are filtered per request the same silent in-memory
 //! way, so a vote takes effect immediately without a restart.
 
+pub mod labels;
 pub mod phone;
 
 use bookmarks_agent::fixture::Bookmark;
@@ -79,6 +80,10 @@ pub struct Response {
     /// Value for one `Set-Cookie` header, if any.
     pub set_cookie: Option<String>,
     pub body: String,
+    /// Raw bytes served instead of `body` when present (thumbnails).
+    pub raw_body: Option<Vec<u8>>,
+    /// Content-Type override; `None` means HTML.
+    pub content_type: Option<String>,
 }
 
 impl Response {
@@ -89,6 +94,8 @@ impl Response {
             location: None,
             set_cookie: None,
             body,
+            raw_body: None,
+            content_type: None,
         }
     }
 
@@ -99,6 +106,8 @@ impl Response {
             location: Some(to),
             set_cookie: None,
             body: String::new(),
+            raw_body: None,
+            content_type: None,
         }
     }
 
@@ -109,6 +118,20 @@ impl Response {
             location: None,
             set_cookie: None,
             body,
+            raw_body: None,
+            content_type: None,
+        }
+    }
+
+    /// 200 binary response (thumbnails) with an explicit content type.
+    fn bytes(content_type: &str, bytes: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            location: None,
+            set_cookie: None,
+            body: String::new(),
+            raw_body: Some(bytes),
+            content_type: Some(content_type.to_string()),
         }
     }
 }
@@ -131,6 +154,13 @@ pub struct State {
     /// Shared secret for the phone approvals page (`/m`); `None` turns it
     /// off (403, fail closed). See [`phone::token_from`].
     pub phone_token: Option<String>,
+    /// Eval-private dir for the labels page (`/labels`); `None` turns
+    /// labels off (404). Set by the binary, per state in tests.
+    pub labels_dir: Option<PathBuf>,
+    /// Explicit `remove_bookmark` binary for labels deletes; `None` falls
+    /// back to a `PATH` lookup at request time. Set by the binary from
+    /// the env var, per state in tests.
+    pub labels_remove_bin: Option<PathBuf>,
 }
 
 /// `store.jsonl` (demo/tests) if present, else the real synced
@@ -185,6 +215,8 @@ impl State {
             all_bookmarks: bookmarks,
             muse_log_path: bookmarks_agent::stats::muse_log_path_from_env(),
             phone_token: None,
+            labels_dir: None,
+            labels_remove_bin: None,
         };
         let live = bookmarks_agent::liveness::filter_live(
             &state.bookmarks,
@@ -198,6 +230,8 @@ impl State {
             all_bookmarks: state.all_bookmarks,
             muse_log_path: state.muse_log_path,
             phone_token: None,
+            labels_dir: None,
+            labels_remove_bin: None,
         })
     }
 
@@ -387,9 +421,9 @@ fn pending_count(state: &State) -> usize {
 
 /// Wrap a page `body` in the shared HTML shell: doctype, inline CSS,
 /// nav (Brief, Ideas, Try it, Wiki, Hidden, Approvals with pending badge,
-/// Log, Stats) and the escaped `title`. Args: the page title, the rendered
-/// body HTML, and the serving state (for the approvals badge); returns the
-/// full page; never fails.
+/// Log, Stats, Accuracy, Labels) and the escaped `title`. Args: the page
+/// title, the rendered body HTML, and the serving state (for the approvals
+/// badge); returns the full page; never fails.
 fn layout(title: &str, body: &str, state: &State) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -400,7 +434,8 @@ fn layout(title: &str, body: &str, state: &State) -> String {
          <a href=\"/hidden-authors\">Hidden</a>\
          <a href=\"/approvals\">Approvals ({})</a>\
          <a href=\"/log\">Log</a><a href=\"/stats\">Stats</a>\
-         <a href=\"/accuracy\">Accuracy</a></nav><hr>{body}</body></html>",
+         <a href=\"/accuracy\">Accuracy</a>\
+         <a href=\"/labels\">Labels</a></nav><hr>{body}</body></html>",
         escape(title),
         pending_count(state),
     )
@@ -1899,6 +1934,12 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("POST", "/approvals/deny") => decide_approval(state, &req.body, false),
         ("GET", "/m") => phone::page_list(req, state),
         ("POST", "/m/decide") => phone::do_decide(req, state),
+        ("GET", "/labels") => labels::page_labels(req, state),
+        ("POST", "/labels/save") => labels::save_labels(req, state),
+        ("POST", "/labels/delete") => labels::delete_post(req, state),
+        ("GET", path) if path.starts_with("/labels/thumb/") => {
+            labels::serve_thumb(req, state, &path["/labels/thumb/".len()..])
+        }
         ("GET", "/wiki") => page_wiki_index(state),
         ("GET", path) if path.starts_with("/wiki/") => {
             page_wiki_show(state, &path["/wiki/".len()..])
@@ -1923,13 +1964,18 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// 400 response.
-fn bad_request(msg: &str) -> Response {
-    Response::status(400, format!("<h1>Bad request</h1><p>{}</p>", escape(msg)))
+fn bad_request(msg: &str) -> Box<Response> {
+    Box::new(Response::status(
+        400,
+        format!("<h1>Bad request</h1><p>{}</p>", escape(msg)),
+    ))
 }
 
 /// Read one request: headers up to [`MAX_HEAD_BYTES`], body up to
 /// [`MAX_BODY_BYTES`] (larger declared bodies get 413 without being read).
-fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Response> {
+/// The error is boxed: `Response` carries binary bodies and exceeds the
+/// large-error threshold.
+fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Box<Response>> {
     use std::io::Read;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -1960,10 +2006,10 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Response> {
         return Err(bad_request("bad version"));
     }
     if method != "GET" && method != "POST" {
-        return Err(Response::status(
+        return Err(Box::new(Response::status(
             405,
             "<h1>Method not allowed</h1>".to_string(),
-        ));
+        )));
     }
     if !target.starts_with('/') {
         return Err(bad_request("bad target"));
@@ -1987,10 +2033,10 @@ fn read_request(stream: &mut std::net::TcpStream) -> Result<Request, Response> {
         }
     }
     if content_length > MAX_BODY_BYTES {
-        return Err(Response::status(
+        return Err(Box::new(Response::status(
             413,
             "<h1>Content too large</h1><p>Body exceeds 64KB.</p>".to_string(),
-        ));
+        )));
     }
     let mut body = buf[head_len..].to_vec();
     while body.len() < content_length {
@@ -2022,6 +2068,7 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         303 => "See Other",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Content Too Large",
@@ -2036,13 +2083,22 @@ fn serve_one(stream: &mut std::net::TcpStream, state: &State) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let resp = match read_request(stream) {
         Ok(req) => handle(&req, state),
-        Err(resp) => resp,
+        Err(resp) => *resp,
+    };
+    let (content_type, bytes) = match &resp.raw_body {
+        Some(raw) => (
+            resp.content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            raw.as_slice(),
+        ),
+        None => ("text/html; charset=utf-8".to_string(), resp.body.as_bytes()),
     };
     let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n",
         resp.status,
         reason(resp.status),
-        resp.body.len()
+        bytes.len()
     );
     if let Some(loc) = &resp.location {
         head.push_str(&format!("Location: {loc}\r\n"));
@@ -2052,7 +2108,7 @@ fn serve_one(stream: &mut std::net::TcpStream, state: &State) {
     }
     head.push_str("Connection: close\r\n\r\n");
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(resp.body.as_bytes());
+    let _ = stream.write_all(bytes);
 }
 
 /// Worker threads in the pool (bounded, std only).
