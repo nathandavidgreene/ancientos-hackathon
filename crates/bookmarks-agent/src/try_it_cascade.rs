@@ -335,8 +335,8 @@ impl CascadeDecision {
     }
 }
 
-/// True when a backend error message reports HTTP 429 (ureq surfaces it as
-/// `http status 429: ...` via both clients' mappers).
+/// True when a backend error message reports HTTP 429 (surfaced as
+/// `http status 429: ...` by the clients' transport mappers).
 pub fn is_rate_limit_error(message: &str) -> bool {
     http_status_of(message) == Some(429)
 }

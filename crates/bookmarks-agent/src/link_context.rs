@@ -5,8 +5,9 @@
 //! URLs plus its media alt text and video captions, so the classifiers can
 //! decide on the post text plus that context (see [`cascade_input`]).
 //!
-//! Linked pages: plain HTTP GET with the repo's existing client (`ureq`),
-//! timeout [`TIMEOUT_SECS`], at most [`MAX_LINKS_PER_POST`] links per post,
+//! Linked pages: plain HTTP GET through the shared transport module
+//! ([`ancientos_router::http`]), timeout [`TIMEOUT_SECS`], at most
+//! [`MAX_LINKS_PER_POST`] links per post,
 //! at most [`MAX_BODY_BYTES`] read per body, `text/html` or `text/plain`
 //! only, at most [`MAX_REDIRECTS`] redirects. URLs are normalized first
 //! ([`normalize_public_url`]: lowercase host, tracking params stripped,
@@ -48,8 +49,8 @@
 use crate::fixture::Bookmark;
 use crate::sanitize::{collapse_whitespace, truncate_chars};
 use ancientos_router::data_class::{max_of, DataClass};
+use ancientos_router::http::{HttpError, TransportKind};
 use std::collections::HashMap;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -452,45 +453,20 @@ pub fn caption_needs_paid(url: &str) -> bool {
     host == "api.x.com" || host == "api.twitter.com"
 }
 
-/// True when a transport error was caused by a timeout: ureq wraps the
-/// deadline expiry as an `io::Error` of kind `TimedOut` in the source
-/// chain (the message alone does not name it).
-fn is_timeout(t: &ureq::Transport) -> bool {
-    use std::error::Error;
-    let mut next = t.source();
-    while let Some(e) = next {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if io.kind() == std::io::ErrorKind::TimedOut {
-                return true;
-            }
-        }
-        next = e.source();
-    }
-    t.message().is_some_and(|m| {
-        let m = m.to_ascii_lowercase();
-        m.contains("timed out") || m.contains("timeout")
-    })
-}
-
 /// Map a fetch error to a short skip reason. Static strings plus the HTTP
 /// status only: never URLs, hostnames, or body text.
-fn map_fetch_error(e: ureq::Error) -> String {
+fn map_fetch_error(e: HttpError) -> String {
     match e {
-        ureq::Error::Status(code, _) => format!("http status {code}"),
-        ureq::Error::Transport(t) => {
-            if is_timeout(&t) {
-                return "timeout".to_string();
-            }
-            match t.kind() {
-                ureq::ErrorKind::TooManyRedirects => "too many redirects".to_string(),
-                ureq::ErrorKind::Dns => "dns failed".to_string(),
-                ureq::ErrorKind::ConnectionFailed => "connection failed".to_string(),
-                ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme => {
-                    "invalid url".to_string()
-                }
-                _ => "request failed".to_string(),
-            }
-        }
+        HttpError::Status { code, .. } => format!("http status {code}"),
+        HttpError::Transport { kind, .. } => match kind {
+            TransportKind::Timeout => "timeout".to_string(),
+            TransportKind::TooManyRedirects => "too many redirects".to_string(),
+            TransportKind::Dns => "dns failed".to_string(),
+            TransportKind::ConnectionFailed => "connection failed".to_string(),
+            TransportKind::InvalidUrl => "invalid url".to_string(),
+            TransportKind::Other => "request failed".to_string(),
+        },
+        HttpError::Body(_) => "unreadable body".to_string(),
     }
 }
 
@@ -507,25 +483,26 @@ fn fetch_body(url: &str, timeout: Duration) -> Result<(String, String), String> 
     if accept_link_url(url).is_none() && !is_captions_fetchable_url(url) {
         return Err("invalid url".to_string());
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(timeout)
-        .redirects(MAX_REDIRECTS)
-        .build();
-    let resp = agent.get(&normalized).call().map_err(map_fetch_error)?;
-    let media_type = resp
-        .header("content-type")
+    let fetched = ancientos_router::http::get_bytes(
+        &normalized,
+        timeout,
+        Some(MAX_REDIRECTS),
+        MAX_BODY_BYTES as u64,
+    )
+    .map_err(map_fetch_error)?;
+    let media_type = fetched
+        .content_type
+        .as_deref()
         .unwrap_or_default()
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take(MAX_BODY_BYTES as u64)
-        .read_to_end(&mut buf)
-        .map_err(|_| "unreadable body".to_string())?;
-    Ok((String::from_utf8_lossy(&buf).into_owned(), media_type))
+    Ok((
+        String::from_utf8_lossy(&fetched.bytes).into_owned(),
+        media_type,
+    ))
 }
 
 /// Caption URLs accept the same http(s) shape as links but without the

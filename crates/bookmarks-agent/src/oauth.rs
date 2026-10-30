@@ -2,6 +2,7 @@
 //!
 //! Native App flow: random verifier/state, loopback redirect, token exchange
 //! and refresh. There is deliberately no client secret anywhere here.
+use ancientos_router::http::HttpError;
 use sha2::{Digest, Sha256};
 
 pub const AUTHORIZE_URL: &str = "https://x.com/i/oauth2/authorize";
@@ -135,12 +136,11 @@ pub fn refresh_form<'a>(
 
 /// POST a form to the X token endpoint and parse the token response.
 fn post_token_form(form: &[(&str, &str)]) -> Result<TokenResponse, OAuthError> {
-    let parsed: TokenResponse = ureq::post(TOKEN_URL)
-        .timeout(std::time::Duration::from_secs(30))
-        .send_form(form)
-        .map_err(map_ureq_error)?
-        .into_json()
-        .map_err(|e| OAuthError::BadResponse(e.to_string()))?;
+    let raw =
+        ancientos_router::http::post_form_json(TOKEN_URL, std::time::Duration::from_secs(30), form)
+            .map_err(map_http_error)?;
+    let parsed: TokenResponse =
+        serde_json::from_value(raw).map_err(|e| OAuthError::BadResponse(e.to_string()))?;
     if parsed.access_token.is_empty() {
         return Err(OAuthError::BadResponse("missing access_token".into()));
     }
@@ -173,15 +173,15 @@ pub fn refresh_tokens(client_id: &str, refresh_token: &str) -> Result<TokenRespo
     post_token_form(&refresh_form(refresh_token, client_id))
 }
 
-/// Map a ureq error to an OAuth error without leaking secrets.
-fn map_ureq_error(e: ureq::Error) -> OAuthError {
+/// Map a transport error to an OAuth error without leaking secrets.
+fn map_http_error(e: HttpError) -> OAuthError {
     match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let snippet: String = body.chars().take(300).collect();
+        HttpError::Status { code, snippet } => {
+            let snippet: String = snippet.chars().take(300).collect();
             OAuthError::Http(format!("token endpoint http status {code}: {snippet}"))
         }
-        other => OAuthError::Http(other.to_string()),
+        HttpError::Transport { message, .. } => OAuthError::Http(message),
+        HttpError::Body(message) => OAuthError::BadResponse(message),
     }
 }
 

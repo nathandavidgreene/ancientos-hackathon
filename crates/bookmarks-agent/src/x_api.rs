@@ -7,6 +7,7 @@ use crate::fixture::Bookmark;
 use crate::ingest::{BookmarkSource, Page};
 use crate::token_store::{StoredTokens, TokenStoreError};
 use crate::unroll::ThreadPost;
+use ancientos_router::http::HttpError;
 use std::collections::HashMap;
 
 pub const ME_URL: &str = "https://api.x.com/2/users/me";
@@ -403,24 +404,24 @@ pub fn parse_bookmarks_page(value: &serde_json::Value) -> Result<Page, String> {
 
 /// GET a URL with a bearer token and parse the JSON body.
 fn get_json(url: &str, access_token: &str) -> Result<serde_json::Value, String> {
-    ureq::get(url)
-        .timeout(std::time::Duration::from_secs(30))
-        .set("Authorization", &format!("Bearer {access_token}"))
-        .call()
-        .map_err(map_ureq_error)?
-        .into_json()
-        .map_err(|e| format!("bad X API response: {e}"))
+    let auth = format!("Bearer {access_token}");
+    ancientos_router::http::get_json(
+        url,
+        std::time::Duration::from_secs(30),
+        &[("Authorization", auth.as_str())],
+    )
+    .map_err(map_http_error)
 }
 
-/// Map a ureq error to a short message without leaking secrets.
-fn map_ureq_error(e: ureq::Error) -> String {
+/// Map a transport error to a short message without leaking secrets.
+fn map_http_error(e: HttpError) -> String {
     match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let snippet: String = body.chars().take(300).collect();
+        HttpError::Status { code, snippet } => {
+            let snippet: String = snippet.chars().take(300).collect();
             format!("X API http status {code}: {snippet}")
         }
-        other => format!("X API request failed: {other}"),
+        HttpError::Transport { message, .. } => format!("X API request failed: {message}"),
+        HttpError::Body(e) => format!("bad X API response: {e}"),
     }
 }
 

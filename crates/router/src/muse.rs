@@ -216,13 +216,14 @@ impl MuseClient {
         // Key lives in env only; an empty value counts as missing.
         let api_key = get_env("META_API_KEY").ok_or(RouterError::MissingEnv("META_API_KEY"))?;
         let body = self.request_body_messages(messages);
-        let raw: serde_json::Value = ureq::post(&self.endpoint())
-            .timeout(std::time::Duration::from_secs(60))
-            .set("Authorization", &format!("Bearer {api_key}"))
-            .send_json(&body)
-            .map_err(map_ureq_error)?
-            .into_json()
-            .map_err(|e| RouterError::Http(e.to_string()))?;
+        let auth = format!("Bearer {api_key}");
+        let raw = crate::http::post_json(
+            &self.endpoint(),
+            std::time::Duration::from_secs(60),
+            &[("Authorization", auth.as_str())],
+            &body,
+        )
+        .map_err(map_http_error)?;
         Self::parse_chat_response(&raw)
     }
 
@@ -348,15 +349,14 @@ fn is_paid_allowed() -> bool {
         .unwrap_or(false)
 }
 
-/// Map a ureq error to a router error.
-fn map_ureq_error(e: ureq::Error) -> RouterError {
+/// Map a transport error to a router error.
+fn map_http_error(e: crate::http::HttpError) -> RouterError {
     match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let snippet: String = body.chars().take(500).collect();
+        crate::http::HttpError::Status { code, snippet } => {
             RouterError::Http(format!("http status {code}: {snippet}"))
         }
-        other => RouterError::Http(other.to_string()),
+        crate::http::HttpError::Transport { message, .. } => RouterError::Http(message),
+        crate::http::HttpError::Body(message) => RouterError::Http(message),
     }
 }
 

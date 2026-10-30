@@ -374,16 +374,18 @@ fn post_systemone(
     questions: &serde_json::Value,
 ) -> Result<SystemOneReply, RouterError> {
     let body = serde_json::json!({"model": model, "state": state, "questions": questions});
-    let request = ureq::post(endpoint).timeout(std::time::Duration::from_secs(TIMEOUT_SECS));
-    let request = match api_key {
-        Some(key) => request.set("Authorization", &format!("Bearer {key}")),
-        None => request,
-    };
-    let raw: serde_json::Value = request
-        .send_json(&body)
-        .map_err(map_ureq_error)?
-        .into_json()
-        .map_err(|e| RouterError::Http(e.to_string()))?;
+    let auth = api_key.map(|key| format!("Bearer {key}"));
+    let headers: Vec<(&str, &str)> = auth
+        .as_ref()
+        .map(|a| vec![("Authorization", a.as_str())])
+        .unwrap_or_default();
+    let raw = crate::http::post_json(
+        endpoint,
+        std::time::Duration::from_secs(TIMEOUT_SECS),
+        &headers,
+        &body,
+    )
+    .map_err(map_http_error)?;
     let answers = raw
         .get("answers")
         .and_then(|a| a.as_object())
@@ -420,15 +422,14 @@ fn is_paid_allowed() -> bool {
         .unwrap_or(false)
 }
 
-/// Map a ureq error to a router error.
-fn map_ureq_error(e: ureq::Error) -> RouterError {
+/// Map a transport error to a router error.
+fn map_http_error(e: crate::http::HttpError) -> RouterError {
     match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let snippet: String = body.chars().take(500).collect();
+        crate::http::HttpError::Status { code, snippet } => {
             RouterError::Http(format!("http status {code}: {snippet}"))
         }
-        other => RouterError::Http(other.to_string()),
+        crate::http::HttpError::Transport { message, .. } => RouterError::Http(message),
+        crate::http::HttpError::Body(message) => RouterError::Http(message),
     }
 }
 
