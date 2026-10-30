@@ -905,7 +905,6 @@ pub fn remove_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     /// Synthetic label-queries file: two queries sharing post 7, one post
     /// with a non-numeric url, all text invented for tests.
@@ -944,13 +943,28 @@ mod tests {
     }
 
     /// Write `body` to `name` under `dir` and make it executable (unix).
+    ///
+    /// The executable is never opened for writing by this test process:
+    /// the body goes to a sibling `.src` file and a `cp` child creates the
+    /// executable. Writing it directly raced with other test threads
+    /// forking concurrently: a child forked while our write fd was open
+    /// inherits it until its exec, so exec'ing the script could fail with
+    /// ETXTBSY ("Text file busy"); `remove_one` then logged `failed` and a
+    /// replay reported "removal failed" (CI run 41054948741). Same fix as
+    /// web-ui's helper in ecc5909.
     #[cfg(unix)]
     fn write_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(body.as_bytes()).unwrap();
-        drop(f);
+        let src = dir.join(format!("{name}.src"));
+        std::fs::write(&src, body.as_bytes()).unwrap();
+        let st = std::process::Command::new("cp")
+            .arg(&src)
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "cp failed: {st}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -1449,6 +1463,34 @@ mod tests {
         assert!(load_labels(dir.path()).unwrap().is_empty());
         let line = std::fs::read_to_string(dir.path().join(REMOVALS_FILE)).unwrap();
         assert!(!line.contains("private output"));
+    }
+
+    /// Regression for the ETXTBSY flake: many threads concurrently create
+    /// fake binaries with [`write_executable`] and exec them right away.
+    /// With the old direct-write helper some execs failed with "Text file
+    /// busy"; every exec must now succeed.
+    #[test]
+    #[cfg(unix)]
+    fn write_executable_concurrent_exec_never_text_file_busy() {
+        let dir = eval_dir();
+        let handles: Vec<_> = (0..16)
+            .map(|t| {
+                let d = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        let bin = write_executable(&d, &format!("x{t}_{i}"), "#!/bin/sh\nexit 0\n");
+                        let st = std::process::Command::new(&bin)
+                            .stdin(std::process::Stdio::null())
+                            .status()
+                            .unwrap_or_else(|e| panic!("exec {t}/{i} failed: {e}"));
+                        assert!(st.success());
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// Replaying an exit-2 request id returns an error and does not call again.
