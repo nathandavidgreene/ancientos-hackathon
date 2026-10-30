@@ -65,6 +65,15 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
+/// Classify original prompt bytes before sanitizing them for hosted execution.
+fn public_prompt(path: &Path) -> Result<String, String> {
+    let raw = std::fs::read_to_string(path).map_err(|_| "prompt unreadable".to_string())?;
+    if bookmarks_agent::translate::class_of(&raw).as_str() != "public" {
+        return Err("prompt is not public (refused)".into());
+    }
+    Ok(bookmarks_agent::sanitize::sanitize_uncapped(&raw))
+}
+
 impl RunSpec {
     /// Build a spec from a prompt file, hashing its current contents. The log
     /// number must be 1-16 ASCII letters, digits, `-` or `_`; the summary must
@@ -84,6 +93,7 @@ impl RunSpec {
         }
         let prompt_file = std::fs::canonicalize(prompt_file)
             .map_err(|e| format!("cannot read prompt {}: {e}", prompt_file.display()))?;
+        public_prompt(&prompt_file)?;
         let prompt_sha256 = sha256_file(&prompt_file)?;
         Ok(Self {
             log_no: log_no.to_string(),
@@ -100,12 +110,16 @@ impl RunSpec {
             "summary": self.summary,
             "prompt_file": self.prompt_file.to_string_lossy(),
             "prompt_sha256": self.prompt_sha256,
+            "class": "public",
         })
     }
 
     /// Read a spec back from a stored payload; `None` when malformed.
     pub fn from_payload(v: &serde_json::Value) -> Option<Self> {
         let s = |k: &str| v.get(k)?.as_str().map(str::to_string);
+        if v["class"].as_str() != Some("public") {
+            return None;
+        }
         Some(Self {
             log_no: s("log_no")?,
             summary: s("summary")?,
@@ -118,6 +132,7 @@ impl RunSpec {
 /// Record a proposed run as a pending approval (24h expiry). A duplicate
 /// pending proposal returns the existing request.
 pub fn propose(log: &mut DecisionLog, spec: &RunSpec, now: u64) -> Result<ApprovalRequest, String> {
+    public_prompt(&spec.prompt_file)?;
     approvals::request(
         log,
         &app_gate(),
@@ -212,6 +227,16 @@ pub fn run(log: &mut DecisionLog, token: ReleaseToken, runner: &Runner) -> Resul
             spec.prompt_file.display()
         ));
     }
+    let sanitized = public_prompt(&spec.prompt_file)?;
+    use std::io::Write;
+    let mut staged =
+        tempfile::NamedTempFile::new().map_err(|_| "prompt staging failed".to_string())?;
+    staged
+        .write_all(sanitized.as_bytes())
+        .map_err(|_| "prompt staging failed".to_string())?;
+    staged
+        .flush()
+        .map_err(|_| "prompt staging failed".to_string())?;
     let script = runner.repo.join(SCRIPT);
     if !script.is_file() {
         return Err(format!("{} not found (refused)", script.display()));
@@ -220,7 +245,7 @@ pub fn run(log: &mut DecisionLog, token: ReleaseToken, runner: &Runner) -> Resul
     let outcome = std::process::Command::new(&script)
         .arg(&spec.log_no)
         .arg(&spec.summary)
-        .arg(&spec.prompt_file)
+        .arg(staged.path())
         .current_dir(&runner.repo)
         .status();
     let (code, error) = match outcome {
@@ -433,6 +458,22 @@ mod tests {
         assert_eq!(runs(&fx.log, NOW).unwrap().len(), 1);
     }
 
+    #[test]
+    fn prompt_classification_refuses_private_input_and_strips_urls() {
+        let fx = Fx::new();
+        let path = fx.dir.path().join("prompt.md");
+        for text in [
+            "email person@example.com",
+            "password=synthetic-secret",
+            "Bearer synthetic-token",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(RunSpec::from_prompt("1", "synthetic", &path).is_err());
+        }
+        std::fs::write(&path, "read https://example.com/ @demo").unwrap();
+        assert_eq!(public_prompt(&path).unwrap(), "read");
+    }
+
     /// An approved paid run consumes its token and executes the stub once.
     #[test]
     fn approved_paid_run_executes_stub_once_and_logs_each_step() {
@@ -446,13 +487,10 @@ mod tests {
             0
         );
         assert_eq!(
-            fx.calls(),
-            vec![
-                "60".to_string(),
-                "muse app test".to_string(),
-                spec.prompt_file.to_string_lossy().to_string()
-            ]
+            &fx.calls()[..2],
+            &["60".to_string(), "muse app test".to_string()]
         );
+        assert_ne!(fx.calls()[2], spec.prompt_file.to_string_lossy());
         assert_eq!(
             fx.kinds(),
             vec![

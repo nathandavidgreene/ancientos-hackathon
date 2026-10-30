@@ -12,6 +12,7 @@ name = "wonder"
 path = "src/main.rs"
 
 [dependencies]
+bookmarks-agent = { path = "../bookmarks-agent" }
 ancientos-core = { path = "../core" }
 ancientos-router = { path = "../router" }
 serde_json.workspace = true

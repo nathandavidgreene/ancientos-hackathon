@@ -94,6 +94,12 @@ pub fn propose(
     now: u64,
 ) -> Result<ApprovalRequest, String> {
     check_question(question)?;
+    let class = bookmarks_agent::translate::class_of(question);
+    if class != DataClass::Public {
+        return Err("question is not public (refused)".into());
+    }
+    let question = bookmarks_agent::sanitize::sanitize_uncapped(question);
+    let question = question.as_str();
     let dest = route(sensitivity, true);
     if dest != Destination::MuseWonder {
         return Err(format!(
@@ -107,7 +113,7 @@ pub fn propose(
         AGENT,
         ASK_ACTION,
         &format!("Ask Muse Wonder: {summary}"),
-        serde_json::json!({ "question": question, "question_sha256": sha256(question) }),
+        serde_json::json!({ "question": question, "question_sha256": sha256(question), "class": class.as_str() }),
         now,
         None,
     )
@@ -195,7 +201,16 @@ pub fn ask(
             "'{id}' question does not match its sha256 (refused)"
         ));
     }
+    if a.request.payload["class"].as_str() != Some("public")
+        || bookmarks_agent::translate::class_of(&question) != DataClass::Public
+        || bookmarks_agent::sanitize::sanitize_uncapped(&question) != question
+    {
+        return Err("question classification or sanitization changed (refused)".into());
+    }
     approvals::release(log, token, &a.request.payload).map_err(|e| e.to_string())?;
+    if bookmarks_agent::translate::class_of(&question) != DataClass::Public {
+        return Err("released question is not public (refused)".into());
+    }
     let result =
         client.complete_with_class(DataClass::Public, CALLER, Some(log), &prompt(&question));
     let entry = match &result {
@@ -582,6 +597,31 @@ mod tests {
         ];
         assert!(cli(&args, &env).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn proposals_classify_before_sanitizing() {
+        let (_dir, mut log) = log();
+        for text in [
+            "email person@example.com",
+            "password=synthetic-secret",
+            "Bearer synthetic-token",
+        ] {
+            assert!(propose(&mut log, text, Sensitivity::Sanitized, NOW).is_err());
+        }
+        assert!(log.verify_or_empty().unwrap().is_empty());
+        let req = propose(
+            &mut log,
+            "try https://example.com/ @demo",
+            Sensitivity::Sanitized,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(req.payload["class"], "public");
+        assert!(!req.payload["question"]
+            .as_str()
+            .unwrap()
+            .contains("https://"));
     }
 
     #[test]

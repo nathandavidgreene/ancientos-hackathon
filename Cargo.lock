@@ -488,6 +488,7 @@ name = "muse-runs"
 version = "0.1.0"
 dependencies = [
  "ancientos-core",
+ "bookmarks-agent",
  "hex",
  "serde_json",
  "sha2",
@@ -992,6 +993,7 @@ version = "0.1.0"
 dependencies = [
  "ancientos-core",
  "ancientos-router",
+ "bookmarks-agent",
  "hex",
  "serde_json",
  "sha2",
