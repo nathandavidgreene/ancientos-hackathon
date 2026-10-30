@@ -48,7 +48,7 @@ fn labels_off(state: &State) -> Response {
 
 /// 403 page; says why without revealing anything about the data.
 fn forbidden(state: &State) -> Response {
-    let why = if state.phone_token.is_none() {
+    let why = if state.labels_token.is_none() {
         "Labels are off (no token configured)."
     } else {
         "Missing or wrong token."
@@ -229,14 +229,14 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
         return labels_off(state);
     };
     if let Some(k) = req.query.get("k") {
-        if !crate::phone::token_valid(state, k) {
+        if !crate::phone::token_matches(state.labels_token.as_deref(), Some(k)) {
             return forbidden(state);
         }
         let mut resp = Response::redirect("/labels".to_string());
         resp.set_cookie = Some(crate::phone::login_cookie_scoped(k, LOGIN_PATH));
         return resp;
     }
-    if !crate::phone::cookie_authorized(state, req) {
+    if !crate::phone::cookie_matches(state.labels_token.as_deref(), req) {
         return forbidden(state);
     }
     let queries = match labels::load_queries(dir) {
@@ -294,7 +294,7 @@ pub fn save_labels(req: &Request, state: &State) -> Response {
     let Some(dir) = state.labels_dir.as_deref() else {
         return labels_off(state);
     };
-    if !crate::phone::cookie_authorized(state, req) {
+    if !crate::phone::cookie_matches(state.labels_token.as_deref(), req) {
         return forbidden(state);
     }
     let form = parse_body(&req.body);
@@ -348,7 +348,7 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
     let Some(dir) = state.labels_dir.as_deref() else {
         return labels_off(state);
     };
-    if !crate::phone::cookie_authorized(state, req) {
+    if !crate::phone::cookie_matches(state.labels_token.as_deref(), req) {
         return forbidden(state);
     }
     let form = parse_body(&req.body);
@@ -439,7 +439,7 @@ pub fn serve_thumb(req: &Request, state: &State, name: &str) -> Response {
     let Some(dir) = state.labels_dir.as_deref() else {
         return labels_off(state);
     };
-    if !crate::phone::cookie_authorized(state, req) {
+    if !crate::phone::cookie_matches(state.labels_token.as_deref(), req) {
         return forbidden(state);
     }
     if name.is_empty() || name.contains('/') || name.contains('\\') {
@@ -543,7 +543,7 @@ mod tests {
     /// given eval dir.
     fn labels_state(data: &std::path::Path, eval: &std::path::Path) -> State {
         let mut s = State::open(data).unwrap();
-        s.phone_token = crate::phone::token_from(Some(TOKEN.to_string()));
+        s.labels_token = crate::phone::token_from(Some(TOKEN.to_string()));
         s.labels_dir = Some(eval.to_path_buf());
         s
     }
@@ -611,10 +611,24 @@ mod tests {
 
     /// Without an eval dir every labels route is 404, even authorized.
     #[test]
+    fn phone_credential_cannot_authorize_separate_labels_scope() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let mut state = labels_state(data.path(), eval.path());
+        state.phone_token = Some("different-phone-credential-123".into());
+        let req = Request::get("/labels?k=different-phone-credential-123");
+        assert_eq!(crate::handle(&req, &state).status, 403);
+        assert_eq!(
+            crate::handle(&Request::get(&format!("/labels?k={TOKEN}")), &state).status,
+            303
+        );
+    }
+
+    #[test]
     fn off_without_eval_dir() {
         let data = tempfile::tempdir().unwrap();
         let mut s = State::open(data.path()).unwrap();
-        s.phone_token = crate::phone::token_from(Some(TOKEN.to_string()));
+        s.labels_token = crate::phone::token_from(Some(TOKEN.to_string()));
         assert_eq!(
             crate::handle(&Request::get("/labels").with_cookie(COOKIE), &s).status,
             404

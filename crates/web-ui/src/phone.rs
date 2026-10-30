@@ -16,7 +16,8 @@
 //! withholds every request, and a stale payload hash decides nothing. Like
 //! `/approvals`, the page only records decisions: nothing executes here.
 //! The server still binds loopback only; reaching it from a phone is the
-//! deployer's job (for example a tailnet-only reverse proxy).
+//! deployer's job. The reverse proxy MUST terminate HTTPS; Secure cookies
+//! deliberately do not work over plain HTTP.
 use crate::{escape, now_secs, parse_body, Request, Response, State};
 use ancientos_core::approvals::{self, ApprovalError};
 use ancientos_core::log::{DecisionLog, Entry, LogError};
@@ -27,6 +28,8 @@ use std::path::{Path, PathBuf};
 pub const PHONE_DECIDER: &str = "phone";
 /// Env var holding the phone token (read by the binary at startup).
 pub const TOKEN_ENV: &str = "ANCIENTOS_PHONE_TOKEN";
+/// Separate credential for label writes and deletion.
+pub const LABELS_TOKEN_ENV: &str = "ANCIENTOS_LABELS_TOKEN";
 /// Shortest accepted token; shorter values leave phone approvals off.
 pub const MIN_TOKEN_LEN: usize = 16;
 /// Cookie that remembers a phone login.
@@ -60,8 +63,39 @@ fn percent_encode(s: &str) -> String {
 
 /// A configured token, or `None` when it is missing or too short.
 pub fn token_from(raw: Option<String>) -> Option<String> {
-    raw.map(|s| s.trim().to_string())
-        .filter(|s| s.len() >= MIN_TOKEN_LEN)
+    raw.map(|s| s.trim().to_string()).filter(|s| {
+        s.len() >= MIN_TOKEN_LEN
+            && !s.bytes().all(|b| b.is_ascii_digit())
+            && s.chars().collect::<std::collections::BTreeSet<_>>().len() >= 6
+    })
+}
+
+/// Use the legacy phone credential only when the labels variable is unset.
+pub fn labels_token_from(raw: Option<String>, legacy: Option<String>) -> Option<String> {
+    match raw {
+        Some(value) => token_from(Some(value)),
+        None => legacy,
+    }
+}
+
+/// Generate 256 bits of random token material without storing it.
+pub fn random_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|_| "token entropy unavailable".to_string())?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Match an explicitly scoped credential using fixed-length hashed equality.
+pub fn token_matches(expected: Option<&str>, given: Option<&str>) -> bool {
+    match (expected, given) {
+        (Some(a), Some(b)) => same(a, b),
+        _ => false,
+    }
+}
+
+/// Authenticate a cookie against the explicitly selected credential scope.
+pub fn cookie_matches(expected: Option<&str>, req: &Request) -> bool {
+    token_matches(expected, cookie_token(req.cookie.as_deref()).as_deref())
 }
 
 /// Constant-time token equality: both sides are hashed to fixed-length
@@ -462,6 +496,21 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn token_generation_strength_and_legacy_scope_fallback() {
+        assert!(token_from(Some("1234567890123456".into())).is_none());
+        assert!(token_from(Some("aaaaaaaaaaaaaaaa".into())).is_none());
+        let first = random_token().unwrap();
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, random_token().unwrap());
+        assert!(token_from(Some(first.clone())).is_some());
+        assert_eq!(
+            labels_token_from(None, Some(first.clone())),
+            Some(first.clone())
+        );
+        assert_eq!(labels_token_from(Some(String::new()), Some(first)), None);
     }
 
     #[test]

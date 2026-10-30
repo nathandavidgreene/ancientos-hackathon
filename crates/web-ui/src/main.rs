@@ -164,6 +164,10 @@ fn cleanup_stale_demo_dirs() {
 
 /// Run one demo-runner command against a `--data` workspace.
 fn run(args: &[String]) -> Result<(), String> {
+    if args == ["--print-phone-token"] {
+        println!("{}", web_ui::phone::random_token()?);
+        return Ok(());
+    }
     let parsed = parse_args(args)?;
     let dir: std::path::PathBuf = if parsed.demo {
         cleanup_stale_demo_dirs();
@@ -178,6 +182,11 @@ fn run(args: &[String]) -> Result<(), String> {
     };
     let mut state = State::open_with_liveness(&dir, parsed.demo)?;
     state.phone_token = web_ui::phone::token_from(std::env::var(web_ui::phone::TOKEN_ENV).ok());
+    state.labels_token = web_ui::phone::labels_token_from(
+        std::env::var_os(web_ui::phone::LABELS_TOKEN_ENV)
+            .map(|v| v.into_string().unwrap_or_default()),
+        state.phone_token.clone(),
+    );
     eprintln!(
         "phone approvals (/m): {}",
         if state.phone_token.is_some() {

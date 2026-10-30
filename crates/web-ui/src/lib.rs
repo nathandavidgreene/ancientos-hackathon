@@ -136,6 +136,10 @@ impl Response {
     }
 }
 
+/// Failed login state shared between workers.
+type LoginAttempts =
+    std::sync::Arc<std::sync::Mutex<BTreeMap<std::net::IpAddr, (std::time::Instant, u32)>>>;
+
 /// Serving state: the data dir plus the bookmark store loaded once at
 /// startup (votes never change the store, so no reload is needed).
 #[derive(Debug, Clone)]
@@ -154,6 +158,10 @@ pub struct State {
     /// Shared secret for the phone approvals page (`/m`); `None` turns it
     /// off (403, fail closed). See [`phone::token_from`].
     pub phone_token: Option<String>,
+    /// Resolved labels credential; the binary applies the legacy fallback once.
+    pub labels_token: Option<String>,
+    /// Failed-login buckets shared by the server workers.
+    login_attempts: LoginAttempts,
     /// Eval-private dir for the labels page (`/labels`); `None` turns
     /// labels off (404). Set by the binary, per state in tests.
     pub labels_dir: Option<PathBuf>,
@@ -215,6 +223,8 @@ impl State {
             all_bookmarks: bookmarks,
             muse_log_path: bookmarks_agent::stats::muse_log_path_from_env(),
             phone_token: None,
+            labels_token: None,
+            login_attempts: Default::default(),
             labels_dir: None,
             labels_remove_bin: None,
         };
@@ -230,6 +240,8 @@ impl State {
             all_bookmarks: state.all_bookmarks,
             muse_log_path: state.muse_log_path,
             phone_token: None,
+            labels_token: None,
+            login_attempts: Default::default(),
             labels_dir: None,
             labels_remove_bin: None,
         })
@@ -2092,8 +2104,29 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Content Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "Error",
+    }
+}
+
+/// Permit at most five failures per peer per minute; bound bucket storage.
+fn login_allowed(state: &State, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
+    let Ok(mut attempts) = state.login_attempts.lock() else {
+        return false;
+    };
+    attempts.retain(|_, (start, _)| now.duration_since(*start).as_secs() < 60);
+    match attempts.get(&ip) {
+        Some((_, count)) => *count < 5,
+        None => attempts.len() < 1024,
+    }
+}
+
+/// Count one refused scoped login without retaining any credential material.
+fn login_failed(state: &State, ip: std::net::IpAddr, now: std::time::Instant) {
+    if let Ok(mut attempts) = state.login_attempts.lock() {
+        let entry = attempts.entry(ip).or_insert((now, 0));
+        entry.1 = entry.1.saturating_add(1);
     }
 }
 
@@ -2102,7 +2135,25 @@ fn serve_one(stream: &mut std::net::TcpStream, state: &State) {
     use std::io::Write;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let resp = match read_request(stream) {
-        Ok(req) => handle(&req, state),
+        Ok(req) => {
+            let scoped = req.path == "/m"
+                || req.path.starts_with("/m/")
+                || req.path == "/labels"
+                || req.path.starts_with("/labels/");
+            let peer = stream.peer_addr().ok().map(|a| a.ip());
+            let now = std::time::Instant::now();
+            if scoped && !peer.is_some_and(|ip| login_allowed(state, ip, now)) {
+                Response::status(429, "<h1>Try again later</h1>".into())
+            } else {
+                let response = handle(&req, state);
+                if scoped && response.status == 403 {
+                    if let Some(ip) = peer {
+                        login_failed(state, ip, now);
+                    }
+                }
+                response
+            }
+        }
         Err(resp) => *resp,
     };
     let (content_type, bytes) = match &resp.raw_body {
@@ -2264,6 +2315,25 @@ mod tests {
             .unwrap()
             .verify()
             .unwrap()
+    }
+
+    #[test]
+    fn login_failures_are_throttled_per_peer_and_expire() {
+        let (_dir, state) = test_state();
+        let ip = "127.0.0.1".parse().unwrap();
+        let other = "127.0.0.2".parse().unwrap();
+        let now = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(login_allowed(&state, ip, now));
+            login_failed(&state, ip, now);
+        }
+        assert!(!login_allowed(&state, ip, now));
+        assert!(login_allowed(&state, other, now));
+        assert!(login_allowed(
+            &state,
+            ip,
+            now + std::time::Duration::from_secs(61)
+        ));
     }
 
     #[test]

@@ -23,3 +23,12 @@ Local model URLs accept only loopback, exact `localhost`, or RFC1918 IP
 literals by default. Redirects and proxy routing are disabled for local prompt
 transport. `ANCIENTOS_ALLOW_REMOTE_LOCAL=1` explicitly permits a remote server;
 use it only when that destination is intended to receive private data.
+
+Phone and labels authentication: set `ANCIENTOS_LABELS_TOKEN` for a separate
+labels/deletion scope. If it is unset, labels falls back to
+`ANCIENTOS_PHONE_TOKEN` so existing phone deployments keep working. An empty
+or weak configured labels token disables labels authentication instead of
+falling back. Generate a random token with `web-ui --print-phone-token`.
+Use an HTTPS-terminating proxy: the Secure cookies require HTTPS. Five failed
+logins per peer in a minute temporarily block that peer; proxies sharing one
+backend peer address share the limit.
