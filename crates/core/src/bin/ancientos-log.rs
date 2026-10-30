@@ -381,7 +381,7 @@ mod tests {
         }
     }
 
-    /// Test helper: a synthetic entry with the given payload.
+    /// Test helper: a synthetic unsigned entry with the given payload.
     fn entry_with(payload: serde_json::Value) -> Entry {
         Entry {
             seq: 7,
@@ -389,6 +389,7 @@ mod tests {
             kind: "route".into(),
             payload,
             hash: "hash".into(),
+            sig: None,
         }
     }
 

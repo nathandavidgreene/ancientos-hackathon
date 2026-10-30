@@ -318,9 +318,10 @@ fn first_bad_line(path: &Path) -> Option<usize> {
 
 /// Open and verify the decision log: returns `(entries, verified,
 /// broken_at)`. A missing file reads as verified-but-empty; a chain break
-/// yields `broken_at` (0-based); an unreadable file yields unverified with
-/// `broken_at: None`. Args: the decision-log path; returns the triple;
-/// never fails.
+/// or a bad/missing signature yields `broken_at` (0-based); a truncation
+/// points at the first missing entry; an unreadable file or any other
+/// failure yields unverified with `broken_at: None`. Args: the
+/// decision-log path; returns the triple; never fails.
 fn read_verified_entries(log_path: &Path) -> (Vec<Entry>, bool, Option<usize>) {
     let log = match DecisionLog::open(log_path) {
         Ok(log) => log,
@@ -331,6 +332,12 @@ fn read_verified_entries(log_path: &Path) -> (Vec<Entry>, bool, Option<usize>) {
         }
         Err(LogError::Io(_)) => return (Vec::new(), false, None),
         Err(LogError::Lock(_)) => return (Vec::new(), false, None),
+        Err(LogError::Key(_)) => return (Vec::new(), false, None),
+        Err(LogError::Unsigned(n)) | Err(LogError::BadSignature(n)) => {
+            return (Vec::new(), false, Some(n))
+        }
+        Err(LogError::Truncated { found, .. }) => return (Vec::new(), false, Some(found)),
+        Err(LogError::HeadMismatch(_)) => return (Vec::new(), false, None),
     };
     match log.verify_or_empty() {
         Ok(entries) => (entries, true, None),
@@ -338,6 +345,10 @@ fn read_verified_entries(log_path: &Path) -> (Vec<Entry>, bool, Option<usize>) {
         Err(LogError::Json(_)) => (Vec::new(), false, first_bad_line(log_path)),
         Err(LogError::Io(_)) => (Vec::new(), false, None),
         Err(LogError::Lock(_)) => (Vec::new(), false, None),
+        Err(LogError::Key(_)) => (Vec::new(), false, None),
+        Err(LogError::Unsigned(n)) | Err(LogError::BadSignature(n)) => (Vec::new(), false, Some(n)),
+        Err(LogError::Truncated { found, .. }) => (Vec::new(), false, Some(found)),
+        Err(LogError::HeadMismatch(_)) => (Vec::new(), false, None),
     }
 }
 

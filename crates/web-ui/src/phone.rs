@@ -876,4 +876,60 @@ mod tests {
         );
         assert!(!s.log_path().exists(), "the data-dir log stays untouched");
     }
+
+    /// A decide POST with no credential at all (no cookie, no form `k`) is
+    /// 403 and appends nothing, even with a valid id and payload hash.
+    #[test]
+    fn decide_without_any_credential_is_forbidden_and_appends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(dir.path());
+        let r = pending_request(&s, 1);
+        let before = std::fs::read(s.log_path()).unwrap();
+        let body = format!(
+            "id={}&payload_hash={}&decision=approve",
+            r.id, r.payload_hash
+        );
+        let resp = do_decide_with_env(&Request::post("/m/decide", &body), &s, &env_none);
+        assert_eq!(resp.status, 403);
+        assert_eq!(status(&s, &r.id), Status::Pending);
+        assert_eq!(
+            std::fs::read(s.log_path()).unwrap(),
+            before,
+            "a refused decide writes nothing"
+        );
+    }
+
+    /// A log with its tail deleted fails the head check: the list is a 500
+    /// with no queue and no buttons, and deciding is refused without
+    /// touching the file.
+    #[test]
+    fn truncated_log_withholds_phone_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_token(dir.path());
+        let r = pending_request(&s, 1);
+        assert_eq!(
+            std::fs::read_to_string(s.log_path())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        std::fs::write(s.log_path(), "").unwrap();
+        let resp = page_list_with_env(&Request::get("/m").with_cookie(COOKIE), &s, &env_none);
+        assert_eq!(resp.status, 500);
+        assert!(!resp.body.contains("synthetic post 1"));
+        assert!(!resp.body.contains("<button"));
+        assert!(!resp.body.contains("/m/decide"));
+        let resp = do_decide_with_env(
+            &Request::post("/m/decide", &form(TOKEN, &r, "approve")),
+            &s,
+            &env_none,
+        );
+        assert_eq!(resp.status, 500);
+        assert_eq!(
+            std::fs::read_to_string(s.log_path()).unwrap(),
+            "",
+            "a refused decide writes nothing"
+        );
+    }
 }
