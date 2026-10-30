@@ -1434,7 +1434,7 @@ pub fn run_with(
         serde_json::json!({
             "post_id": post_id,
             "mode": mode,
-            "path": path.to_string_lossy(),
+            "path": path.file_name().unwrap_or_default().to_string_lossy(),
             "thread_posts": thread.len(),
             "quoted_posts": quoted.len() + thread.iter().filter(|p| p.quoted.is_some()).count(),
             "linked_posts": linked.len(),
@@ -2278,7 +2278,7 @@ mod tests {
         assert_eq!(p["prompt_tokens"], serde_json::Value::Null);
         assert_eq!(
             p["path"],
-            serde_json::Value::String(res.path.to_string_lossy().into_owned())
+            serde_json::Value::String(res.path.file_name().unwrap().to_string_lossy().into_owned())
         );
         assert!(res.path.ends_with("100.md"));
     }

@@ -1966,6 +1966,21 @@ fn page_stats(state: &State) -> Response {
     Response::ok(layout("Stats", &body, state))
 }
 
+/// Authenticate decision-log access with the phone credential and scoped cookie.
+fn authenticated_log(req: &Request, state: &State) -> Response {
+    if let Some(token) = req.query.get("k") {
+        if phone::token_valid(state, token) {
+            let mut response = Response::redirect("/log".into());
+            response.set_cookie = Some(phone::login_cookie_scoped(token, "/log"));
+            return response;
+        }
+    }
+    if !phone::cookie_authorized(state, req) {
+        return Response::status(403, "<h1>Log authentication required</h1>".into());
+    }
+    page_log(state)
+}
+
 /// Route one request. Pure over `(Request, &State)` apart from the file
 /// appends that votes, triage, follow-ups and approval decisions require.
 /// `GET /stats` renders the local stats dashboard (read-only).
@@ -1989,7 +2004,7 @@ pub fn handle(req: &Request, state: &State) -> Response {
         ("POST", "/try") => do_try(state, &req.body),
         ("GET", "/hidden-authors") => page_hidden_authors(state),
         ("POST", "/unhide-author") => do_unhide_author(state, &req.body),
-        ("GET", "/log") => page_log(state),
+        ("GET", "/log") => authenticated_log(req, state),
         ("GET", "/stats") => page_stats(state),
         ("GET", "/accuracy") => page_accuracy(state),
         ("GET", "/approvals") => page_approvals(state),
@@ -2346,6 +2361,25 @@ mod tests {
             .unwrap()
             .verify()
             .unwrap()
+    }
+
+    #[test]
+    fn log_access_requires_a_scoped_login() {
+        let (_dir, mut state) = test_state();
+        assert_eq!(handle(&Request::get("/log"), &state).status, 403);
+        state.phone_token = Some("synthetic-log-credential".into());
+        assert_eq!(
+            handle(&Request::get("/log?k=synthetic-log-credential"), &state).status,
+            303
+        );
+        assert_eq!(
+            handle(
+                &Request::get("/log").with_cookie("ap_k=synthetic-log-credential"),
+                &state
+            )
+            .status,
+            200
+        );
     }
 
     #[test]
@@ -3049,7 +3083,8 @@ mod tests {
 
     #[test]
     fn log_page_shows_verified_badge() {
-        let (_dir, state) = test_state();
+        let (_dir, mut state) = test_state();
+        state.phone_token = Some("synthetic-log-credential".into());
         assert_eq!(
             handle(
                 &Request::post("/vote", "post_id=p3&verdict=skip&i=2"),
@@ -3058,7 +3093,10 @@ mod tests {
             .status,
             303
         );
-        let resp = handle(&Request::get("/log"), &state);
+        let resp = handle(
+            &Request::get("/log").with_cookie("ap_k=synthetic-log-credential"),
+            &state,
+        );
         assert_eq!(resp.status, 200);
         assert!(resp.body.contains("chain verified"), "{}", resp.body);
         assert!(resp.body.contains("feedback"), "{}", resp.body);
@@ -3066,7 +3104,8 @@ mod tests {
 
     #[test]
     fn log_page_shows_tampered_badge() {
-        let (_dir, state) = test_state();
+        let (_dir, mut state) = test_state();
+        state.phone_token = Some("synthetic-log-credential".into());
         assert_eq!(
             handle(
                 &Request::post("/vote", "post_id=p3&verdict=skip&i=2"),
@@ -3077,7 +3116,10 @@ mod tests {
         );
         let body = std::fs::read_to_string(state.log_path()).unwrap();
         std::fs::write(state.log_path(), body.replacen("feedback", "xfeedback", 1)).unwrap();
-        let resp = handle(&Request::get("/log"), &state);
+        let resp = handle(
+            &Request::get("/log").with_cookie("ap_k=synthetic-log-credential"),
+            &state,
+        );
         assert_eq!(resp.status, 200);
         assert!(resp.body.contains("TAMPERED at row 0"), "{}", resp.body);
     }

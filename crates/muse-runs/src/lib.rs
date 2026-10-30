@@ -108,7 +108,7 @@ impl RunSpec {
         serde_json::json!({
             "log_no": self.log_no,
             "summary": self.summary,
-            "prompt_file": self.prompt_file.to_string_lossy(),
+            "prompt_file": self.prompt_file.file_name().unwrap_or_default().to_string_lossy(),
             "prompt_sha256": self.prompt_sha256,
             "class": "public",
         })
@@ -219,8 +219,17 @@ pub fn run(log: &mut DecisionLog, token: ReleaseToken, runner: &Runner) -> Resul
             "Muse Code runs are paid: set {PAID_ENV_VAR}=1 to run (fail closed; approval kept)"
         ));
     }
-    let spec = RunSpec::from_payload(&a.request.payload)
+    let mut spec = RunSpec::from_payload(&a.request.payload)
         .ok_or_else(|| format!("'{id}' has a malformed payload (refused)"))?;
+    if spec.prompt_file.components().count() != 1
+        || !matches!(
+            spec.prompt_file.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err("prompt path must be a repository basename; propose again".into());
+    }
+    spec.prompt_file = runner.repo.join(&spec.prompt_file);
     if sha256_file(&spec.prompt_file)? != spec.prompt_sha256 {
         return Err(format!(
             "prompt {} changed since approval (refused; propose again)",
@@ -628,7 +637,14 @@ mod tests {
         assert!(RunSpec::from_prompt("60", " ", &p).is_err());
         assert!(RunSpec::from_prompt("60", "s", &fx.dir.path().join("missing.md")).is_err());
         let spec = spec_of(&fx.dir);
-        assert_eq!(RunSpec::from_payload(&spec.payload()), Some(spec));
+        let payload = spec.payload();
+        assert_eq!(payload["prompt_file"], "prompt.md");
+        assert!(!payload
+            .to_string()
+            .contains(fx.dir.path().to_str().unwrap()));
+        let mut expected = spec;
+        expected.prompt_file = "prompt.md".into();
+        assert_eq!(RunSpec::from_payload(&payload), Some(expected));
     }
 
     #[test]

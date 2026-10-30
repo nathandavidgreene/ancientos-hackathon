@@ -32,3 +32,11 @@ falling back. Generate a random token with `web-ui --print-phone-token`.
 Use an HTTPS-terminating proxy: the Secure cookies require HTTPS. Five failed
 logins per peer in a minute temporarily block that peer; proxies sharing one
 backend peer address share the limit.
+
+Decision-log privacy: `/log` requires the phone credential, initially via
+`/log?k=TOKEN` over HTTPS. New Wonder questions and answers live in private
+content-addressed files beside the log; payloads contain digests and short
+summaries. Preserve these directories with the log. Runner prompt payloads
+contain a basename: place prompt files in the runner repository root before
+proposal/execution. Re-propose older pending requests that stored absolute
+paths or lack private content files. Existing log entries remain untouched.

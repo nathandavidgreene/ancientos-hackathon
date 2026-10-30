@@ -487,6 +487,11 @@ impl DecisionLog {
         Self::open_with_key(path, None)
     }
 
+    /// Path identifying this log's local data directory, never a logged payload.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Open (or create) a log in signed mode, loading the HMAC key from
     /// `key_path` via [`load_signing_key`].
     ///

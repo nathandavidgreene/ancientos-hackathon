@@ -15,7 +15,7 @@
 //! 3. [`ask`] takes the question approval's [`ReleaseToken`]
 //!    by value and calls the model only with the paid switch on, and only
 //!    if the client is the Wonder route. It appends `approval.released`
-//!    before the call and `wonder.answered` (answer text plus its sha256)
+//!    before the call and `wonder.answered` (answer digest only; text stays in private local storage)
 //!    after. A refused ask appends nothing and the approval stays usable; a
 //!    failed call is logged with its error.
 //!
@@ -73,6 +73,55 @@ fn sha256(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
+/// Content-addressed private storage beside this log; names must be digests.
+fn text_path(
+    log: &DecisionLog,
+    namespace: &str,
+    digest: &str,
+) -> Result<std::path::PathBuf, String> {
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid content digest".into());
+    }
+    Ok(log
+        .path()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(namespace)
+        .join(digest))
+}
+
+/// Persist full text locally with private directory and file permissions.
+fn save_text(log: &DecisionLog, namespace: &str, text: &str) -> Result<String, String> {
+    use std::io::Write;
+    let digest = sha256(text);
+    let path = text_path(log, namespace, &digest)?;
+    let dir = path.parent().ok_or("text directory unavailable")?;
+    std::fs::create_dir_all(dir).map_err(|_| "text directory unavailable".to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| "text permissions failed".to_string())?;
+    }
+    let mut file =
+        tempfile::NamedTempFile::new_in(dir).map_err(|_| "text staging failed".to_string())?;
+    file.write_all(text.as_bytes())
+        .map_err(|_| "text write failed".to_string())?;
+    file.persist(&path)
+        .map_err(|_| "text persistence failed".to_string())?;
+    Ok(digest)
+}
+
+/// Read full text only when it still matches the approved/logged digest.
+fn load_text(log: &DecisionLog, namespace: &str, digest: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(text_path(log, namespace, digest)?)
+        .map_err(|_| "approved text unavailable; propose again".to_string())?;
+    if sha256(&text) != digest {
+        return Err("stored text digest mismatch".into());
+    }
+    Ok(text)
+}
+
 /// Validate a question: non-empty, at most [`MAX_QUESTION_CHARS`].
 fn check_question(q: &str) -> Result<(), String> {
     if q.trim().is_empty() {
@@ -106,14 +155,15 @@ pub fn propose(
             "{sensitivity:?} text routes to {dest:?}, not Muse Wonder (refused)"
         ));
     }
-    let summary: String = question.chars().take(80).collect();
+    let digest = save_text(log, "wonder-questions", question)?;
+    let summary = format!("question {}", &digest[..12]);
     approvals::request(
         log,
         &app_gate(),
         AGENT,
         ASK_ACTION,
         &format!("Ask Muse Wonder: {summary}"),
-        serde_json::json!({ "question": question, "question_sha256": sha256(question), "class": class.as_str() }),
+        serde_json::json!({ "question_sha256": digest, "class": class.as_str() }),
         now,
         None,
     )
@@ -192,15 +242,10 @@ pub fn ask(
             client.destination()
         ));
     }
-    let question = a.request.payload["question"]
+    let digest = a.request.payload["question_sha256"]
         .as_str()
-        .ok_or_else(|| format!("'{id}' has a malformed payload (refused)"))?
-        .to_string();
-    if a.request.payload["question_sha256"].as_str() != Some(sha256(&question).as_str()) {
-        return Err(format!(
-            "'{id}' question does not match its sha256 (refused)"
-        ));
-    }
+        .ok_or("missing question digest")?;
+    let question = load_text(log, "wonder-questions", digest)?;
     if a.request.payload["class"].as_str() != Some("public")
         || bookmarks_agent::translate::class_of(&question) != DataClass::Public
         || bookmarks_agent::sanitize::sanitize_uncapped(&question) != question
@@ -214,9 +259,10 @@ pub fn ask(
     let result =
         client.complete_with_class(DataClass::Public, CALLER, Some(log), &prompt(&question));
     let entry = match &result {
-        Ok(text) => serde_json::json!({
-            "id": id, "answer": text, "answer_sha256": sha256(text), "error": null,
-        }),
+        Ok(text) => {
+            let digest = save_text(log, "wonder-answers", text)?;
+            serde_json::json!({"id": id, "answer_sha256": digest, "error": null})
+        }
         Err(e) => serde_json::json!({ "id": id, "answer": null, "error": e.to_string() }),
     };
     log.append(ANSWERED_KIND, entry)
@@ -227,11 +273,14 @@ pub fn ask(
 /// The logged answer for a question, if one was recorded.
 pub fn answer_of(log: &DecisionLog, id: &str) -> Result<Option<String>, String> {
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
-    Ok(entries
+    let digest = entries
         .iter()
         .rev()
-        .filter(|e| e.kind == ANSWERED_KIND && e.payload["id"].as_str() == Some(id))
-        .find_map(|e| e.payload["answer"].as_str().map(str::to_string)))
+        .find(|e| e.kind == ANSWERED_KIND && e.payload["id"].as_str() == Some(id))
+        .and_then(|e| e.payload["answer_sha256"].as_str());
+    digest
+        .map(|hash| load_text(log, "wonder-answers", hash))
+        .transpose()
 }
 
 /// Muse client pointed at the Wonder route.
@@ -618,10 +667,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.payload["class"], "public");
-        assert!(!req.payload["question"]
-            .as_str()
-            .unwrap()
-            .contains("https://"));
+        assert!(req.payload.get("question").is_none());
+        let stored = load_text(
+            &log,
+            "wonder-questions",
+            req.payload["question_sha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(!stored.contains("https://"));
+    }
+
+    #[test]
+    fn question_and_answer_text_stay_out_of_log_payloads() {
+        let (_dir, mut log) = log();
+        let text = "What if houses floated above parks";
+        let request = propose(&mut log, text, Sensitivity::Sanitized, NOW).unwrap();
+        assert!(request.payload.get("question").is_none());
+        approve(&mut log, &request.id, "human", NOW + 1).unwrap();
+        let token = claim(&log, &request);
+        let answer = ask(&mut log, token, &Mock::at(Destination::MuseWonder), true).unwrap();
+        let raw = std::fs::read_to_string(log.path()).unwrap();
+        assert!(!raw.contains(text));
+        assert!(!raw.contains(&answer));
+        assert_eq!(answer_of(&log, &request.id).unwrap(), Some(answer));
     }
 
     #[test]
