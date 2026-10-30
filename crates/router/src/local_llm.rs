@@ -36,15 +36,15 @@ pub struct LocalLlmClient {
 impl LocalLlmClient {
     /// Build from env: [`URL_ENV`], [`MODEL_ENV`].
     pub fn from_env() -> Self {
-        Self {
-            base_url: get_env(URL_ENV),
-            model: get_env(MODEL_ENV).unwrap_or_else(|| DEFAULT_MODEL.into()),
-        }
+        Self::new(
+            get_env(URL_ENV),
+            get_env(MODEL_ENV).unwrap_or_else(|| DEFAULT_MODEL.into()),
+        )
     }
 
     /// Build with explicit settings (tests, callers that already read env).
     pub fn new(base_url: Option<String>, model: impl Into<String>) -> Self {
-        let base_url = base_url.filter(|u| !u.trim().is_empty());
+        let base_url = base_url.filter(|u| crate::http::validate_local_url(u).is_ok());
         Self {
             base_url,
             model: model.into(),
@@ -69,6 +69,8 @@ impl LocalLlmClient {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .ok_or(RouterError::MissingEnv(URL_ENV))?;
+        crate::http::validate_local_url(base)
+            .map_err(|_| RouterError::Refused("non-local model endpoint refused".into()))?;
         let trimmed = base.trim_end_matches('/');
         if trimmed.ends_with("/v1") {
             Ok(format!("{trimmed}/chat/completions"))
@@ -97,6 +99,8 @@ impl LocalLlmClient {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .ok_or(RouterError::MissingEnv(URL_ENV))?;
+        crate::http::validate_local_url(base)
+            .map_err(|_| RouterError::Refused("non-local model endpoint refused".into()))?;
         let trimmed = base.trim_end_matches('/');
         let api_base = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
         let tags = format!("{api_base}/api/tags");
@@ -148,7 +152,7 @@ impl ModelClient for LocalLlmClient {
         self.health_check()?;
         let endpoint = self.endpoint()?;
         let body = self.request_body(prompt);
-        let raw = crate::http::post_json(
+        let raw = crate::http::post_json_local(
             &endpoint,
             std::time::Duration::from_secs(TIMEOUT_SECS),
             &[],

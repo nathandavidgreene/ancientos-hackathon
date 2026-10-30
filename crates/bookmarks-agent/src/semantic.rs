@@ -46,8 +46,10 @@ impl Config {
     /// both the local server URL and the embedding model are set.
     pub fn from_env() -> Option<Self> {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let base_url = get(ancientos_router::local_llm::URL_ENV)?;
+        ancientos_router::http::validate_local_url(&base_url).ok()?;
         Some(Self {
-            base_url: get(ancientos_router::local_llm::URL_ENV)?,
+            base_url,
             model: get(MODEL_ENV)?,
         })
     }
@@ -164,7 +166,7 @@ impl VectorCache {
 pub fn fetch_local(base_url: &str, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     let base = base_url.trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
-    let raw = ancientos_router::http::post_json(
+    let raw = ancientos_router::http::post_json_local(
         &format!("{base}/api/embed"),
         std::time::Duration::from_secs(TIMEOUT_SECS),
         &[],

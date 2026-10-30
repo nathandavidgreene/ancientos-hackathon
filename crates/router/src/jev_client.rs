@@ -148,6 +148,10 @@ impl JevClient {
                 get_env(LOCALJEV_MODEL_ENV).unwrap_or_else(|| LOCALJEV_DEFAULT_MODEL.into()),
             ),
         };
+        if backend == JevBackend::LocalJev {
+            crate::http::validate_local_url(&base_url)
+                .map_err(|_| RouterError::Refused("non-local model endpoint refused".into()))?;
+        }
         Ok(Self {
             backend,
             base_url,
@@ -241,6 +245,10 @@ impl JevClient {
     /// Gates shared by every call: paid switch + key for TypeSafe; optional
     /// key for local. Returns the Bearer key to send, if any.
     fn preflight(&self) -> Result<Option<String>, RouterError> {
+        if self.backend == JevBackend::LocalJev {
+            crate::http::validate_local_url(&self.base_url)
+                .map_err(|_| RouterError::Refused("non-local model endpoint refused".into()))?;
+        }
         match self.backend {
             JevBackend::TypeSafe => {
                 if !self.allow_paid {
@@ -287,6 +295,7 @@ impl JevClient {
         }
         let key = self.preflight()?;
         post_systemone(
+            self.backend == JevBackend::LocalJev,
             &self.endpoint(),
             &self.model,
             key.as_deref(),
@@ -367,6 +376,7 @@ fn endpoint_for(base: &str) -> String {
 /// Shape verified live against TypeSafe on 2026-10-26; the localjev server is
 /// assumed to share it (the Luna stack uses one SystemOneClient for both).
 fn post_systemone(
+    local: bool,
     endpoint: &str,
     model: &str,
     api_key: Option<&str>,
@@ -379,7 +389,11 @@ fn post_systemone(
         .as_ref()
         .map(|a| vec![("Authorization", a.as_str())])
         .unwrap_or_default();
-    let raw = crate::http::post_json(
+    let raw = (if local {
+        crate::http::post_json_local
+    } else {
+        crate::http::post_json
+    })(
         endpoint,
         std::time::Duration::from_secs(TIMEOUT_SECS),
         &headers,

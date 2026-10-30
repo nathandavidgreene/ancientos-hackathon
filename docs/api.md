@@ -18,3 +18,8 @@ Unset preserves unsigned operation with a loud warning. A configured key must
 be at least 32 bytes and mode 0600. Existing unsigned logs cannot be opened
 in signed mode: retain the old log unchanged and configure a new log path
 when enabling signing. Restart the affected binaries after configuring it.
+
+Local model URLs accept only loopback, exact `localhost`, or RFC1918 IP
+literals by default. Redirects and proxy routing are disabled for local prompt
+transport. `ANCIENTOS_ALLOW_REMOTE_LOCAL=1` explicitly permits a remote server;
+use it only when that destination is intended to receive private data.

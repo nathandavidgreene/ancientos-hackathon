@@ -87,6 +87,61 @@ pub fn post_json(
     read_json(request.send_json(body.clone()).map_err(map_err)?)
 }
 
+/// Validate a local destination without resolving arbitrary hostnames.
+/// Remote use requires the explicit deployment escape hatch.
+pub fn validate_local_url(raw: &str) -> Result<(), HttpError> {
+    let remote = std::env::var("ANCIENTOS_ALLOW_REMOTE_LOCAL").is_ok_and(|v| v == "1");
+    if local_url_allowed(raw, remote) {
+        Ok(())
+    } else {
+        Err(HttpError::Body("non-local model endpoint refused".into()))
+    }
+}
+
+/// Pure URL policy: loopback or RFC1918 literals, or exact localhost.
+fn local_url_allowed(raw: &str, remote: bool) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return false;
+    }
+    remote
+        || match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(host)) => host == "localhost",
+            None => false,
+        }
+}
+
+/// POST to a validated local model, with redirects and proxy routing disabled.
+pub fn post_json_local(
+    url: &str,
+    timeout: Duration,
+    headers: &[(&str, &str)],
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, HttpError> {
+    validate_local_url(url)?;
+    if std::env::var("ANCIENTOS_ALLOW_REMOTE_LOCAL").is_ok_and(|v| v == "1") {
+        return post_json(url, timeout, headers, body);
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .build();
+    let mut request = agent.post(url);
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    read_json(request.send_json(body.clone()).map_err(map_err)?)
+}
+
 /// GET and parse the JSON reply. Used for JSON APIs with header auth.
 pub fn get_json(
     url: &str,
@@ -311,6 +366,30 @@ fn is_timeout(t: &ureq::Transport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_destinations_require_explicit_local_authority() {
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://10.0.0.1",
+            "https://192.168.1.2",
+            "http://[::1]",
+        ] {
+            assert!(local_url_allowed(url, false));
+        }
+        for url in [
+            "https://example.com",
+            "http://169.254.169.254",
+            "http://[::ffff:8.8.8.8]",
+            "http://localhost.example.com",
+            "http://user:pass@localhost",
+            "file:///tmp/test",
+        ] {
+            assert!(!local_url_allowed(url, false));
+        }
+        assert!(local_url_allowed("https://example.com", true));
+    }
 
     /// Short bodies pass through; long ones are cut at exactly the cap.
     #[test]
