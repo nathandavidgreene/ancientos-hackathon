@@ -2123,6 +2123,7 @@ mod tests {
         assert_eq!(d.explanation.confidence, Some(0.9f32));
     }
 
+    /// Muse explanation is sanitized and capped; sets META_API_KEY via EnvGuard so the test cannot hang on a missing key.
     #[test]
     fn muse_explanation_uses_sanitized_capped_reason() {
         // The Muse stage reads META_API_KEY at call time: without the lock

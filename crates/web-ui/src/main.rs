@@ -186,6 +186,22 @@ fn run(args: &[String]) -> Result<(), String> {
             "off (set ANCIENTOS_PHONE_TOKEN, 16+ chars)"
         }
     );
+    state.labels_dir = bookmarks_agent::labels::eval_dir_from_env();
+    state.labels_remove_bin = std::env::var(bookmarks_agent::labels::REMOVE_BIN_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    if let Some(eval) = &state.labels_dir {
+        match bookmarks_agent::labels::seed_labels(eval, bookmarks_agent::idea_card::now_secs()) {
+            Ok(rep) => eprintln!(
+                "labels (/labels): on (seeded {}, kept {})",
+                rep.added, rep.kept
+            ),
+            Err(e) => return Err(format!("labels seed failed: {e}")),
+        }
+    } else {
+        eprintln!("labels (/labels): off (no label queries found)");
+    }
     let addr = loopback_addr(&parsed.host, parsed.port)?;
     let listener = TcpListener::bind(addr).map_err(|e| format!("bind {addr} failed: {e}"))?;
     println!(
