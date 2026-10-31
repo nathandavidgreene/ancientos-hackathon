@@ -177,7 +177,38 @@ fn findings_html(
     out
 }
 
-/// One post card: header, tags, text, thumbs, findings, radios, Delete.
+/// Dry-run Delete preview line for one post card: names the bookmark, its
+/// author when present, and its sorted categories, plus what the click
+/// logs. Pure, deterministic, and HTML-escaped (no network, no writes).
+fn delete_preview_line(key: &str, author: &str, categories: &[String]) -> String {
+    let mut cats = categories.to_vec();
+    cats.sort();
+    cats.dedup();
+    let cats_text = if cats.is_empty() {
+        "none".to_string()
+    } else {
+        cats.iter()
+            .map(|c| escape(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let who = if author.is_empty() {
+        String::new()
+    } else {
+        format!(" (@{})", escape(author))
+    };
+    format!(
+        "<p class=\"delete-preview\">Delete preview: removes bookmark {key}{who} \
+         · categories: {cats} · logs: label=delete for {key} in the labels store; \
+         Social's remover unbookmarks it. Nothing else changes.</p>",
+        key = escape(key),
+        who = who,
+        cats = cats_text,
+    )
+}
+
+/// One post card: header, tags, text, thumbs, findings, radios, Delete
+/// preview line, Delete.
 fn card_html(
     queries: &LabelQueries,
     key: &str,
@@ -190,6 +221,15 @@ fn card_html(
     let status_id = labels::status_id_of_url(&post.url);
     let rel = current == Some(Label::Relevant);
     let not = current == Some(Label::Not);
+    let mut preview_cats: Vec<String> = queries.member_of(key);
+    if let Some(c) = classify.get(key) {
+        preview_cats.extend(c.iter().cloned());
+    }
+    if let Some(id) = status_id.as_deref() {
+        if let Some(c) = classify.get(id) {
+            preview_cats.extend(c.iter().cloned());
+        }
+    }
     format!(
         "<div class=\"card\" id=\"post-{}\">\
          <h2>#{key} by {author} {badge}</h2>\
@@ -201,6 +241,7 @@ fn card_html(
          value=\"relevant\"{rel}> Relevant</label>\
          <label><input type=\"radio\" form=\"{form}\" name=\"label-{key}\" \
          value=\"not\"{not}> Not</label></p>\
+         {preview}\
          <form method=\"post\" action=\"/labels/delete\">\
          <input type=\"hidden\" name=\"post\" value=\"{key}\">\
          <input type=\"hidden\" name=\"request_id\" value=\"{request_id}\">\
@@ -218,6 +259,7 @@ fn card_html(
         form = SAVE_FORM_ID,
         rel = if rel { " checked" } else { "" },
         not = if not { " checked" } else { "" },
+        preview = delete_preview_line(key, &post.author, &preview_cats),
         request_id = request_uuid(),
     )
 }
@@ -1021,6 +1063,84 @@ mod tests {
             );
             assert_eq!(resp.status, 400, "{body}");
         }
+    }
+
+    /// Preview with categories sorts them and names the author; repeated
+    /// calls with shuffled input render identically (deterministic).
+    #[test]
+    fn delete_preview_sorts_categories_and_names_author() {
+        let a = delete_preview_line(
+            "7",
+            "syn_sleeper",
+            &[
+                "sleep".to_string(),
+                "q2".to_string(),
+                "q1".to_string(),
+                "q1".to_string(),
+            ],
+        );
+        let b = delete_preview_line(
+            "7",
+            "syn_sleeper",
+            &["q1".to_string(), "q2".to_string(), "sleep".to_string()],
+        );
+        assert_eq!(a, b, "{a}");
+        assert_eq!(
+            a,
+            "<p class=\"delete-preview\">Delete preview: removes bookmark 7 (@syn_sleeper) \
+             · categories: q1, q2, sleep · logs: label=delete for 7 in the labels store; \
+             Social's remover unbookmarks it. Nothing else changes.</p>",
+            "{a}"
+        );
+    }
+
+    /// Preview with no categories says `none`, omits the author when empty,
+    /// and escapes hostile markup in key, author, and categories.
+    #[test]
+    fn delete_preview_escapes_hostile_text_and_handles_no_categories() {
+        let plain = delete_preview_line("9", "", &[]);
+        assert!(plain.contains("removes bookmark 9"), "{plain}");
+        assert!(!plain.contains("(@"), "{plain}");
+        assert!(plain.contains("categories: none"), "{plain}");
+        assert!(plain.contains("label=delete for 9"), "{plain}");
+        let evil = delete_preview_line(
+            "<script>7</script>",
+            "a&b",
+            &["<script>evil</script>".to_string()],
+        );
+        assert!(!evil.contains("<script>"), "{evil}");
+        assert!(evil.contains("&lt;script&gt;7&lt;/script&gt;"), "{evil}");
+        assert!(evil.contains("(@a&amp;b)"), "{evil}");
+        assert!(
+            evil.contains("categories: &lt;script&gt;evil&lt;/script&gt;"),
+            "{evil}"
+        );
+        assert!(evil.contains("class=\"delete-preview\""), "{evil}");
+    }
+
+    /// Each labels card shows its Delete preview directly above its
+    /// unchanged one-click Delete form.
+    #[test]
+    fn page_shows_delete_preview_above_delete_form() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let s = labels_state(data.path(), eval.path());
+        let body = crate::handle_routes(&Request::get("/labels").with_cookie(COOKIE), &s).body;
+        assert_eq!(count(&body, "class=\"delete-preview\""), 2, "{body}");
+        assert_eq!(count(&body, "action=\"/labels/delete\""), 2, "{body}");
+        for want in [
+            "removes bookmark 7 (@syn_sleeper)",
+            "categories: q1, q2, sleep",
+            "removes bookmark 9 (@syn_cook)",
+            "categories: q1, rest",
+            "label=delete for 7",
+            "Nothing else changes.",
+        ] {
+            assert!(body.contains(want), "missing {want}: {body}");
+        }
+        let preview = body.find("delete-preview").unwrap();
+        let form = body.find("action=\"/labels/delete\"").unwrap();
+        assert!(preview < form, "{body}");
     }
 
     /// Thumbnails cross the socket as bytes with an image content type.
