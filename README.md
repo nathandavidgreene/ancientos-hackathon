@@ -75,7 +75,7 @@ expected. `/log` needs a scoped login.
 
 ### 3. Tests
 ```sh
-cargo test --workspace --quiet    # 1020 tests on main c637d51
+cargo test --workspace --quiet    # 1031 tests on current main
 ```
 Run from the repo root: `scripts/demo.sh` and its tests use `./target`, so do
 not set `CARGO_TARGET_DIR`.
