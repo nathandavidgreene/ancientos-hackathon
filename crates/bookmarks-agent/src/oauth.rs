@@ -29,8 +29,9 @@ pub enum OAuthError {
     BadResponse(String),
 }
 
-/// Token endpoint response. Never printed: callers must not log this.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// Token endpoint response. Its `Debug` output redacts both tokens (see
+/// the manual impl below), but callers still must not log it.
+#[derive(Clone, serde::Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -41,6 +42,23 @@ pub struct TokenResponse {
     pub scope: Option<String>,
     #[serde(default)]
     pub token_type: Option<String>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    /// Debug output with `access_token` and `refresh_token` redacted,
+    /// mirroring `StoredTokens`; only whether a refresh token exists shows.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("token_type", &self.token_type)
+            .finish()
+    }
 }
 
 /// base64url without padding.
@@ -187,6 +205,22 @@ fn map_http_error(e: HttpError) -> OAuthError {
 
 #[cfg(test)]
 mod tests {
+    /// `{:?}` on a token response never prints either token.
+    #[test]
+    fn token_response_debug_redacts_tokens() {
+        let t = TokenResponse {
+            access_token: "synthetic-access-AAAA".into(),
+            refresh_token: Some("synthetic-refresh-BBBB".into()),
+            expires_in: Some(7200),
+            scope: Some("bookmark.read".into()),
+            token_type: Some("bearer".into()),
+        };
+        let out = format!("{t:?} {t:#?}");
+        assert!(!out.contains("synthetic-access"), "{out}");
+        assert!(!out.contains("synthetic-refresh"), "{out}");
+        assert!(out.contains("[redacted]") && out.contains("7200"), "{out}");
+    }
+
     use super::*;
 
     /// Test helper: whether a char is valid in a PKCE verifier.
