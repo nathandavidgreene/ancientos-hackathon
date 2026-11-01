@@ -8,6 +8,12 @@
 //!   tags when present), thumbnails, accepted `analyze_media` findings, a
 //!   Relevant/Not radio pair, and its own Delete button. `GET /labels?k=`
 //!   logs in like `/m?k=` and sets a `/labels`-scoped cookie.
+//!   `GET /labels?ids=<id>,<id>` renders only the cards whose X status id
+//!   is listed; `?ids=demo` reads the list from the server-side allowlist
+//!   file named by `ANCIENTOS_LABELS_DEMO_IDS_PATH` (default
+//!   `$HOME/.local/share/ancientos-hackathon/demo-safe-ids.txt`). Any
+//!   malformed input or unreadable allowlist fails closed to zero cards,
+//!   never to every post. Without `ids` the page is unchanged.
 //! - `POST /labels/save` persists the submitted Relevant/Not labels
 //!   through the bookmarks app endpoint
 //!   (`bookmarks_agent::labels::save_labels`).
@@ -33,6 +39,102 @@ pub const LOGIN_PATH: &str = "/labels";
 const SAVE_FORM_ID: &str = "labels-save";
 /// Largest thumbnail served (fail closed above this).
 pub const MAX_THUMB_BYTES: usize = 5 * 1024 * 1024;
+
+/// Env var naming the server-side allowlist file used by `?ids=demo`.
+pub const DEMO_IDS_ENV: &str = "ANCIENTOS_LABELS_DEMO_IDS_PATH";
+/// Allowlist path under `$HOME` used when [`DEMO_IDS_ENV`] is unset or
+/// empty. Deliberately outside the repo and outside eval-private.
+pub const DEMO_IDS_DEFAULT_REL: &str = ".local/share/ancientos-hackathon/demo-safe-ids.txt";
+/// Most ids one filter may name; more is treated as malformed.
+const MAX_FILTER_IDS: usize = 1000;
+/// Longest accepted id (X status ids are at most 20 digits).
+const MAX_ID_LEN: usize = 25;
+
+/// Which cards `GET /labels` renders, parsed from the `?ids=` param.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdsFilter {
+    /// No `ids` param: every query post (today's behavior).
+    All,
+    /// Only posts whose X status id is in the set. An empty set (from
+    /// malformed input or a missing allowlist) renders no cards.
+    Only(BTreeSet<String>),
+}
+
+impl IdsFilter {
+    /// True if a card with this X status id should render. Posts without
+    /// a parseable status id only render under [`IdsFilter::All`].
+    fn allows(&self, status_id: Option<&str>) -> bool {
+        match self {
+            IdsFilter::All => true,
+            IdsFilter::Only(ids) => status_id.is_some_and(|id| ids.contains(id)),
+        }
+    }
+}
+
+/// True if `s` looks like an X status id: 1..=[`MAX_ID_LEN`] ASCII digits.
+fn valid_post_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_ID_LEN && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parse a comma-separated id list. Surrounding whitespace per id is
+/// trimmed; any empty or non-numeric entry, or more than
+/// [`MAX_FILTER_IDS`] ids, makes the whole list invalid (`None`).
+fn parse_id_list(raw: &str) -> Option<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for tok in raw.split(',') {
+        let tok = tok.trim();
+        if !valid_post_id(tok) {
+            return None;
+        }
+        out.insert(tok.to_string());
+    }
+    (out.len() <= MAX_FILTER_IDS).then_some(out)
+}
+
+/// Read an allowlist file: one id per line, blank lines ignored. An
+/// unreadable file, any malformed line, or too many ids yields `None`.
+fn load_id_file(path: &std::path::Path) -> Option<BTreeSet<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut out = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !valid_post_id(line) {
+            return None;
+        }
+        out.insert(line.to_string());
+    }
+    (out.len() <= MAX_FILTER_IDS).then_some(out)
+}
+
+/// Resolve the `?ids=demo` allowlist path: [`DEMO_IDS_ENV`] if set and
+/// non-empty, else `$HOME/`[`DEMO_IDS_DEFAULT_REL`]; `None` if neither.
+fn demo_ids_path() -> Option<std::path::PathBuf> {
+    match std::env::var_os(DEMO_IDS_ENV) {
+        Some(p) if !p.is_empty() => Some(p.into()),
+        _ => std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(|h| std::path::PathBuf::from(h).join(DEMO_IDS_DEFAULT_REL)),
+    }
+}
+
+/// Build the card filter from the raw `ids` param. Absent means
+/// [`IdsFilter::All`]; `demo` reads `demo_path`; anything else is parsed
+/// as a comma list. Every failure fails closed to an empty
+/// [`IdsFilter::Only`], never to all posts.
+fn ids_filter(raw: Option<&str>, demo_path: Option<&std::path::Path>) -> IdsFilter {
+    let Some(raw) = raw else {
+        return IdsFilter::All;
+    };
+    let ids = if raw.trim() == "demo" {
+        demo_path.and_then(load_id_file)
+    } else {
+        parse_id_list(raw)
+    };
+    IdsFilter::Only(ids.unwrap_or_default())
+}
 
 /// 404 page for labels routes when no eval dir is configured.
 fn labels_off(state: &State) -> Response {
@@ -266,6 +368,7 @@ fn card_html(
 
 /// `GET /labels`: log in via `?k=` (303 + scoped cookie, like `/m`), else
 /// list every query post once with tags, thumbs, findings, and labels.
+/// An `?ids=` param narrows the cards (see [`ids_filter`]).
 pub fn page_labels(req: &Request, state: &State) -> Response {
     let Some(dir) = state.labels_dir.as_deref() else {
         return labels_off(state);
@@ -292,7 +395,21 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
     let thumbs = labels::load_thumb_manifest(dir);
     let findings = labels::load_findings(dir);
     let classify = labels::load_classify(dir);
-    let keys = queries.ordered_keys();
+    let filter = ids_filter(
+        req.query.get("ids").map(String::as_str),
+        demo_ids_path().as_deref(),
+    );
+    let keys: Vec<String> = queries
+        .ordered_keys()
+        .into_iter()
+        .filter(|k| {
+            let sid = queries
+                .posts
+                .get(k)
+                .and_then(|p| labels::status_id_of_url(&p.url));
+            filter.allows(sid.as_deref())
+        })
+        .collect();
     let labeled = keys.iter().filter(|k| stored.contains_key(*k)).count();
     let mut body = format!(
         "<h1>Labels ({} post{}, {} labeled)</h1>\
@@ -805,6 +922,96 @@ mod tests {
         assert!(!body.contains(TOKEN), "{body}");
         assert!(!body.contains("eval-private"), "{body}");
         assert!(!body.contains(&data.path().display().to_string()), "{body}");
+    }
+
+    /// `?ids=` with a known status id renders only that card.
+    #[test]
+    fn ids_filter_renders_only_listed_posts() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let s = labels_state(data.path(), eval.path());
+        let target = format!("/labels?ids={ID9}, 123");
+        let resp = crate::handle_routes(&Request::get(&target).with_cookie(COOKIE), &s);
+        assert_eq!(resp.status, 200);
+        let body = &resp.body;
+        assert_eq!(count(body, "id=\"post-9\""), 1, "{body}");
+        assert!(!body.contains("id=\"post-7\""), "{body}");
+        assert!(body.contains("Labels (1 post, 0 labeled)"), "{body}");
+    }
+
+    /// Malformed, empty, or unknown-only `?ids=` input fails closed to
+    /// zero cards, never all posts.
+    #[test]
+    fn ids_filter_malformed_or_unknown_is_empty() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let s = labels_state(data.path(), eval.path());
+        for q in [
+            "abc",
+            "",
+            ",",
+            "7,,9",
+            "9000000000000000007;rm",
+            "123",
+            "-1",
+        ] {
+            let target = format!("/labels?ids={q}");
+            let resp = crate::handle_routes(&Request::get(&target).with_cookie(COOKIE), &s);
+            assert_eq!(resp.status, 200, "{q}");
+            assert_eq!(count(&resp.body, "id=\"post-"), 0, "{q}: {}", resp.body);
+            assert!(resp.body.contains("Labels (0 posts"), "{q}");
+        }
+    }
+
+    /// No `ids` param keeps today's behavior: every query post renders.
+    #[test]
+    fn ids_filter_absent_renders_all() {
+        assert_eq!(ids_filter(None, None), IdsFilter::All);
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let s = labels_state(data.path(), eval.path());
+        let resp = crate::handle_routes(&Request::get("/labels").with_cookie(COOKIE), &s);
+        assert_eq!(count(&resp.body, "id=\"post-"), 2, "{}", resp.body);
+    }
+
+    /// `demo` reads the allowlist file; a missing, unreadable, or
+    /// malformed file fails closed to an empty filter.
+    #[test]
+    fn ids_filter_demo_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("ids.txt");
+        std::fs::write(&good, format!("{ID7}\n\n  {ID9}  \n")).unwrap();
+        let want: BTreeSet<String> = [ID7, ID9].iter().map(|s| s.to_string()).collect();
+        assert_eq!(ids_filter(Some("demo"), Some(&good)), IdsFilter::Only(want));
+        let bad = dir.path().join("bad.txt");
+        std::fs::write(&bad, format!("{ID7}\nnot-an-id\n")).unwrap();
+        let empty = IdsFilter::Only(BTreeSet::new());
+        assert_eq!(ids_filter(Some("demo"), Some(&bad)), empty);
+        assert_eq!(
+            ids_filter(Some("demo"), Some(&dir.path().join("missing"))),
+            empty
+        );
+        assert_eq!(ids_filter(Some("demo"), None), empty);
+        assert!(!empty.allows(Some(ID7)));
+        assert!(!IdsFilter::Only([ID7.to_string()].into()).allows(None));
+    }
+
+    /// End to end: `?ids=demo` with the env var pointing at an allowlist
+    /// renders only the listed card. Only this test sets the env var.
+    #[test]
+    fn ids_demo_page_uses_env_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("demo.txt");
+        std::fs::write(&file, format!("{ID7}\n")).unwrap();
+        std::env::set_var(DEMO_IDS_ENV, &file);
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let s = labels_state(data.path(), eval.path());
+        let resp = crate::handle_routes(&Request::get("/labels?ids=demo").with_cookie(COOKIE), &s);
+        std::env::remove_var(DEMO_IDS_ENV);
+        assert_eq!(count(&resp.body, "id=\"post-7\""), 1, "{}", resp.body);
+        assert_eq!(count(&resp.body, "id=\"post-"), 1, "{}", resp.body);
+        assert!(!resp.body.contains(&file.display().to_string()));
     }
 
     /// Saved labels show as checked radios and counts.
