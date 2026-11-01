@@ -13,7 +13,10 @@
 //!   file named by `ANCIENTOS_LABELS_DEMO_IDS_PATH` (default
 //!   `$HOME/.local/share/ancientos-hackathon/demo-safe-ids.txt`). Any
 //!   malformed input or unreadable allowlist fails closed to zero cards,
-//!   never to every post. Without `ids` the page is unchanged.
+//!   never to every post. With `ids` set, listed posts from the bookmarks
+//!   store (`ANCIENTOS_LABELS_BOOKMARKS_PATH`, default the bookmarks-agent
+//!   store path) also render as cards even when no eval query names them.
+//!   Without `ids` the page is unchanged.
 //! - `POST /labels/save` persists the submitted Relevant/Not labels
 //!   through the bookmarks app endpoint
 //!   (`bookmarks_agent::labels::save_labels`).
@@ -134,6 +137,57 @@ fn ids_filter(raw: Option<&str>, demo_path: Option<&std::path::Path>) -> IdsFilt
         parse_id_list(raw)
     };
     IdsFilter::Only(ids.unwrap_or_default())
+}
+
+/// Env var naming the bookmarks JSONL store that `?ids=` cards may come
+/// from; unset means [`bookmarks_agent::ingest::store_path`].
+pub const BOOKMARKS_PATH_ENV: &str = "ANCIENTOS_LABELS_BOOKMARKS_PATH";
+
+/// Resolve the bookmarks store path: [`BOOKMARKS_PATH_ENV`] if set and
+/// non-empty, else the bookmarks-agent default; `None` if neither works.
+fn bookmarks_store_path() -> Option<std::path::PathBuf> {
+    match std::env::var_os(BOOKMARKS_PATH_ENV) {
+        Some(p) if !p.is_empty() => Some(p.into()),
+        _ => bookmarks_agent::ingest::store_path().ok(),
+    }
+}
+
+/// Add bookmarks-store posts named by `filter` that no eval query already
+/// shows (matched by X status id) to `queries.posts`, keyed by status id.
+/// Returns the added keys, sorted. Does nothing for [`IdsFilter::All`],
+/// a missing path, or an unreadable store (fail closed: no extra cards).
+fn add_store_posts(
+    queries: &mut LabelQueries,
+    filter: &IdsFilter,
+    store: Option<&std::path::Path>,
+) -> Vec<String> {
+    let (IdsFilter::Only(ids), Some(path)) = (filter, store) else {
+        return Vec::new();
+    };
+    let Ok(store) = bookmarks_agent::ingest::Store::load_from(path) else {
+        return Vec::new();
+    };
+    let shown: BTreeSet<String> = queries
+        .posts
+        .values()
+        .filter_map(|p| labels::status_id_of_url(&p.url))
+        .collect();
+    let mut added = Vec::new();
+    for (id, b) in &store.by_id {
+        if !ids.contains(id) || shown.contains(id) || queries.posts.contains_key(id) {
+            continue;
+        }
+        queries.posts.insert(
+            id.clone(),
+            labels::QueryPost {
+                author: b.author_username.clone().unwrap_or_default(),
+                text: b.text.clone(),
+                url: b.url.clone(),
+            },
+        );
+        added.push(id.clone());
+    }
+    added
 }
 
 /// 404 page for labels routes when no eval dir is configured.
@@ -384,7 +438,7 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
     if !crate::phone::cookie_matches(state.labels_token.as_deref(), req) {
         return forbidden(state);
     }
-    let queries = match labels::load_queries(dir) {
+    let mut queries = match labels::load_queries(dir) {
         Ok(q) => q,
         Err(e) => return failed("Labels failed", &e, state),
     };
@@ -399,7 +453,8 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
         req.query.get("ids").map(String::as_str),
         demo_ids_path().as_deref(),
     );
-    let keys: Vec<String> = queries
+    let extra = add_store_posts(&mut queries, &filter, bookmarks_store_path().as_deref());
+    let mut keys: Vec<String> = queries
         .ordered_keys()
         .into_iter()
         .filter(|k| {
@@ -410,6 +465,7 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
             filter.allows(sid.as_deref())
         })
         .collect();
+    keys.extend(extra);
     let labeled = keys.iter().filter(|k| stored.contains_key(*k)).count();
     let mut body = format!(
         "<h1>Labels ({} post{}, {} labeled)</h1>\
@@ -1012,6 +1068,41 @@ mod tests {
         assert_eq!(count(&resp.body, "id=\"post-7\""), 1, "{}", resp.body);
         assert_eq!(count(&resp.body, "id=\"post-"), 1, "{}", resp.body);
         assert!(!resp.body.contains(&file.display().to_string()));
+    }
+
+    /// `?ids=` also pulls listed posts from the bookmarks store (keyed by
+    /// status id, no duplicates of query posts); absent/All adds nothing
+    /// and an unreadable store adds nothing.
+    #[test]
+    fn ids_filter_adds_store_posts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("bookmarks.jsonl");
+        std::fs::write(
+            &store,
+            format!(
+                "{{\"post_id\":\"{ID7}\",\"url\":\"https://x.com/a/status/{ID7}\",\"text\":\"dup\"}}\n\
+                 {{\"post_id\":\"8000000000000000001\",\"url\":\"https://x.com/syn_store/status/8000000000000000001\",\"text\":\"synthetic store post\",\"author_username\":\"syn_store\"}}\n\
+                 {{\"post_id\":\"8000000000000000002\",\"url\":\"https://x.com/b/status/8000000000000000002\",\"text\":\"unlisted\"}}\n"
+            ),
+        )
+        .unwrap();
+        let eval = eval_fixture();
+        let base = labels::load_queries(eval.path()).unwrap();
+        let only = IdsFilter::Only([ID7.to_string(), "8000000000000000001".to_string()].into());
+        let mut q = base.clone();
+        assert_eq!(
+            add_store_posts(&mut q, &only, Some(&store)),
+            vec!["8000000000000000001".to_string()]
+        );
+        assert_eq!(q.posts["8000000000000000001"].author, "syn_store");
+        assert_eq!(q.posts.len(), base.posts.len() + 1);
+        let mut q = base.clone();
+        assert!(add_store_posts(&mut q, &IdsFilter::All, Some(&store)).is_empty());
+        assert!(add_store_posts(&mut q, &only, Some(&dir.path().join("nope"))).is_empty());
+        assert!(add_store_posts(&mut q, &only, None).is_empty());
+        std::fs::write(&store, "not json\n").unwrap();
+        assert!(add_store_posts(&mut q, &only, Some(&store)).is_empty());
+        assert_eq!(q.posts.len(), base.posts.len());
     }
 
     /// Saved labels show as checked radios and counts.
