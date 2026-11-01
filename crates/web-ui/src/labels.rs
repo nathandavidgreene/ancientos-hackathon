@@ -368,7 +368,7 @@ fn card_html(
 
 /// `GET /labels`: log in via `?k=` (303 + scoped cookie, like `/m`), else
 /// list every query post once with tags, thumbs, findings, and labels.
-/// An `?ids=` param narrows the cards (see [`ids_filter`]).
+/// An `?ids=` param narrows the cards (see `ids_filter`).
 pub fn page_labels(req: &Request, state: &State) -> Response {
     let Some(dir) = state.labels_dir.as_deref() else {
         return labels_off(state);
