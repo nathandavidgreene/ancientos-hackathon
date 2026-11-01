@@ -1,7 +1,12 @@
 # analyze_media (bookmark images and video posters)
 
-Module: `bookmarks-agent::analyze_media`. Status: built and tested with a mock
-backend only; no live model is wired and it has never made a paid call.
+Module: `bookmarks-agent::analyze_media`. Status: wired to live model
+backends (the `muse exec` CLI by default, plus HTTP and Baseten routes) and
+used for live runs. Every live run is paid-gated and fails closed: it needs
+`ANCIENTOS_ALLOW_PAID=1`, a per-run item cap, and the backend's own required
+config, and the paid switch is rechecked before each call. The default runner
+mode is a dry run with no model call. Unit tests use mock backends and
+synthetic replies only and never make a paid call.
 
 **Input** matches the planned `x_bookmark_media` table: `post_id`, `media_key`,
 `type`, `url` (photo), `preview_image_url` (video/GIF poster), `variants[]`,
@@ -48,7 +53,7 @@ when either is missing. It sends one chat call per item with the image URL
 attached. The reply must be JSON only, `{"findings":[{kind,text,quote?,region?}]}`,
 with no unknown fields. More than 20 findings keeps the first 20 in the model's
 order. Anything else skips the item with a logged reason. Evidence is then enforced by the same quote-or-region check.
-Tested only with synthetic replies.
+Unit tests use synthetic replies only.
 
 ## muse exec backend (default)
 
@@ -72,8 +77,7 @@ logged), `ANCIENTOS_MEDIA_MODEL`, an https `ANCIENTOS_MEDIA_API_BASE`
 (`https://inference.baseten.co/v1`) and `ANCIENTOS_MEDIA_MAX_TOKENS`; any
 missing value fails closed. It sends `reasoning_effort: low`, reads
 `message.content` (not the reasoning), and treats a reply cut off at the token
-limit as an error. In a live one-image test it returned the same letter
-findings as Muse with about 1.6K input tokens (Muse: about 29K) in about 5s.
+limit as an error.
 
 ## Thumbnails
 
