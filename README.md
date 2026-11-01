@@ -41,8 +41,71 @@ agent (read-only OAuth2 PKCE, incremental ingest that never infers removals).
 ```sh
 cp .env.example .env   # fill in locally; never commit
 scripts/ci_local.sh    # boundary, docs, strict Pyright, fmt, clippy, tests
-cargo run -p bookmarks-agent -- load fixtures/sample_bookmarks.jsonl
+cargo run -p bookmarks-agent --bin bookmarks-agent -- load fixtures/sample_bookmarks.jsonl
 ```
+
+## Judge quick-start (about 2 minutes, no keys)
+
+Everything below runs offline on synthetic fixtures. No `META_API_KEY`, X tokens,
+or other credentials are needed. Leave `ANCIENTOS_ALLOW_PAID` unset: paid model
+calls are off by default and fail closed before any network request.
+
+Needs: a stable Rust toolchain (`rustup default stable`), bash, a browser.
+
+```sh
+git clone https://github.com/nathandavidgreene/ancientos-hackathon
+cd ancientos-hackathon
+unset ANCIENTOS_ALLOW_PAID
+```
+
+### 1. Offline demo (all 14 storyboard shots, ~10 s after first build)
+```sh
+scripts/demo.sh            # or: scripts/demo.sh --shot 6   (privacy routing)
+```
+Mock and local clients only, temp data dir, no network, no real data.
+
+### 2. Web UI on demo data
+```sh
+cargo run -p web-ui -- --demo     # add --port 8799 if 8787 is taken
+```
+Open http://127.0.0.1:8787/ (loopback only, server-rendered, works without JS).
+The brief (`/`) and ideas (`/ideas`) pages work. `/m` (phone approvals) and
+`/labels` report "off" without their tokens and private label queries; that is
+expected. `/log` needs a scoped login.
+
+### 3. Tests
+```sh
+cargo test --workspace --quiet    # 1020 tests on main c637d51
+```
+Run from the repo root: `scripts/demo.sh` and its tests use `./target`, so do
+not set `CARGO_TARGET_DIR`.
+
+Sign-in security tests only:
+```sh
+cargo test -p web-ui --lib -- --test-threads=1 \
+  valid_k_redirects_and_sets_exact_cookie invalid_k_is_forbidden_without_cookie \
+  rendered_html_never_holds_token_or_k origin_and_host_must_match_an_explicit_allowed_origin \
+  all_non_get_routes_require_authentication_and_session_csrf \
+  socket_login_limiter_separates_forwarded_clients login_failures_are_throttled_per_peer_and_expire
+```
+
+### 4. Load the sample bookmarks
+```sh
+ANCIENTOS_HOME=$(mktemp -d) cargo run -p bookmarks-agent --bin bookmarks-agent -- \
+  load fixtures/sample_bookmarks.jsonl      # prints: loaded 5 bookmarks
+```
+
+### Expected noise
+`WARNING: ANCIENTOS_LOG_KEY_PATH is unset; decision log is UNSIGNED` appears
+throughout. Keyless runs use an unsigned decision log; set that path to a key
+file to sign it.
+
+### What does not run without keys
+- Live X bookmark sync (needs X OAuth client and tokens).
+- Hosted Muse / Muse Code calls and `analyze-media` on real images (need
+  `META_API_KEY` and `ANCIENTOS_ALLOW_PAID=1`).
+- Phone approvals `/m` and `/labels` (need `ANCIENTOS_PHONE_TOKEN` and private
+  label queries; the real deploy is on Nathan's own server).
 
 ## Post liveness
 Before a post surfaces in the brief or web-ui, `bookmarks-agent` confirms it
