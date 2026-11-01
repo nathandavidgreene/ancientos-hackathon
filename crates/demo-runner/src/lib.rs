@@ -867,8 +867,15 @@ impl Workspace {
                 None,
             ))
         };
-        let tick =
-            daemon::deeper_queue_tick_with(&ctx, now, true, &fetch_thread, &fetch_post, &call)?;
+        let tick = daemon::deeper_queue_tick_with(
+            &ctx,
+            now,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut daemon::deeper_loop_guard(now),
+        )?;
         if tick.proposed.is_empty() && tick.waiting.is_empty() {
             return Err(format!("approvals demo: expected a proposal, got {tick:?}"));
         }
@@ -931,8 +938,15 @@ impl Workspace {
                 None,
             ))
         };
-        let tick =
-            daemon::deeper_queue_tick_with(&ctx, now, true, &fetch_thread, &fetch_post, &call)?;
+        let tick = daemon::deeper_queue_tick_with(
+            &ctx,
+            now,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut daemon::deeper_loop_guard(now),
+        )?;
         if tick.executed_paid.len() != 1 || tick.executed_paid[0] != post_id {
             return Err(format!(
                 "approvals demo: expected exactly one paid execution, got {tick:?}"

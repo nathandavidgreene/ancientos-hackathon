@@ -450,14 +450,17 @@ pub fn deeper_queue_tick_with(
     fetch_thread: &crate::delegate::ThreadFetcher<'_>,
     fetch_post: &crate::deeper::PostFetcher<'_>,
     call: &crate::deeper::DeeperMuseCaller<'_>,
+    guard: &mut LoopGuard,
 ) -> Result<DeeperQueueTick, String> {
+    if paid && guard.tripped().is_some() {
+        resume_guard_if_approved(ctx, guard, now)?;
+    }
     let log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
         .map_err(|e| e.to_string())?;
     let entries = log.verify_or_empty().map_err(|e| e.to_string())?;
     let jobs = crate::deeper::due_jobs(&entries, now);
     let mut out = DeeperQueueTick::default();
     let mut errors: Vec<String> = Vec::new();
-    let mut guard = LoopGuard::new(DEEPER_LOOP_NAME, Budgets::default(), now);
     for job in jobs {
         let payload = deeper_paid_payload(&job.post_id, job.at);
         if !paid {
@@ -502,7 +505,7 @@ pub fn deeper_queue_tick_with(
                     &mut log,
                     &crate::app_gate(),
                     DAEMON_AGENT_NAME,
-                    &guard,
+                    guard,
                     now,
                 )
                 .map_err(|e| e.to_string())?;
@@ -773,7 +776,12 @@ fn execute_paid(
 /// Production deeper-queue tick: real thread/post fetchers and a real Muse
 /// caller. Paid execution still requires `ANCIENTOS_ALLOW_PAID=1` (checked
 /// again inside the deeper paid path).
-pub fn deeper_queue_tick(ctx: &AgentCtx, now: u64, paid: bool) -> Result<DeeperQueueTick, String> {
+pub fn deeper_queue_tick(
+    ctx: &AgentCtx,
+    now: u64,
+    paid: bool,
+    guard: &mut LoopGuard,
+) -> Result<DeeperQueueTick, String> {
     let client = ancientos_router::muse::MuseClient::from_env()
         .with_max_completion_tokens(crate::deeper::DEEPER_MAX_COMPLETION_TOKENS)
         .with_reasoning_effort(crate::deeper::DEEPER_REASONING_EFFORT);
@@ -785,7 +793,43 @@ pub fn deeper_queue_tick(ctx: &AgentCtx, now: u64, paid: bool) -> Result<DeeperQ
         &crate::x_api::fetch_thread,
         &crate::x_api::fetch_post,
         &call,
+        guard,
     )
+}
+
+/// A new deeper-queue [`LoopGuard`] (default budgets) started at `now`.
+/// The daemon keeps one for its whole life; one-shot callers make one per
+/// run.
+pub fn deeper_loop_guard(now: u64) -> LoopGuard {
+    LoopGuard::new(DEEPER_LOOP_NAME, Budgets::default(), now)
+}
+
+/// The one executor for [`loop_guard::RESUME_ACTION`]: when the daemon's
+/// persistent deeper-queue guard is tripped, find a human-approved resume
+/// request for this loop, claim its release token and hand it to
+/// [`LoopGuard::resume_if_approved`] (which releases it exactly once and
+/// resets the counters). Pending, denied, expired or released requests do
+/// nothing, so the guard stays tripped. Returns whether it resumed.
+pub fn resume_guard_if_approved(
+    ctx: &AgentCtx,
+    guard: &mut LoopGuard,
+    now: u64,
+) -> Result<bool, String> {
+    let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
+        .map_err(|e| e.to_string())?;
+    let decided = approvals::decided(&log, now).map_err(|e| e.to_string())?;
+    let Some(a) = decided.into_iter().find(|a| {
+        a.request.action == loop_guard::RESUME_ACTION
+            && a.request.payload.get("loop").and_then(|v| v.as_str()) == Some(guard.name())
+            && a.status_at(now) == approvals::Status::Approved
+    }) else {
+        return Ok(false);
+    };
+    let token = approvals::claim_release_token(&log, &a.request.id, &a.request.payload_hash)
+        .map_err(|e| e.to_string())?;
+    guard
+        .resume_if_approved(&mut log, token, now)
+        .map_err(|e| e.to_string())
 }
 
 /// Daily brief agent: local path only (see [`brief_tick`]).
@@ -897,16 +941,24 @@ impl Agent for TryFollowupAgent {
     }
 }
 
-/// Queued go-deeper agent (see [`deeper_queue_tick`]).
+/// Queued go-deeper agent (see [`deeper_queue_tick`]). It owns one
+/// [`LoopGuard`] for the daemon's whole life (created on the first tick),
+/// so budgets accumulate across ticks instead of resetting every tick; a
+/// trip holds until a human approves a resume.
 pub struct DeeperQueueAgent {
     ctx: AgentCtx,
     interval: Duration,
+    guard: Option<LoopGuard>,
 }
 
 impl DeeperQueueAgent {
     /// Create the wiki lint agent with its tick interval.
     pub fn new(ctx: AgentCtx, interval: Duration) -> Self {
-        Self { ctx, interval }
+        Self {
+            ctx,
+            interval,
+            guard: None,
+        }
     }
 }
 
@@ -924,7 +976,10 @@ impl Agent for DeeperQueueAgent {
     /// Run one tick: lint the wiki and propose fixes through approvals.
     fn tick(&mut self) -> Result<(), String> {
         let now = self.ctx.now_secs();
-        let summary = deeper_queue_tick(&self.ctx, now, allow_paid())?;
+        let guard = self
+            .guard
+            .get_or_insert_with(|| LoopGuard::new(DEEPER_LOOP_NAME, Budgets::default(), now));
+        let summary = deeper_queue_tick(&self.ctx, now, allow_paid(), guard)?;
         println!(
             "deeper_queue: local={} proposed={} paid={} waiting={} denied={} released_not_done={}",
             summary.ran_local.len(),
@@ -1084,6 +1139,12 @@ pub fn run_once(config: &DaemonConfig) -> RunReport {
     run_due_once(&mut sched, config)
 }
 
+/// Sleep between daemon ticks: `secs`, clamped to at least
+/// [`ancientos_core::scheduler::MIN_INTERVAL`] so `0` cannot busy-spin.
+pub fn tick_sleep(secs: u64) -> Duration {
+    ancientos_core::scheduler::clamp_interval(Duration::from_secs(secs))
+}
+
 /// Tick in a loop until `stop` is set or `max_ticks` is reached, sleeping
 /// `tick_sleep_secs` between ticks. Ctrl-C stops the process via the
 /// default disposition (no signal handler without new crates); tests bound
@@ -1101,7 +1162,7 @@ pub fn run_loop(config: &DaemonConfig, stop: &AtomicBool) -> Vec<RunReport> {
         if config.max_ticks.is_some_and(|m| tick_no >= m) {
             break;
         }
-        std::thread::sleep(Duration::from_secs(config.tick_sleep_secs));
+        std::thread::sleep(tick_sleep(config.tick_sleep_secs));
     }
     reports
 }
@@ -1356,6 +1417,68 @@ mod tests {
         crate::deeper::queue_later(&mut log, post_id, at, now).unwrap();
     }
 
+    /// Test helper: a fresh deeper-queue guard with default budgets.
+    fn fresh_guard(now: u64) -> LoopGuard {
+        LoopGuard::new(DEEPER_LOOP_NAME, Budgets::default(), now)
+    }
+
+    #[test]
+    fn one_guard_across_ticks_trips_then_resumes_only_after_approval() {
+        let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir, false);
+        queue_job(&ctx, "100", NOW, NOW);
+        let (ft, fp, call) = panicking_fetchers();
+        // Fresh guards (the old per-tick behaviour) never accumulate.
+        for _ in 0..5 {
+            let t = deeper_queue_tick_with(&ctx, NOW, true, &ft, &fp, &call, &mut fresh_guard(NOW))
+                .unwrap();
+            assert!(t.guard_resume.is_none());
+        }
+        // One guard kept across ticks: the repeat budget (3) holds.
+        let mut guard = fresh_guard(NOW);
+        for _ in 0..3 {
+            let t = deeper_queue_tick_with(&ctx, NOW, true, &ft, &fp, &call, &mut guard).unwrap();
+            assert!(t.guard_resume.is_none());
+        }
+        let t = deeper_queue_tick_with(&ctx, NOW, true, &ft, &fp, &call, &mut guard).unwrap();
+        let resume_id = t.guard_resume.expect("trip proposes a resume");
+        assert!(guard.tripped().is_some());
+        // Still pending: the next tick stays tripped.
+        deeper_queue_tick_with(&ctx, NOW, true, &ft, &fp, &call, &mut guard).unwrap();
+        assert!(guard.tripped().is_some());
+        // A human approves; the next tick resumes exactly once.
+        let mut log = DecisionLog::open(&ctx.log_path).unwrap();
+        let a = approvals::get(&log, &resume_id).unwrap();
+        approvals::approve(&mut log, &resume_id, &a.request.payload_hash, "human", NOW).unwrap();
+        drop(log);
+        let t = deeper_queue_tick_with(&ctx, NOW, true, &ft, &fp, &call, &mut guard).unwrap();
+        assert!(
+            guard.tripped().is_none(),
+            "approved resume resets the guard"
+        );
+        assert!(t.guard_resume.is_none());
+        let log = DecisionLog::open(&ctx.log_path).unwrap();
+        assert!(
+            approvals::claim_release_token(&log, &resume_id, &a.request.payload_hash).is_err(),
+            "resume approval is released once"
+        );
+    }
+
+    #[test]
+    fn resume_executor_ignores_pending_and_other_loops() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(&dir, false);
+        let mut guard = fresh_guard(NOW);
+        assert!(!resume_guard_if_approved(&ctx, &mut guard, NOW).unwrap());
+    }
+
+    #[test]
+    fn tick_sleep_is_clamped_to_one_second() {
+        assert_eq!(tick_sleep(0), Duration::from_secs(1));
+        assert_eq!(tick_sleep(30), Duration::from_secs(30));
+    }
+
     #[test]
     fn deeper_paid_propose_makes_no_fetch_or_model_call() {
         let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
@@ -1363,7 +1486,8 @@ mod tests {
         let ctx = test_ctx(&dir, false);
         queue_job(&ctx, "100", NOW, NOW);
         let (ft, fp, call) = panicking_fetchers();
-        let tick = deeper_queue_tick_with(&ctx, NOW, true, &ft, &fp, &call).unwrap();
+        let tick = deeper_queue_tick_with(&ctx, NOW, true, &ft, &fp, &call, &mut fresh_guard(NOW))
+            .unwrap();
         assert_eq!(tick.proposed, vec!["100".to_string()]);
         assert!(tick.executed_paid.is_empty());
         let entries = entries_of(&ctx.log_path);
@@ -1415,8 +1539,16 @@ mod tests {
             ))
         };
         // Tick 1 proposes; the mock is never called.
-        let t1 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t1 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t1.proposed, vec!["100".to_string()]);
         assert_eq!(calls.get(), 0);
         // A human approves (CLI-style: the token is dropped).
@@ -1433,8 +1565,16 @@ mod tests {
         .unwrap();
         drop(log);
         // Tick 2 claims, releases exactly once, and executes via the mock.
-        let t2 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t2 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t2.executed_paid, vec!["100".to_string()]);
         assert_eq!(calls.get(), 1);
         let entries = entries_of(&ctx.log_path);
@@ -1450,8 +1590,16 @@ mod tests {
         }));
         assert!(ctx.deeper_dir.join("100.md").exists());
         // Tick 3 is a no-op: done jobs never run again.
-        let t3 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t3 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t3, DeeperQueueTick::default());
         assert_eq!(calls.get(), 1);
         assert_eq!(
@@ -1532,12 +1680,28 @@ mod tests {
                 None,
             ))
         };
-        let t1 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t1 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t1.proposed, vec!["100".to_string()]);
         let (id, hash) = approve_only_for(&ctx, NOW);
-        let t2 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t2 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t2.executed_paid, vec!["100".to_string()]);
         assert!(t2.released_not_done.is_empty());
         let entries = entries_of(&ctx.log_path);
@@ -1578,8 +1742,16 @@ mod tests {
             ))
         };
         // Tick 1 proposes.
-        let t1 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t1 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t1.proposed, vec!["100".to_string()]);
         // A human approves; the executor releases, then the process dies
         // before marking done (simulated by releasing directly).
@@ -1597,8 +1769,16 @@ mod tests {
         // Tick 2 (a second later, so the fresh request gets a new id) must
         // not execute the released request: it proposes a fresh approval
         // and the mock is never called.
-        let t2 =
-            deeper_queue_tick_with(&ctx, NOW + 1, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t2 = deeper_queue_tick_with(
+            &ctx,
+            NOW + 1,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW + 1),
+        )
+        .unwrap();
         assert!(t2.executed_paid.is_empty());
         assert_eq!(t2.proposed, vec!["100".to_string()]);
         assert_eq!(calls.get(), 0);
@@ -1625,8 +1805,16 @@ mod tests {
         let fresh_hash = pending[0].request.payload_hash.clone();
         approvals::approve(&mut log, &fresh_id, &fresh_hash, "human", NOW + 1).unwrap();
         drop(log);
-        let t3 =
-            deeper_queue_tick_with(&ctx, NOW + 1, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t3 = deeper_queue_tick_with(
+            &ctx,
+            NOW + 1,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW + 1),
+        )
+        .unwrap();
         assert_eq!(t3.executed_paid, vec!["100".to_string()]);
         assert_eq!(calls.get(), 1);
         assert!(ctx.deeper_dir.join("100.md").exists());
@@ -1652,8 +1840,16 @@ mod tests {
                 None,
             ))
         };
-        let t1 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t1 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t1.proposed, vec!["100".to_string()]);
         assert_eq!(calls.get(), 0);
         let (id, hash) = approve_and_release_for(&ctx, "100", NOW, NOW);
@@ -1667,8 +1863,16 @@ mod tests {
         .unwrap();
         drop(log);
         for _ in 0..2 {
-            let tick =
-                deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+            let tick = deeper_queue_tick_with(
+                &ctx,
+                NOW,
+                true,
+                &fetch_thread,
+                &fetch_post,
+                &call,
+                &mut fresh_guard(NOW),
+            )
+            .unwrap();
             assert_eq!(
                 tick.released_not_done,
                 vec![ReleasedNotDone {
@@ -1704,8 +1908,16 @@ mod tests {
                 None,
             ))
         };
-        let t1 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t1 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t1.proposed, vec!["100".to_string()]);
         let (id, hash) = approve_and_release_for(&ctx, "100", NOW, NOW);
         // Simulate a crash after the side effect completed but before the
@@ -1720,8 +1932,16 @@ mod tests {
         log.append(JOB_DONE_KIND, job_done_payload(&id, &hash, "100", NOW, NOW))
             .unwrap();
         drop(log);
-        let tick =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let tick = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(tick.executed_paid, vec!["100".to_string()]);
         assert!(tick.released_not_done.is_empty());
         assert_eq!(calls.get(), 0, "side effect already ran: no second run");
@@ -1729,8 +1949,16 @@ mod tests {
             e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND && e.payload["mode"] == "paid"
         }));
         // The healed job leaves the queue: the next tick is a no-op.
-        let again =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let again = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(again, DeeperQueueTick::default());
         assert_eq!(calls.get(), 0);
     }
@@ -1754,8 +1982,16 @@ mod tests {
                 None,
             ))
         };
-        let t1 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t1 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(t1.proposed.len(), 2);
         // Deny the first job's proposal.
         let mut log = DecisionLog::open(&ctx.log_path).unwrap();
@@ -1764,8 +2000,16 @@ mod tests {
         let id = pending[0].request.id.clone();
         approvals::deny(&mut log, &id, &hash, "human", "no", NOW).unwrap();
         drop(log);
-        let t2 =
-            deeper_queue_tick_with(&ctx, NOW, true, &fetch_thread, &fetch_post, &call).unwrap();
+        let t2 = deeper_queue_tick_with(
+            &ctx,
+            NOW,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call,
+            &mut fresh_guard(NOW),
+        )
+        .unwrap();
         assert_eq!(calls.get(), 0, "denied job never executes");
         assert!(
             t2.skipped_denied.contains(&"100".to_string())
@@ -1805,8 +2049,16 @@ mod tests {
                 None,
             ))
         };
-        let t3 = deeper_queue_tick_with(&ctx2, NOW + 100, true, &fetch_thread, &fetch_post, &call2)
-            .unwrap();
+        let t3 = deeper_queue_tick_with(
+            &ctx2,
+            NOW + 100,
+            true,
+            &fetch_thread,
+            &fetch_post,
+            &call2,
+            &mut fresh_guard(NOW + 100),
+        )
+        .unwrap();
         assert_eq!(calls2.get(), 0, "expired proposal never executes");
         assert!(t3.executed_paid.is_empty());
         assert!(!entries_of(&ctx2.log_path)
@@ -1847,14 +2099,24 @@ mod tests {
         queue_job(&ctx, "100", NOW, NOW - 10);
         let (ft, fp, call) = panicking_fetchers();
         // Before its time: not due, nothing runs (fetchers would panic).
-        let early = deeper_queue_tick_with(&ctx, NOW - 1, false, &ft, &fp, &call).unwrap();
+        let early = deeper_queue_tick_with(
+            &ctx,
+            NOW - 1,
+            false,
+            &ft,
+            &fp,
+            &call,
+            &mut fresh_guard(NOW - 1),
+        )
+        .unwrap();
         assert_eq!(early, DeeperQueueTick::default());
         assert!(!entries_of(&ctx.log_path)
             .iter()
             .any(|e| e.kind == crate::deeper::DEEPER_QUEUE_DONE_KIND));
         // At its time: the free local fallback runs directly from the
         // fixture (still no fetch or model call).
-        let due = deeper_queue_tick_with(&ctx, NOW, false, &ft, &fp, &call).unwrap();
+        let due = deeper_queue_tick_with(&ctx, NOW, false, &ft, &fp, &call, &mut fresh_guard(NOW))
+            .unwrap();
         assert_eq!(due.ran_local, vec!["100".to_string()]);
         assert!(ctx.deeper_dir.join("100.md").exists());
         let entries = entries_of(&ctx.log_path);
