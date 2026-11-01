@@ -868,13 +868,29 @@ pub fn remove_one(
         .ok_or_else(|| format!("unknown post {post_key:?}"))?;
     let id = status_id_of_url(&post.url)
         .ok_or_else(|| format!("post {post_key:?} has no numeric X id"))?;
-    if !id.bytes().all(|b| b.is_ascii_digit()) {
+    remove_one_id(dir, post_key, &id, explicit_bin, path_env, now, request_id)
+}
+
+/// Remove exactly one post whose X status id the caller already resolved
+/// and authorized (for example a demo-allowlisted bookmark that is not in
+/// the eval queries). Same checks, CLI, audit log, and request-UUID replay
+/// as [`remove_one`], which delegates here after resolving `post_key`.
+pub fn remove_one_id(
+    dir: &Path,
+    post_key: &str,
+    id: &str,
+    explicit_bin: Option<&Path>,
+    path_env: Option<&str>,
+    now: u64,
+    request_id: &str,
+) -> Result<RemoveOutcome, String> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         return Err("post id must contain digits only".to_string());
     }
     if !is_uuid(request_id) {
         return Err("invalid request id".to_string());
     }
-    if let Some(prior) = prior_request(dir, request_id, post_key, &id) {
+    if let Some(prior) = prior_request(dir, request_id, post_key, id) {
         return prior;
     }
     if explicit_bin.is_some_and(|path| path.as_os_str().is_empty()) {
@@ -884,20 +900,20 @@ pub fn remove_one(
     if !bin.is_file() || !is_executable(&bin) {
         return Err("remover is not executable".to_string());
     }
-    let run = run_remove_cli(&bin, &id, request_id);
+    let run = run_remove_cli(&bin, id, request_id);
     if !run.ran {
-        let _ = log_attempt(dir, &id, post_key, request_id, "failed", None, now);
+        let _ = log_attempt(dir, id, post_key, request_id, "failed", None, now);
         return Err(format!("{REMOVE_BIN_NAME} failed"));
     }
     match run.code {
         Some(0) => {
-            log_attempt(dir, &id, post_key, request_id, "removed", Some(0), now)?;
+            log_attempt(dir, id, post_key, request_id, "removed", Some(0), now)?;
             Ok(RemoveOutcome::Removed)
         }
         Some(2) => {
             log_attempt(
                 dir,
-                &id,
+                id,
                 post_key,
                 request_id,
                 "refused_or_not_found",
@@ -907,11 +923,11 @@ pub fn remove_one(
             Err("refused or not found on X".to_string())
         }
         Some(code) => {
-            log_attempt(dir, &id, post_key, request_id, "failed", Some(code), now)?;
+            log_attempt(dir, id, post_key, request_id, "failed", Some(code), now)?;
             Err(format!("removal failed (exit code {code})"))
         }
         None => {
-            let _ = log_attempt(dir, &id, post_key, request_id, "failed", None, now);
+            let _ = log_attempt(dir, id, post_key, request_id, "failed", None, now);
             Err(format!("{REMOVE_BIN_NAME} died by signal"))
         }
     }

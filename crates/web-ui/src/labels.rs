@@ -22,7 +22,10 @@
 //!   (`bookmarks_agent::labels::save_labels`).
 //! - `POST /labels/delete` removes one post via Social's single-post CLI
 //!   (`remove_bookmark --post-id <id>`, one post per click, never
-//!   batched). There is no phone approval: the click itself is the human
+//!   batched). Besides eval-query posts it accepts a post id that is both
+//!   in the `?ids=demo` allowlist and in the bookmarks store; anything else,
+//!   or a missing/unreadable allowlist or store, is refused. There is no
+//!   phone approval: the click itself is the human
 //!   authorization, and every attempt is logged. Failures keep the
 //!   bookmark and its label and show the error.
 //! - `GET /labels/thumb/<file>` serves thumbnail bytes, but only for
@@ -188,6 +191,34 @@ fn add_store_posts(
         added.push(id.clone());
     }
     added
+}
+
+/// True only if `id` is a well-formed status id listed in the demo
+/// allowlist at `allowlist` AND present in the bookmarks store at `store`
+/// with a URL whose status id is `id`. Any missing path, unreadable or
+/// malformed file, or mismatch returns false (Delete refuses).
+fn demo_delete_allowed(
+    id: &str,
+    allowlist: Option<&std::path::Path>,
+    store: Option<&std::path::Path>,
+) -> bool {
+    if !valid_post_id(id) {
+        return false;
+    }
+    let Some(ids) = allowlist.and_then(load_id_file) else {
+        return false;
+    };
+    if !ids.contains(id) {
+        return false;
+    }
+    let Some(Ok(store)) = store.map(bookmarks_agent::ingest::Store::load_from) else {
+        return false;
+    };
+    store
+        .by_id
+        .get(id)
+        .and_then(|b| labels::status_id_of_url(&b.url))
+        .is_some_and(|sid| sid == id)
 }
 
 /// 404 page for labels routes when no eval dir is configured.
@@ -578,13 +609,34 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
         Ok(q) => q,
         Err(e) => return failed("Delete failed", &e, state),
     };
-    if !queries.posts.contains_key(key) {
-        return Response::status(
-            400,
-            crate::error_page("Bad request", "Unknown post.", state),
-        );
-    }
     let request_id = form.get("request_id").map(String::as_str).unwrap_or("");
+    if !queries.posts.contains_key(key) {
+        if !demo_delete_allowed(
+            key,
+            demo_ids_path().as_deref(),
+            bookmarks_store_path().as_deref(),
+        ) {
+            return Response::status(
+                400,
+                crate::error_page("Bad request", "Unknown post.", state),
+            );
+        }
+        // Demo-allowlisted store post: same remover, log, and replay as
+        // eval posts. It has no eval label row, so no label is saved.
+        let path_env = std::env::var("PATH").ok();
+        return match labels::remove_one_id(
+            dir,
+            key,
+            key,
+            state.labels_remove_bin.as_deref(),
+            path_env.as_deref(),
+            now_secs(),
+            request_id,
+        ) {
+            Ok(_) => Response::redirect("/labels?ids=demo".to_string()),
+            Err(e) => failed("Delete failed", &format!("{e} Bookmark kept."), state),
+        };
+    }
     let post_id = labels::status_id_of_url(&queries.posts[key].url).unwrap_or_default();
     if post_id.is_empty() || !post_id.bytes().all(|b| b.is_ascii_digit()) {
         return Response::status(
@@ -677,6 +729,9 @@ pub fn serve_thumb(req: &Request, state: &State, name: &str) -> Response {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// Serializes tests that set process env vars (allowlist/store paths).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Synthetic phone token shared by the labels fixtures.
     const TOKEN: &str = "synthetic-labels-token-0002";
@@ -1059,6 +1114,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("demo.txt");
         std::fs::write(&file, format!("{ID7}\n")).unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(DEMO_IDS_ENV, &file);
         let data = tempfile::tempdir().unwrap();
         let eval = eval_fixture();
@@ -1276,6 +1332,129 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["outcome"], "removed");
         assert_eq!(rows[0]["post_id"], ID7);
+    }
+
+    /// Demo delete gate: allowlisted + in store is accepted; unknown id,
+    /// missing allowlist, missing store, or malformed key is refused.
+    #[test]
+    fn demo_delete_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let allow = dir.path().join("allow.txt");
+        let store = dir.path().join("bookmarks.jsonl");
+        std::fs::write(&allow, "8000000000000000001\n8000000000000000009\n").unwrap();
+        std::fs::write(
+            &store,
+            "{\"post_id\":\"8000000000000000001\",\"url\":\"https://x.com/s/status/8000000000000000001\",\"text\":\"t\"}\n\
+             {\"post_id\":\"8000000000000000002\",\"url\":\"https://x.com/s/status/8000000000000000002\",\"text\":\"t\"}\n",
+        )
+        .unwrap();
+        let ok = |id: &str| demo_delete_allowed(id, Some(&allow), Some(&store));
+        assert!(ok("8000000000000000001"));
+        assert!(!ok("8000000000000000002"), "in store, not allowlisted");
+        assert!(!ok("8000000000000000009"), "allowlisted, not in store");
+        assert!(!ok("7"));
+        assert!(!ok("8000000000000000001x"));
+        let missing = dir.path().join("missing");
+        assert!(!demo_delete_allowed(
+            "8000000000000000001",
+            Some(&missing),
+            Some(&store)
+        ));
+        assert!(!demo_delete_allowed(
+            "8000000000000000001",
+            None,
+            Some(&store)
+        ));
+        assert!(!demo_delete_allowed(
+            "8000000000000000001",
+            Some(&allow),
+            Some(&missing)
+        ));
+        assert!(!demo_delete_allowed(
+            "8000000000000000001",
+            Some(&allow),
+            None
+        ));
+    }
+
+    /// End to end: an allowlisted store post reaches the stubbed remover
+    /// once, is audit-logged, replays idempotently, and saves no eval
+    /// label; an unknown id is refused without calling the remover. Only
+    /// this test sets the allowlist/store env vars for Delete.
+    #[test]
+    #[cfg(unix)]
+    fn delete_accepts_demo_allowlisted_store_post() {
+        const SID: &str = "8000000000000000001";
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let mut s = labels_state(data.path(), eval.path());
+        let calls = data.path().join("calls.txt");
+        s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
+        let allow = data.path().join("allow.txt");
+        let store = data.path().join("bookmarks.jsonl");
+        std::fs::write(&allow, format!("{SID}\n")).unwrap();
+        std::fs::write(
+            &store,
+            format!("{{\"post_id\":\"{SID}\",\"url\":\"https://x.com/s/status/{SID}\",\"text\":\"t\"}}\n"),
+        )
+        .unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(DEMO_IDS_ENV, &allow);
+        std::env::set_var(BOOKMARKS_PATH_ENV, &store);
+        let post = |body: &str| {
+            crate::handle_routes(
+                &Request::post("/labels/delete", body).with_cookie(COOKIE),
+                &s,
+            )
+        };
+        let rid = "00000000-0000-4000-8000-0000000000d1";
+        let first = post(&format!("post={SID}&request_id={rid}"));
+        let replay = post(&format!("post={SID}&request_id={rid}"));
+        let unknown =
+            post("post=8000000000000000002&request_id=00000000-0000-4000-8000-0000000000d2");
+        std::env::remove_var(DEMO_IDS_ENV);
+        std::env::remove_var(BOOKMARKS_PATH_ENV);
+        assert_eq!(first.status, 303, "{}", first.body);
+        assert_eq!(first.location.as_deref(), Some("/labels?ids=demo"));
+        assert_eq!(replay.status, 303, "{}", replay.body);
+        assert_eq!(unknown.status, 400);
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap(),
+            format!("--post-id {SID} --request-id {rid}\n"),
+            "remover called exactly once, never for the unknown id"
+        );
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(eval.path().join(labels::REMOVALS_FILE))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["outcome"], "removed");
+        assert_eq!(rows[0]["post_id"], SID);
+        assert!(!labels::load_labels(eval.path()).unwrap().contains_key(SID));
+    }
+
+    /// With no demo allowlist configured, a non-eval id is refused and the
+    /// remover is never called (eval posts keep working as before).
+    #[test]
+    #[cfg(unix)]
+    fn delete_refuses_non_eval_id_without_allowlist() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let mut s = labels_state(data.path(), eval.path());
+        let calls = data.path().join("calls.txt");
+        s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
+        let resp = crate::handle_routes(
+            &Request::post(
+                "/labels/delete",
+                "post=8000000000000000077&request_id=00000000-0000-4000-8000-0000000000d3",
+            )
+            .with_cookie(COOKIE),
+            &s,
+        );
+        assert_eq!(resp.status, 400);
+        assert!(!calls.exists());
     }
 
     /// A failing CLI keeps the bookmark and label and shows the error.
