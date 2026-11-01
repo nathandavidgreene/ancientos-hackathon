@@ -113,13 +113,14 @@ fn ingest_show_query_lint_round_trip() {
         Setup::stdout(&out)
     );
     assert!(s.log_text().contains("wiki.fileback"), "{}", s.log_text());
-    // Lint proposes approvals and never edits pages.
+    // Lint reports only: no approvals, and it never edits pages.
     let before = std::fs::read(s.home.join("wiki/pages/post-p1.md")).unwrap();
     let out = s.run(&["wiki", "lint"]);
     assert!(out.status.success(), "stderr: {}", Setup::stderr(&out));
     let stdout = Setup::stdout(&out);
     assert!(stdout.contains("wiki lint:"), "{stdout}");
-    assert!(stdout.contains("wiki.edit"), "{stdout}");
+    assert!(stdout.contains("report only"), "{stdout}");
+    assert!(!s.log_text().contains("wiki.edit"), "{}", s.log_text());
     assert_eq!(
         std::fs::read(s.home.join("wiki/pages/post-p1.md")).unwrap(),
         before,

@@ -45,7 +45,7 @@
 //! needs `ANCIENTOS_ALLOW_PAID=1` and Public sources; otherwise the local
 //! model or the deterministic fallback compiles), `query` answers with
 //! citations (`--file-back` files the answer as a new page), `lint`
-//! proposes hygiene fixes as `wiki.edit` approvals (never applied), and
+//! reports hygiene findings (report only, never applied), and
 //! `show` prints one page. `stats` prints the same numbers as the web
 //! UI's `/stats` dashboard as plain text, computed locally from the
 //! decision log and the Muse Code run log (no network, no paid calls).
@@ -1205,7 +1205,7 @@ fn cmd_wiki_lint(args: &[String]) -> Result<(), String> {
     }
     let log_path = brief::decision_log_path()?;
     let wiki_dir = wiki::wiki_dir()?;
-    let report = wiki::lint_and_propose(&wiki_dir, &log_path, idea_card::now_secs())?;
+    let report = wiki::lint_and_log(&wiki_dir, &log_path, idea_card::now_secs())?;
     print!("{}", wiki::render_lint_report(&report));
     Ok(())
 }

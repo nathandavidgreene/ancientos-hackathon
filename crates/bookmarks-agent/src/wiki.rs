@@ -26,9 +26,8 @@
 //!
 //! Query picks relevant pages via `index.md` plus simple term overlap (no
 //! embeddings) and answers with citations to pages and raw sources.
-//! Lint reports hygiene findings and proposes them as `wiki.edit` approvals
-//! ([`Risk::High`](ancientos_core::gate::Risk)); findings are never
-//! auto-applied.
+//! Lint reports hygiene findings for a human to fix by hand; it proposes
+//! no approvals and findings are never auto-applied.
 
 use crate::sanitize::truncate_chars;
 use ancientos_router::data_class::{check_egress, max_of, DataClass, Route};
@@ -2348,18 +2347,16 @@ pub fn lint(wiki: &Path) -> Vec<Finding> {
     findings
 }
 
-/// Outcome of lint plus proposals.
+/// Outcome of a lint run: findings only.
 #[derive(Debug, Clone)]
 pub struct LintReport {
     pub findings: Vec<Finding>,
-    pub approvals: Vec<String>,
 }
 
-/// Run [`lint`] and propose every finding as a `wiki.edit` approval
-/// ([`Risk::High`](ancientos_core::gate::Risk)); findings are never
-/// auto-applied — pages are untouched. A [`WIKI_LINT_KIND`] entry records
-/// the run. Returns the findings plus the approval ids.
-pub fn lint_and_propose(wiki: &Path, log_path: &Path, now: u64) -> Result<LintReport, String> {
+/// Run [`lint`] and record the run as a [`WIKI_LINT_KIND`] entry. Findings
+/// are a report for a human to act on by hand: no approvals are proposed
+/// (no executor ever applied a `wiki.edit`) and pages are never touched.
+pub fn lint_and_log(wiki: &Path, log_path: &Path, now: u64) -> Result<LintReport, String> {
     let findings = lint(wiki);
     if let Some(parent) = log_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -2371,37 +2368,12 @@ pub fn lint_and_propose(wiki: &Path, log_path: &Path, now: u64) -> Result<LintRe
         std::env::var(key).ok()
     })
     .map_err(|e| e.to_string())?;
-    let mut approvals = Vec::new();
-    for f in &findings {
-        let req = ancientos_core::approvals::request(
-            &mut log,
-            &crate::app_gate(),
-            crate::brief::AGENT_NAME,
-            crate::WIKI_EDIT_ACTION,
-            &format!(
-                "wiki lint [{}] {}: {}",
-                f.kind,
-                f.slug,
-                truncate_chars(&f.detail, 140)
-            ),
-            serde_json::json!({"kind": f.kind, "slug": f.slug, "detail": f.detail}),
-            now,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
-        approvals.push(req.id);
-    }
     let date = crate::brief::date_from_days((now / 86400) as i64);
-    let title = format!(
-        "lint: {} findings, {} approvals",
-        findings.len(),
-        approvals.len()
-    );
+    let title = format!("lint: {} findings", findings.len());
     log.append(
         WIKI_LINT_KIND,
         serde_json::json!({
             "findings": findings.len(),
-            "approvals": approvals,
             "title": title,
             "date": date,
             "at": now,
@@ -2410,30 +2382,17 @@ pub fn lint_and_propose(wiki: &Path, log_path: &Path, now: u64) -> Result<LintRe
     .map_err(|e| e.to_string())?;
     drop(log);
     sync_log_md(log_path, wiki)?;
-    Ok(LintReport {
-        findings,
-        approvals,
-    })
+    Ok(LintReport { findings })
 }
 
-/// Render a lint report for the CLI: one line per finding plus the proposed
-/// approval ids.
+/// Render a lint report for the CLI: one line per finding, then a note
+/// that nothing was proposed or applied.
 pub fn render_lint_report(report: &LintReport) -> String {
     let mut out = format!("wiki lint: {} findings\n", report.findings.len());
     for f in &report.findings {
         out.push_str(&format!("[{}] {}: {}\n", f.kind, f.slug, f.detail));
     }
-    if report.approvals.is_empty() {
-        out.push_str("no approvals proposed\n");
-    } else {
-        out.push_str(&format!(
-            "proposed {} approvals (action wiki.edit, nothing applied):\n",
-            report.approvals.len()
-        ));
-        for id in &report.approvals {
-            out.push_str(&format!("  {id}\n"));
-        }
-    }
+    out.push_str("report only: no approvals proposed, nothing applied\n");
     out
 }
 
@@ -3089,7 +3048,7 @@ mod tests {
     }
 
     #[test]
-    fn lint_proposes_approvals_and_never_edits() {
+    fn lint_reports_only_and_never_edits() {
         let (_dir, wiki, log) = setup();
         seed_raw(&wiki, "p1");
         seed_page(
@@ -3098,34 +3057,24 @@ mod tests {
             "# Lonely\nslug: lonely\nsources: p1\nclass: public\nsummary: Alone.\n\n## claims\n- Alone claim. [sources: p1]\n\n## links\nnone\n",
         );
         let before = std::fs::read_to_string(page_path(&wiki, "lonely")).unwrap();
-        let report = lint_and_propose(&wiki, &log, NOW).unwrap();
+        let report = lint_and_log(&wiki, &log, NOW).unwrap();
         assert!(!report.findings.is_empty());
-        assert_eq!(report.findings.len(), report.approvals.len());
         // Pages are byte-identical: nothing was auto-applied.
         assert_eq!(
             std::fs::read_to_string(page_path(&wiki, "lonely")).unwrap(),
             before
         );
-        // Every proposal is a pending wiki.edit approval (High risk gate).
+        // No approvals: nothing could ever execute a wiki.edit.
         let clog = ancientos_core::log::DecisionLog::open(&log).unwrap();
-        let pending = ancientos_core::approvals::pending(&clog, NOW).unwrap();
-        assert_eq!(pending.len(), report.approvals.len());
-        for a in &pending {
-            assert_eq!(a.request.action, crate::WIKI_EDIT_ACTION);
-        }
-        let gate = crate::app_gate();
-        assert_eq!(
-            gate.evaluate(&ancientos_core::gate::Proposal {
-                agent: "t".to_string(),
-                action: crate::WIKI_EDIT_ACTION.to_string(),
-            }),
-            ancientos_core::gate::Verdict::NeedsHuman
-        );
+        assert!(ancientos_core::approvals::pending(&clog, NOW)
+            .unwrap()
+            .is_empty());
         // The lint run itself is logged.
         let entries = clog.verify().unwrap();
         assert!(entries.iter().any(|e| e.kind == WIKI_LINT_KIND));
         let rendered = render_lint_report(&report);
-        assert!(rendered.contains("wiki.edit"), "{rendered}");
+        assert!(rendered.contains("report only"), "{rendered}");
+        assert!(!rendered.contains("wiki.edit"), "{rendered}");
     }
 
     #[test]

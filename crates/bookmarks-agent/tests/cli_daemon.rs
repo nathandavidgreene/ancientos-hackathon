@@ -240,7 +240,7 @@ fn paid_on_proposes_instead_of_calling() {
     let s = Setup::new();
     let fix = fixture("synthetic_bookmarks.jsonl");
     // No META_API_KEY is set anywhere in this test: a paid call would fail.
-    // The daemon proposes instead, and the brief stays local.
+    // The brief stays local and proposes nothing (no paid brief executor).
     let out = s.run(
         &[
             "run",
@@ -254,7 +254,7 @@ fn paid_on_proposes_instead_of_calling() {
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = s.log_text();
-    assert!(text.contains("\"action\":\"brief.paid\""), "{text}");
+    assert!(!text.contains("brief.paid"), "{text}");
     assert!(text.contains("\"fallback\":true"), "{text}");
     assert!(text.contains("\"model\":\"local\""), "{text}");
     // A queued deeper job under paid mode is proposed, never executed.

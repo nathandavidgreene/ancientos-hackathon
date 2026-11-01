@@ -4093,7 +4093,7 @@ mod tests {
             &mut log,
             &bookmarks_agent::app_gate(),
             "bookmarks-agent",
-            "x.post",
+            "deeper.paid",
             summary,
             serde_json::json!({"draft": draft}),
             now,
@@ -4122,7 +4122,7 @@ mod tests {
             for want in [
                 r.id.as_str(),
                 "bookmarks-agent",
-                "x.post",
+                "deeper.paid",
                 &r.expires_at.to_string(),
                 &format!("name=\"id\" value=\"{}\"", r.id),
                 &format!("name=\"payload_hash\" value=\"{}\"", r.payload_hash),
@@ -4351,7 +4351,11 @@ mod tests {
         let (_dir, state) = test_state();
         seed_approval(&state, "synthetic web tamper", "draft-h", now_secs(), None);
         let body = std::fs::read_to_string(state.log_path()).unwrap();
-        std::fs::write(state.log_path(), body.replacen("x.post", "x.POST", 1)).unwrap();
+        std::fs::write(
+            state.log_path(),
+            body.replacen("deeper.paid", "deeper.PAID", 1),
+        )
+        .unwrap();
         let resp = handle(&Request::get("/approvals"), &state);
         assert_eq!(resp.status, 200);
         assert!(resp.body.contains("TAMPERED at row 0"), "{}", resp.body);
@@ -4369,7 +4373,7 @@ mod tests {
                 log,
                 &bookmarks_agent::app_gate(),
                 "bookmarks-agent",
-                "x.post",
+                "deeper.paid",
                 "synthetic stats proposal",
                 serde_json::json!({"draft": draft}),
                 at,
@@ -4830,7 +4834,7 @@ mod request_security_tests {
             &mut log,
             &bookmarks_agent::app_gate(),
             "bookmarks-agent",
-            "x.post",
+            "deeper.paid",
             "synthetic security approval",
             serde_json::json!({"draft": "synthetic"}),
             now_secs(),

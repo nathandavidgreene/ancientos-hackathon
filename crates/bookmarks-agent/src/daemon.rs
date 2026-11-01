@@ -7,9 +7,9 @@
 //! others (each tick result is collected, and the agent fails closed).
 //!
 //! Paid work is never executed by the daemon directly: when
-//! `ANCIENTOS_ALLOW_PAID=1` the brief agent proposes a `brief.paid`
-//! approval and the deeper-queue agent proposes `deeper.paid` approvals
-//! (both [`Risk::High`](ancientos_core::gate::Risk) in the single
+//! `ANCIENTOS_ALLOW_PAID=1` the deeper-queue agent proposes `deeper.paid`
+//! approvals (the brief agent always stays local and proposes nothing)
+//! ([`Risk::High`](ancientos_core::gate::Risk) in the single
 //! [`app_gate`](crate::app_gate) policy) instead of
 //! calling Muse. A paid walkthrough runs only after a human approves the
 //! exact payload: the daemon claims the release token
@@ -29,7 +29,7 @@
 //! tests. Ctrl-C stops the loop via the default disposition (there is no
 //! signal handler without new crates); the loop also checks a stop flag.
 
-use crate::{BRIEF_PAID_ACTION, DEEPER_PAID_ACTION};
+use crate::DEEPER_PAID_ACTION;
 use ancientos_core::approvals;
 use ancientos_core::log::{DecisionLog, Entry};
 use ancientos_core::loop_guard::{self, Budgets, LoopGuard};
@@ -214,11 +214,6 @@ pub fn allow_paid() -> bool {
         .unwrap_or(false)
 }
 
-/// Exact payload proposed (and later claim-matched) for a paid brief.
-pub fn brief_paid_payload(date: &str, candidate_count: usize) -> serde_json::Value {
-    serde_json::json!({"date": date, "candidate_count": candidate_count})
-}
-
 /// Exact payload proposed (and later claim-matched) for a paid walkthrough.
 pub fn deeper_paid_payload(post_id: &str, at: u64) -> serde_json::Value {
     serde_json::json!({"post_id": post_id, "at": at})
@@ -229,16 +224,14 @@ pub fn deeper_paid_payload(post_id: &str, at: u64) -> serde_json::Value {
 pub struct BriefTick {
     pub picks: usize,
     pub candidates: usize,
-    /// Approval id proposed when paid is on (dedupe may return an existing
-    /// pending request for the same payload).
-    pub proposed: Option<String>,
 }
 
 /// Daily brief, local path only: runs [`crate::brief::run_local_full`]
-/// offline with no hydrator/expander (no network is possible) and, when
-/// paid is on, proposes a `brief.paid` approval instead of calling Muse.
-/// Metadata only in the log; never post text, never secrets.
-pub fn brief_tick(ctx: &AgentCtx, now: u64, paid: bool) -> Result<BriefTick, String> {
+/// offline with no hydrator/expander (no network is possible). It never
+/// proposes a paid approval: no executor ever released one, so a
+/// `brief.paid` request could only mislead. Metadata only in the log;
+/// never post text, never secrets.
+pub fn brief_tick(ctx: &AgentCtx, now: u64) -> Result<BriefTick, String> {
     let live = crate::ingest::Store::load_from(&ctx.live_store)?;
     let live_rows: Vec<crate::fixture::Bookmark> = live.by_id.into_values().collect();
     let fixture_rows = match &ctx.fixture {
@@ -249,31 +242,9 @@ pub fn brief_tick(ctx: &AgentCtx, now: u64, paid: bool) -> Result<BriefTick, Str
     let date = crate::brief::date_from_days((now / 86400) as i64);
     let result =
         crate::brief::run_local_full(&merged, &ctx.log_path, &date, None, None, true, None, now)?;
-    let proposed = if paid {
-        let mut log = DecisionLog::open_with_key_env(&ctx.log_path, &|key| std::env::var(key).ok())
-            .map_err(|e| e.to_string())?;
-        let req = approvals::request(
-            &mut log,
-            &crate::app_gate(),
-            DAEMON_AGENT_NAME,
-            BRIEF_PAID_ACTION,
-            &format!(
-                "Paid brief ranking for {date} ({} candidates)",
-                result.candidates.len()
-            ),
-            brief_paid_payload(&date, result.candidates.len()),
-            now,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
-        Some(req.id)
-    } else {
-        None
-    };
     Ok(BriefTick {
         picks: result.picks.len(),
         candidates: result.candidates.len(),
-        proposed,
     })
 }
 
@@ -331,12 +302,12 @@ pub fn approvals_sweep_tick(ctx: &AgentCtx, now: u64) -> Result<usize, String> {
     approvals::sweep_expired(&mut log, now).map_err(|e| e.to_string())
 }
 
-/// Weekly wiki lint: [`crate::wiki::lint_and_propose`] against the wiki dir
-/// alongside the decision log. Findings become `wiki.edit` approvals; pages
-/// are never modified.
+/// Weekly wiki lint: [`crate::wiki::lint_and_log`] against the wiki dir
+/// alongside the decision log. Findings are reported only (no approvals);
+/// pages are never modified.
 pub fn wiki_lint_tick(ctx: &AgentCtx, now: u64) -> Result<crate::wiki::LintReport, String> {
     let wiki = crate::wiki::wiki_dir_for_log(&ctx.log_path);
-    crate::wiki::lint_and_propose(&wiki, &ctx.log_path, now)
+    crate::wiki::lint_and_log(&wiki, &ctx.log_path, now)
 }
 
 /// A paid job whose approval was released but whose completion was never
@@ -844,17 +815,11 @@ impl Agent for BriefAgent {
     /// Run one tick: lint the wiki and propose fixes through approvals.
     fn tick(&mut self) -> Result<(), String> {
         let now = self.ctx.now_secs();
-        let summary = brief_tick(&self.ctx, now, allow_paid())?;
-        match summary.proposed {
-            Some(id) => println!(
-                "brief: {} picks ({} candidates), proposed paid brief {id}",
-                summary.picks, summary.candidates
-            ),
-            None => println!(
-                "brief: {} picks ({} candidates, local)",
-                summary.picks, summary.candidates
-            ),
-        }
+        let summary = brief_tick(&self.ctx, now)?;
+        println!(
+            "brief: {} picks ({} candidates, local)",
+            summary.picks, summary.candidates
+        );
         Ok(())
     }
 }
@@ -1035,9 +1000,8 @@ impl Agent for WikiLintAgent {
         let now = self.ctx.now_secs();
         let report = wiki_lint_tick(&self.ctx, now)?;
         println!(
-            "wiki_lint: {} findings, {} approvals",
-            report.findings.len(),
-            report.approvals.len()
+            "wiki_lint: {} findings (report only)",
+            report.findings.len()
         );
         Ok(())
     }
@@ -1337,22 +1301,19 @@ mod tests {
     }
 
     #[test]
-    fn brief_paid_proposes_without_model_call() {
+    fn brief_tick_never_proposes_paid_approval() {
         let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, true);
-        // run_local_full takes no model at all: paid mode cannot call one.
-        let tick = brief_tick(&ctx, NOW, true).unwrap();
+        // run_local_full takes no model at all: the brief cannot call one,
+        // and with no releasing executor it proposes nothing either.
+        let tick = brief_tick(&ctx, NOW).unwrap();
         assert_eq!(tick.candidates, 3);
-        assert!(!tick.proposed.is_none());
         let entries = entries_of(&ctx.log_path);
-        let req = entries
-            .iter()
-            .find(|e| e.kind == approvals::REQUESTED_KIND)
-            .expect("proposal appended");
-        assert_eq!(req.payload["action"], BRIEF_PAID_ACTION);
-        let date = crate::brief::date_from_days((NOW / 86400) as i64);
-        assert_eq!(req.payload["payload"], brief_paid_payload(&date, 3));
+        assert!(
+            !entries.iter().any(|e| e.kind == approvals::REQUESTED_KIND),
+            "no approval proposed"
+        );
         let model_call = entries
             .iter()
             .find(|e| e.kind == "brief.model_call")
@@ -2036,7 +1997,6 @@ mod tests {
         let before = std::fs::read(pages.join("lonely.md")).unwrap();
         let report = wiki_lint_tick(&ctx, NOW).unwrap();
         assert!(!report.findings.is_empty());
-        assert_eq!(report.findings.len(), report.approvals.len());
         assert_eq!(
             std::fs::read(pages.join("lonely.md")).unwrap(),
             before,
@@ -2054,12 +2014,20 @@ mod tests {
     fn daemon_paid_actions_share_the_single_gate_policy() {
         let _mute = crate::topic_mute::set_terms(crate::topic_mute::MuteList::default());
         use ancientos_core::gate::{Proposal, Verdict};
-        // The daemon imports the gate's constants (one place): both actions
-        // need a human, and anything unregistered fails closed.
-        assert_eq!(BRIEF_PAID_ACTION, "brief.paid");
+        // The daemon imports the gate's constant (one place): the paid
+        // action needs a human, and anything unregistered (including the
+        // removed brief.paid) fails closed.
         assert_eq!(DEEPER_PAID_ACTION, "deeper.paid");
         let gate = crate::app_gate();
-        for action in [BRIEF_PAID_ACTION, DEEPER_PAID_ACTION] {
+        assert!(matches!(
+            gate.evaluate(&Proposal {
+                agent: DAEMON_AGENT_NAME.into(),
+                action: "brief.paid".into(),
+            }),
+            Verdict::Deny { .. }
+        ));
+        {
+            let action = DEEPER_PAID_ACTION;
             assert_eq!(
                 gate.evaluate(&Proposal {
                     agent: DAEMON_AGENT_NAME.into(),

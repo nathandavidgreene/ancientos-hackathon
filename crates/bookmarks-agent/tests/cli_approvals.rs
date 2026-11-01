@@ -49,7 +49,7 @@ fn seed_at(
         &mut log,
         &bookmarks_agent::app_gate(),
         "bookmarks-agent",
-        "x.post",
+        "deeper.paid",
         summary,
         serde_json::json!({"draft": draft}),
         now,
@@ -92,7 +92,7 @@ fn list_shows_pending_fields_and_empty_state() {
     for want in [
         r.id.as_str(),
         "bookmarks-agent",
-        "x.post",
+        "deeper.paid",
         "synthetic cli proposal",
         &r.expires_at.to_string(),
     ] {

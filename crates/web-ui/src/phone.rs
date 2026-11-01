@@ -440,14 +440,14 @@ mod tests {
         s
     }
 
-    /// Test helper: one pending synthetic `x.post` request.
+    /// Test helper: one pending synthetic `deeper.paid` request.
     fn pending_request(state: &State, n: u32) -> ApprovalRequest {
         let mut log = DecisionLog::open(state.log_path()).unwrap();
         approvals::request(
             &mut log,
             &bookmarks_agent::app_gate(),
             "bookmarks-agent",
-            "x.post",
+            "deeper.paid",
             &format!("synthetic post {n}"),
             serde_json::json!({"draft": n}),
             now_secs(),
@@ -489,7 +489,7 @@ mod tests {
         }
     }
 
-    /// Test helper: one pending synthetic `x.post` request in the log file
+    /// Test helper: one pending synthetic `deeper.paid` request in the log file
     /// at `path` (the file's parent dir must already exist).
     fn pending_request_at(path: &std::path::Path, n: u32) -> ApprovalRequest {
         let mut log = DecisionLog::open(path).unwrap();
@@ -497,7 +497,7 @@ mod tests {
             &mut log,
             &bookmarks_agent::app_gate(),
             "bookmarks-agent",
-            "x.post",
+            "deeper.paid",
             &format!("synthetic post {n}"),
             serde_json::json!({"draft": n}),
             now_secs(),

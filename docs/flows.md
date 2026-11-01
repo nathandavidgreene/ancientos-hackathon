@@ -73,7 +73,7 @@ sequenceDiagram
   participant Q as approvals
   participant L as decision log
   participant H as human (CLI / web-ui)
-  D->>G: evaluate brief.paid / deeper.paid / wiki.edit
+  D->>G: evaluate deeper.paid
   G-->>D: NeedsHuman (Risk::High)
   D->>Q: request(payload) - redacted, hashed
   Q->>L: approval.requested {id, payload_hash, expires_at}
@@ -152,5 +152,5 @@ flowchart TD
   PG --> IDX[index.md]
   PG --> WLOG[log.md<br/>rendered from wiki.* log entries]
   Q[wiki query] --> IDX --> ANS[answer with page + raw citations]
-  LINT[wiki lint] --> FIND[findings] --> APR[wiki.edit approvals<br/>never auto-applied]
+  LINT[wiki lint] --> FIND[findings] --> APR[report only<br/>never auto-applied]
 ```

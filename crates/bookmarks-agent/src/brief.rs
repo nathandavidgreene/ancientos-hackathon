@@ -8,7 +8,6 @@
 use crate::feedback;
 use crate::fixture::Bookmark;
 use crate::merge::{MergeCounts, MergeOutput};
-use ancientos_core::gate::{Gate, Proposal, Risk, Verdict};
 use ancientos_core::log::DecisionLog;
 use ancientos_router::muse::{MuseClient, MuseUsage};
 use ancientos_router::{route, Destination, RouterError, Sensitivity};
@@ -359,15 +358,6 @@ pub fn local_picks(candidates: &[Candidate]) -> Vec<(usize, String)> {
         .take(MAX_PICKS)
         .map(|c| (c.index, rule_based_why(c)))
         .collect()
-}
-
-/// Human-readable label for a feedback verdict.
-fn verdict_label(v: &Verdict) -> &'static str {
-    match v {
-        Verdict::Allow => "allow",
-        Verdict::NeedsHuman => "needs_human",
-        Verdict::Deny { .. } => "deny",
-    }
 }
 
 /// Decision log path: `$DECISION_LOG_PATH` or `$ANCIENTOS_HOME/decision_log.jsonl`
@@ -826,17 +816,14 @@ fn run_impl(
         }
         _ => (local_picks(&candidates), "local".to_string(), None, true),
     };
-    let mut gate = Gate::new();
-    gate.register(BRIEF_ACTION, Risk::Low);
-    let mut evaluated: Vec<(BriefPick, Verdict, String)> = Vec::new();
+    // No gate here: including a pick is local, read-only work, so there is
+    // nothing a policy could deny (a self-registered Low gate always
+    // allowed and only decorated the log).
+    let mut evaluated: Vec<(BriefPick, String)> = Vec::new();
     for (n, why) in &resolved {
         let Some(c) = candidates.iter().find(|c| c.index == *n) else {
             continue;
         };
-        let verdict = gate.evaluate(&Proposal {
-            agent: AGENT_NAME.to_string(),
-            action: BRIEF_ACTION.to_string(),
-        });
         let full_text = stored
             .get(c.post_id.as_str())
             .map(|b| b.text.clone())
@@ -856,13 +843,9 @@ fn run_impl(
             media,
             translation: None,
         };
-        evaluated.push((pick, verdict, why.clone()));
+        evaluated.push((pick, why.clone()));
     }
-    let mut picks: Vec<BriefPick> = evaluated
-        .iter()
-        .filter(|(_, v, _)| *v == Verdict::Allow)
-        .map(|(p, _, _)| p.clone())
-        .collect();
+    let mut picks: Vec<BriefPick> = evaluated.iter().map(|(p, _)| p.clone()).collect();
 
     // Hydrate truncated picks with full text (display only). At most one call.
     let need: Vec<String> = picks
@@ -1021,15 +1004,11 @@ fn run_impl(
         }),
     )
     .map_err(|e| e.to_string())?;
-    for (pick, verdict, why) in &evaluated {
-        let mut payload = serde_json::json!({
+    for (pick, why) in &evaluated {
+        let payload = serde_json::json!({
             "post_id": pick.post_id,
-            "verdict": verdict_label(verdict),
             "why": why,
         });
-        if let Verdict::Deny { reason } = verdict {
-            payload["reason"] = serde_json::json!(reason);
-        }
         log.append("brief.pick", payload)
             .map_err(|e| e.to_string())?;
     }
@@ -1425,7 +1404,7 @@ mod tests {
         assert!(!call_json.contains("synthetic text"), "{call_json}");
         assert_eq!(entries[3].kind, "brief.pick");
         assert_eq!(entries[3].payload["post_id"], "id1");
-        assert_eq!(entries[3].payload["verdict"], "allow");
+        assert!(entries[3].payload.get("verdict").is_none());
         assert_eq!(entries[6].kind, "brief.hydrate");
         assert_eq!(entries[6].payload["requested"], 0);
         assert_eq!(entries[6].payload["hydrated"], 0);

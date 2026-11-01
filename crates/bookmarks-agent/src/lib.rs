@@ -44,33 +44,23 @@ pub mod vote;
 pub mod wiki;
 pub mod x_api;
 
-/// Paid brief ranking: proposed by the daemon, never executed without a human.
-pub const BRIEF_PAID_ACTION: &str = "brief.paid";
 /// Paid go-deeper walkthrough: proposed by the daemon, executed only after
 /// a human approval is claimed and released.
 pub const DEEPER_PAID_ACTION: &str = "deeper.paid";
-/// Wiki lint fix: proposed by `wiki lint` (or the weekly daemon lint), never
-/// auto-applied — a human approves each fix.
-pub const WIKI_EDIT_ACTION: &str = "wiki.edit";
 
 /// Canonical policy used by the approval queue: read-only agent work is
-/// low risk, X writes (which no agent performs without a human) and paid
-/// agent work (proposed by the daemon, approved by a human) are high
-/// risk, and anything unlisted is denied (fail closed).
+/// low risk; only actions with exactly one releasing executor are high
+/// risk (`deeper.paid`, released by the daemon's paid executor, and the
+/// loop-guard resume); anything unlisted is denied (fail closed). X
+/// writes, `brief.paid` and `wiki.edit` are deliberately absent: nothing
+/// executes them, so approving one could only mislead. Labels Delete does
+/// not go through this queue (it uses Social's remover directly).
 pub fn app_gate() -> ancientos_core::gate::Gate {
     use ancientos_core::gate::Risk;
     let mut g = ancientos_core::gate::Gate::new();
     g.register("brief.include", Risk::Low);
     for action in [
-        "x.post",
-        "x.reply",
-        "x.repost",
-        "x.like",
-        "x.follow",
-        "x.dm.send",
-        BRIEF_PAID_ACTION,
         DEEPER_PAID_ACTION,
-        WIKI_EDIT_ACTION,
         ancientos_core::loop_guard::RESUME_ACTION,
     ] {
         g.register(action, Risk::High);
@@ -130,35 +120,44 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_allows_reads_needs_human_for_x_writes_denies_unknown() {
+    fn default_policy_has_no_decorative_x_write_approvals() {
         let g = app_gate();
         assert_eq!(g.evaluate(&p("brief.include")), Verdict::Allow);
-        for action in ["x.post", "x.reply", "x.repost", "x.like", "x.follow"] {
-            assert_eq!(g.evaluate(&p(action)), Verdict::NeedsHuman, "{action}");
-        }
-        assert!(matches!(g.evaluate(&p("wipe.drive")), Verdict::Deny { .. }));
-    }
-
-    #[test]
-    fn default_policy_needs_human_for_daemon_paid_actions() {
-        let g = app_gate();
-        assert_eq!(g.evaluate(&p(BRIEF_PAID_ACTION)), Verdict::NeedsHuman);
-        assert_eq!(g.evaluate(&p(DEEPER_PAID_ACTION)), Verdict::NeedsHuman);
-        // Neighbouring names still fail closed.
-        for action in ["brief.paid.extra", "deeper.paid2", "brief", "deeper"] {
+        // No executor performs X writes, so they are not approvable: they
+        // fail closed like any unknown action.
+        for action in [
+            "x.post",
+            "x.reply",
+            "x.repost",
+            "x.like",
+            "x.follow",
+            "x.dm.send",
+        ] {
             assert!(
                 matches!(g.evaluate(&p(action)), Verdict::Deny { .. }),
                 "{action}"
             );
         }
+        assert!(matches!(g.evaluate(&p("wipe.drive")), Verdict::Deny { .. }));
     }
 
     #[test]
-    fn default_policy_needs_human_for_wiki_edits() {
+    fn default_policy_needs_human_only_for_executed_actions() {
         let g = app_gate();
-        assert_eq!(g.evaluate(&p(WIKI_EDIT_ACTION)), Verdict::NeedsHuman);
-        // Neighbouring names still fail closed.
-        for action in ["wiki", "wiki.read", "wiki.edit.extra"] {
+        assert_eq!(g.evaluate(&p(DEEPER_PAID_ACTION)), Verdict::NeedsHuman);
+        assert_eq!(
+            g.evaluate(&p(ancientos_core::loop_guard::RESUME_ACTION)),
+            Verdict::NeedsHuman
+        );
+        // Removed proposals (no executor) and neighbours fail closed.
+        for action in [
+            "brief.paid",
+            "wiki.edit",
+            "deeper.paid2",
+            "brief",
+            "deeper",
+            "wiki",
+        ] {
             assert!(
                 matches!(g.evaluate(&p(action)), Verdict::Deny { .. }),
                 "{action}"
@@ -169,7 +168,8 @@ mod tests {
     #[test]
     fn daemon_paid_actions_round_trip_through_request() {
         let (_dir, mut log) = open_log();
-        for action in [BRIEF_PAID_ACTION, DEEPER_PAID_ACTION] {
+        {
+            let action = DEEPER_PAID_ACTION;
             let r = request(
                 &mut log,
                 &app_gate(),

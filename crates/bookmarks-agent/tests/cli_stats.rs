@@ -63,7 +63,7 @@ fn seed(log_path: &Path) -> u64 {
         &mut log,
         &bookmarks_agent::app_gate(),
         "bookmarks-agent",
-        "x.post",
+        "deeper.paid",
         "synthetic stats cli proposal",
         serde_json::json!({"draft": "synthetic cli draft"}),
         now,
