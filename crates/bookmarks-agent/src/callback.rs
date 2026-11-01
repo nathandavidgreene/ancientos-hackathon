@@ -1,7 +1,13 @@
 //! Loopback OAuth2 callback listener on 127.0.0.1:8080.
 //!
-//! Accepts one `GET /callback?code=..&state=..` request, verifies the state
-//! matches (fail closed), and replies with a small "close this tab" page.
+//! Waits until the deadline for one `GET /callback?code=..&state=..`
+//! request whose state matches (compared in constant time, fail closed),
+//! and replies with a small "close this tab" page. Anything that is not
+//! `/callback` gets a 404 and the listener keeps waiting; a `/callback`
+//! with a wrong or missing state (or a malformed request) gets a 400 and
+//! the listener keeps waiting too, so a stray or forged request cannot end
+//! the login. A state-valid callback ends it: with the code, or with the
+//! server's `error` / a missing code.
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
@@ -28,6 +34,29 @@ pub enum CallbackError {
     ServerError(String),
     #[error("callback is missing the code parameter")]
     MissingCode,
+}
+
+/// Constant-time byte equality: the time taken depends only on the
+/// lengths, never on where the first differing byte is.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Whether a raw request's target path is exactly [`CALLBACK_PATH`]
+/// (with or without a query).
+fn is_callback_target(request: &str) -> bool {
+    let target = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split(' ')
+        .nth(1)
+        .unwrap_or_default();
+    let path = target.split('?').next().unwrap_or_default();
+    path == CALLBACK_PATH
 }
 
 /// Percent-decode a URL query value; fails closed on malformed escapes.
@@ -91,21 +120,24 @@ pub fn parse_callback_request(
 
     let mut code: Option<String> = None;
     let mut state: Option<String> = None;
+    let mut error: Option<String> = None;
     for pair in query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
-            "error" => {
-                let desc = format!("error={}", percent_decode(v)?);
-                return Err(CallbackError::ServerError(desc));
-            }
+            "error" => error = Some(percent_decode(v)?),
             "code" => code = Some(percent_decode(v)?),
             "state" => state = Some(percent_decode(v)?),
             _ => {}
         }
     }
+    // State first (constant time): an unauthenticated `error=` cannot end
+    // the login either.
     match state {
-        Some(s) if s == expected_state => {}
+        Some(s) if ct_eq(s.as_bytes(), expected_state.as_bytes()) => {}
         _ => return Err(CallbackError::StateMismatch),
+    }
+    if let Some(e) = error {
+        return Err(CallbackError::ServerError(format!("error={e}")));
     }
     match code {
         Some(c) if !c.is_empty() => Ok(c),
@@ -121,12 +153,24 @@ fn http_response(status: &str, body: &str) -> String {
     )
 }
 
-/// Serve one OAuth callback connection and return the code if `state` matches.
+/// What one served connection means for the wait loop.
+#[derive(Debug)]
+enum Served {
+    /// Not ours (404, wrong state, malformed, I/O): keep waiting.
+    KeepWaiting,
+    /// A state-valid callback: the login ends with this result.
+    Done(Result<String, CallbackError>),
+}
+
+/// Serve one connection: 404 for anything but `/callback`, otherwise the
+/// parsed callback (200 on success, 400 on failure). The read timeout is
+/// bounded by `read_timeout` so a silent client cannot hold the listener.
 fn handle_connection(
     stream: std::net::TcpStream,
     expected_state: &str,
-) -> Result<String, CallbackError> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    read_timeout: Duration,
+) -> Result<Served, CallbackError> {
+    stream.set_read_timeout(Some(read_timeout.max(Duration::from_millis(10))))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut raw = String::new();
     // Read the request line plus headers (bounded); the query is on line one.
@@ -138,8 +182,15 @@ fn handle_connection(
             break;
         }
     }
-    let result = parse_callback_request(&raw, expected_state);
     let mut stream = reader.into_inner();
+    if !is_callback_target(&raw) {
+        let _ = stream.write_all(
+            http_response("404 Not Found", "<html><body>Not found</body></html>").as_bytes(),
+        );
+        let _ = stream.flush();
+        return Ok(Served::KeepWaiting);
+    }
+    let result = parse_callback_request(&raw, expected_state);
     let reply = match &result {
         Ok(_) => http_response("200 OK", CLOSE_TAB_HTML),
         Err(e) => http_response(
@@ -149,11 +200,16 @@ fn handle_connection(
     };
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.flush();
-    result
+    Ok(match result {
+        Err(CallbackError::StateMismatch | CallbackError::BadRequest(_)) => Served::KeepWaiting,
+        other => Served::Done(other),
+    })
 }
 
-/// Bind the loopback listener and wait for one callback. Fails closed on
-/// timeout, state mismatch, or any protocol error.
+/// Bind the loopback listener and keep accepting connections until a
+/// state-valid callback arrives or the deadline passes (then
+/// [`CallbackError::Timeout`]). Non-callback paths, wrong states and
+/// broken connections never end the wait.
 pub fn wait_for_code_with_timeout(
     expected_state: &str,
     timeout: Duration,
@@ -168,7 +224,16 @@ pub fn wait_for_code_with_timeout(
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
-                return handle_connection(stream, expected_state);
+                let left = deadline.saturating_duration_since(Instant::now());
+                let read_timeout = left.min(Duration::from_secs(5));
+                if let Ok(Served::Done(result)) =
+                    handle_connection(stream, expected_state, read_timeout)
+                {
+                    return result;
+                }
+                if Instant::now() >= deadline {
+                    return Err(CallbackError::Timeout);
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
@@ -176,6 +241,7 @@ pub fn wait_for_code_with_timeout(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(CallbackError::Io(e)),
         }
     }
@@ -267,6 +333,7 @@ mod tests {
     #[test]
     fn listener_roundtrip_accepts_one_callback() {
         // Binds the real loopback port; other tests here are pure.
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state = "roundtrip-state";
         let handle =
             std::thread::spawn(|| wait_for_code_with_timeout(state, Duration::from_secs(10)));
@@ -282,4 +349,68 @@ mod tests {
         assert!(body.contains("You can close this tab"), "reply: {body}");
         assert_eq!(handle.join().unwrap().unwrap(), "the-code");
     }
+
+    #[test]
+    fn constant_time_eq_matches_plain_eq() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn error_param_without_valid_state_is_a_mismatch() {
+        let r = parse_callback_request(&req("/callback?error=access_denied&state=bad"), "s");
+        assert!(matches!(r, Err(CallbackError::StateMismatch)));
+    }
+
+    #[test]
+    fn callback_target_detection() {
+        assert!(is_callback_target(&req("/callback?code=c")));
+        assert!(is_callback_target(&req("/callback")));
+        assert!(!is_callback_target(&req("/favicon.ico")));
+        assert!(!is_callback_target(&req("/callbackx?code=c")));
+        assert!(!is_callback_target(""));
+    }
+
+    /// Test helper: send one raw request to the listener and read the reply.
+    fn send(raw: &str) -> String {
+        let mut stream = std::net::TcpStream::connect(CALLBACK_ADDR).unwrap();
+        stream.write_all(raw.as_bytes()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        read_all(&stream)
+    }
+
+    #[test]
+    fn listener_404s_strays_and_survives_bad_state_until_real_callback() {
+        // Shares the real loopback port with the roundtrip test.
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle =
+            std::thread::spawn(|| wait_for_code_with_timeout("st", Duration::from_secs(10)));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(send(&req("/favicon.ico")).starts_with("HTTP/1.1 404"));
+        assert!(send(&req("/callback?code=evil&state=forged")).starts_with("HTTP/1.1 400"));
+        assert!(send("garbage\r\n\r\n").starts_with("HTTP/1.1 404"));
+        let ok = send(&req("/callback?code=real&state=st"));
+        assert!(ok.contains("You can close this tab"), "{ok}");
+        assert_eq!(handle.join().unwrap().unwrap(), "real");
+    }
+
+    #[test]
+    fn listener_times_out_after_only_strays() {
+        let _port = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle =
+            std::thread::spawn(|| wait_for_code_with_timeout("st", Duration::from_millis(800)));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(send(&req("/nope")).starts_with("HTTP/1.1 404"));
+        assert!(matches!(
+            handle.join().unwrap(),
+            Err(CallbackError::Timeout)
+        ));
+    }
+
+    /// Serializes tests that bind [`CALLBACK_ADDR`].
+    static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
