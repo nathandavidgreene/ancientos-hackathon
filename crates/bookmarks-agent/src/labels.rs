@@ -707,6 +707,31 @@ struct CliRun {
     code: Option<i32>,
     /// True only when the CLI ran to completion (whatever it exited).
     ran: bool,
+    /// `detail` from the CLI's JSON stdout line, when it printed one
+    /// (for example `request_in_progress`).
+    detail: Option<String>,
+}
+
+/// Read the remover's stdout after it exited (capped at 64 KiB) and return
+/// the `detail` string of the last JSON line that has one. Non-JSON output,
+/// read errors, and missing pipes yield `None`; nothing is logged or echoed.
+fn read_cli_detail(stdout: Option<std::process::ChildStdout>) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    stdout?.take(64 * 1024).read_to_end(&mut buf).ok()?;
+    parse_cli_detail(&String::from_utf8_lossy(&buf))
+}
+
+/// Pure parser behind [`read_cli_detail`]: the `detail` string of the last
+/// stdout line that parses as a JSON object with a string `detail`.
+fn parse_cli_detail(text: &str) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()?
+            .get("detail")?
+            .as_str()
+            .map(str::to_string)
+    })
 }
 
 /// Run `bin --post-id <id>` with no shell, killing it after
@@ -719,7 +744,7 @@ fn run_remove_cli(bin: &Path, id: &str, request_id: &str) -> CliRun {
         .arg("--request-id")
         .arg(request_id)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     {
@@ -727,6 +752,7 @@ fn run_remove_cli(bin: &Path, id: &str, request_id: &str) -> CliRun {
             return CliRun {
                 code: None,
                 ran: false,
+                detail: None,
             }
         }
         Ok(c) => c,
@@ -740,12 +766,14 @@ fn run_remove_cli(bin: &Path, id: &str, request_id: &str) -> CliRun {
                 return CliRun {
                     code: None,
                     ran: false,
+                    detail: None,
                 }
             }
             Ok(Some(status)) => {
                 return CliRun {
                     code: status.code(),
                     ran: true,
+                    detail: read_cli_detail(child.stdout.take()),
                 };
             }
             Ok(None) => {
@@ -755,6 +783,7 @@ fn run_remove_cli(bin: &Path, id: &str, request_id: &str) -> CliRun {
                     return CliRun {
                         code: None,
                         ran: false,
+                        detail: None,
                     };
                 }
                 std::thread::sleep(step);
@@ -848,6 +877,11 @@ pub enum RemoveOutcome {
     Removed,
     /// The post id already had an `ok` row; the CLI was not called.
     AlreadyRemoved,
+    /// The CLI exited 1 with `detail: request_in_progress`: an earlier run
+    /// with this request id is still working. Nothing is logged, so the
+    /// earlier run's row stays authoritative; the caller should show a
+    /// pending notice and must not treat the post as removed yet.
+    InProgress,
 }
 
 /// Remove exactly one post via Social's configured CLI and audit the result.
@@ -921,6 +955,9 @@ pub fn remove_one_id(
                 now,
             )?;
             Err("refused or not found on X".to_string())
+        }
+        Some(1) if run.detail.as_deref() == Some("request_in_progress") => {
+            Ok(RemoveOutcome::InProgress)
         }
         Some(code) => {
             log_attempt(dir, id, post_key, request_id, "failed", Some(code), now)?;
@@ -1023,6 +1060,57 @@ mod tests {
             Err(_) => Vec::new(),
             Ok(t) => t.lines().map(str::to_string).collect(),
         }
+    }
+
+    /// The remover's JSON stdout `detail` is parsed from the last JSON line;
+    /// junk and lines without a string detail are ignored.
+    #[test]
+    fn parse_cli_detail_reads_last_json_detail() {
+        assert_eq!(
+            parse_cli_detail("noise\n{\"status\":\"failed\",\"detail\":\"request_in_progress\"}\n"),
+            Some("request_in_progress".to_string())
+        );
+        assert_eq!(parse_cli_detail("{\"detail\":1}\nnot json"), None);
+        assert_eq!(parse_cli_detail(""), None);
+    }
+
+    /// Exit 1 with `request_in_progress` on stdout maps to `InProgress`
+    /// and writes no removal row; plain exit 1 is still a logged failure.
+    #[test]
+    #[cfg(unix)]
+    fn request_in_progress_maps_to_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_executable(
+            dir.path(),
+            "remove_bookmark",
+            "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"failed\",\"detail\":\"request_in_progress\"}'\nexit 1\n",
+        );
+        let rid = "00000000-0000-4000-8000-0000000000a1";
+        let out = remove_one_id(
+            dir.path(),
+            "k",
+            "8000000000000000001",
+            Some(&bin),
+            None,
+            1,
+            rid,
+        );
+        assert_eq!(out, Ok(RemoveOutcome::InProgress));
+        assert!(removal_rows(dir.path()).is_empty());
+        let calls = dir.path().join("calls.txt");
+        let plain = fake_remove_bin(dir.path(), &calls, 1, "");
+        let rid2 = "00000000-0000-4000-8000-0000000000a2";
+        let out = remove_one_id(
+            dir.path(),
+            "k",
+            "8000000000000000001",
+            Some(&plain),
+            None,
+            1,
+            rid2,
+        );
+        assert!(out.is_err(), "{out:?}");
+        assert_eq!(removal_rows(dir.path()).len(), 1);
     }
 
     /// Read the removal log rows as JSON values.

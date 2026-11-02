@@ -387,15 +387,68 @@ fn delete_preview_line(key: &str, author: &str, categories: &[String]) -> String
     format!(
         "<p class=\"delete-preview\">Delete preview: removes bookmark {key}{who} \
          · categories: {cats} · logs: label=delete for {key} in the labels store; \
-         Social's remover unbookmarks it. Nothing else changes.</p>",
+         a separate X worker unbookmarks it. Nothing else changes.</p>",
         key = escape(key),
         who = who,
         cats = cats_text,
     )
 }
 
+/// Default Delete return target (the full labels view).
+const RETURN_DEFAULT: &str = "/labels";
+/// Delete return target for the demo view.
+const RETURN_DEMO: &str = "/labels?ids=demo";
+
+/// Map a posted `return` value to an allowlisted redirect target. Only the
+/// exact strings [`RETURN_DEFAULT`] and [`RETURN_DEMO`] are honored; any
+/// other value (absent, external, or crafted) yields `fallback`, so this
+/// is never an open redirect.
+fn delete_return_target(posted: Option<&str>, fallback: &'static str) -> &'static str {
+    match posted {
+        Some(RETURN_DEFAULT) => RETURN_DEFAULT,
+        Some(RETURN_DEMO) => RETURN_DEMO,
+        _ => fallback,
+    }
+}
+
+/// Redirect after a successful Delete: `target` plus `removed=<id>` so the
+/// labels page can show the "Removed on X" notice.
+fn removed_redirect(target: &str, id: &str) -> Response {
+    let sep = if target.contains('?') { '&' } else { '?' };
+    Response::redirect(format!("{target}{sep}removed={id}"))
+}
+
+/// Pending page for a Delete whose earlier run (same request id) is still
+/// in progress: not a failure, and the bookmark may still be removed.
+fn delete_pending(target: &str, state: &State) -> Response {
+    Response::status(
+        202,
+        crate::error_page(
+            "Removal in progress",
+            &format!(
+                "Removal in progress, reload in a few seconds. Back to labels: {}",
+                escape(target)
+            ),
+            state,
+        ),
+    )
+}
+
+/// "Removed on X" notice for `?removed=<id>`; empty unless the value is
+/// 1-25 ASCII digits, so arbitrary query text is never rendered.
+fn removed_notice(removed: Option<&str>) -> String {
+    match removed {
+        Some(id) if !id.is_empty() && id.len() <= 25 && id.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("<p class=\"notice\">Removed on X: bookmark {id}.</p>")
+        }
+        _ => String::new(),
+    }
+}
+
 /// One post card: header, tags, text, thumbs, findings, radios, Delete
-/// preview line, Delete.
+/// preview line, and a Delete form that posts `return_to` (the view to come
+/// back to) and disables its button on submit (the form still posts
+/// normally when JS is off).
 fn card_html(
     queries: &LabelQueries,
     key: &str,
@@ -403,6 +456,7 @@ fn card_html(
     thumbs: &BTreeMap<String, Vec<labels::ThumbEntry>>,
     findings: &BTreeMap<String, Vec<labels::ShownFinding>>,
     classify: &BTreeMap<String, BTreeSet<String>>,
+    return_to: &str,
 ) -> String {
     let post = &queries.posts[key];
     let status_id = labels::status_id_of_url(&post.url);
@@ -429,8 +483,10 @@ fn card_html(
          <label><input type=\"radio\" form=\"{form}\" name=\"label-{key}\" \
          value=\"not\"{not}> Not</label></p>\
          {preview}\
-         <form method=\"post\" action=\"/labels/delete\">\
+         <form method=\"post\" action=\"/labels/delete\" \
+         onsubmit=\"this.querySelector('button').disabled=true\">\
          <input type=\"hidden\" name=\"post\" value=\"{key}\">\
+         <input type=\"hidden\" name=\"return\" value=\"{return_to}\">\
          <input type=\"hidden\" name=\"request_id\" value=\"{request_id}\">\
          <button type=\"submit\">Delete</button></form>\
          </div>",
@@ -448,6 +504,7 @@ fn card_html(
         not = if not { " checked" } else { "" },
         preview = delete_preview_line(key, &post.author, &preview_cats),
         request_id = request_uuid(),
+        return_to = escape(return_to),
     )
 }
 
@@ -498,7 +555,13 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
         .collect();
     keys.extend(extra);
     let labeled = keys.iter().filter(|k| stored.contains_key(*k)).count();
-    let mut body = format!(
+    let return_to = if req.query.get("ids").map(String::as_str) == Some("demo") {
+        RETURN_DEMO
+    } else {
+        RETURN_DEFAULT
+    };
+    let mut body = removed_notice(req.query.get("removed").map(String::as_str));
+    body += &format!(
         "<h1>Labels ({} post{}, {} labeled)</h1>\
          <ul>{}</ul>\
          <form id=\"{form}\" method=\"post\" action=\"/labels/save\">\
@@ -525,6 +588,7 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
             &thumbs,
             &findings,
             &classify,
+            return_to,
         ));
     }
     body.push_str(&format!(
@@ -586,10 +650,12 @@ pub fn save_labels(req: &Request, state: &State) -> Response {
     }
 }
 
-/// `POST /labels/delete`: remove the one posted post via Social's CLI (no
-/// phone approval; the click is the authorization). Success records the
-/// `delete` label; failure keeps the bookmark and its label and shows the
-/// error. Already-removed posts just converge the label and redirect.
+/// `POST /labels/delete`: remove the one posted post via the X remover CLI
+/// (no phone approval; the click is the authorization). Success records the
+/// `delete` label and redirects to the allowlisted `return` view with
+/// `removed=<id>`; a still-running earlier request shows a pending page;
+/// failure keeps the bookmark and its label and shows the error.
+/// Already-removed posts just converge the label and redirect.
 pub fn delete_post(req: &Request, state: &State) -> Response {
     let Some(dir) = state.labels_dir.as_deref() else {
         return labels_off(state);
@@ -623,6 +689,7 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
         }
         // Demo-allowlisted store post: same remover, log, and replay as
         // eval posts. It has no eval label row, so no label is saved.
+        let target = delete_return_target(form.get("return").map(String::as_str), RETURN_DEMO);
         let path_env = std::env::var("PATH").ok();
         return match labels::remove_one_id(
             dir,
@@ -633,7 +700,8 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
             now_secs(),
             request_id,
         ) {
-            Ok(_) => Response::redirect("/labels?ids=demo".to_string()),
+            Ok(labels::RemoveOutcome::InProgress) => delete_pending(target, state),
+            Ok(_) => removed_redirect(target, key),
             Err(e) => failed("Delete failed", &format!("{e} Bookmark kept."), state),
         };
     }
@@ -646,6 +714,7 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
     }
     let now = now_secs();
     let path_env = std::env::var("PATH").ok();
+    let target = delete_return_target(form.get("return").map(String::as_str), RETURN_DEFAULT);
     match labels::remove_one(
         dir,
         key,
@@ -654,8 +723,9 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
         now,
         request_id,
     ) {
+        Ok(labels::RemoveOutcome::InProgress) => delete_pending(target, state),
         Ok(_) => match labels::save_labels(dir, &[(key.to_string(), Label::Delete)], now) {
-            Ok(_) => Response::redirect("/labels".to_string()),
+            Ok(_) => removed_redirect(target, &post_id),
             Err(e) => failed(
                 "Delete half-saved",
                 &format!("Removed on X, but the label was not saved: {e}"),
@@ -1316,7 +1386,10 @@ mod tests {
             &s,
         );
         assert_eq!(resp.status, 303);
-        assert_eq!(resp.location.as_deref(), Some("/labels"));
+        assert_eq!(
+            resp.location.as_deref(),
+            Some(format!("/labels?removed={ID7}").as_str())
+        );
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
             format!("--post-id {ID7} --request-id 00000000-0000-4000-8000-000000000001\n")
@@ -1332,6 +1405,124 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["outcome"], "removed");
         assert_eq!(rows[0]["post_id"], ID7);
+    }
+
+    /// A posted `return=/labels?ids=demo` sends the user back to the demo
+    /// view with the removed notice param.
+    #[test]
+    #[cfg(unix)]
+    fn delete_returns_to_demo_view() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let mut s = labels_state(data.path(), eval.path());
+        let calls = data.path().join("calls.txt");
+        s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
+        let resp = crate::handle_routes(
+            &Request::post(
+                "/labels/delete",
+                "post=7&return=%2Flabels%3Fids%3Ddemo&request_id=00000000-0000-4000-8000-000000000011",
+            )
+            .with_cookie(COOKIE),
+            &s,
+        );
+        assert_eq!(resp.status, 303);
+        assert_eq!(
+            resp.location.as_deref(),
+            Some(format!("/labels?ids=demo&removed={ID7}").as_str())
+        );
+    }
+
+    /// A `return` outside the allowlist (external URL) falls back to
+    /// `/labels`; the helper itself honors only the two exact targets.
+    #[test]
+    #[cfg(unix)]
+    fn delete_disallowed_return_falls_back() {
+        assert_eq!(
+            delete_return_target(Some("https://evil.example/"), RETURN_DEFAULT),
+            "/labels"
+        );
+        assert_eq!(
+            delete_return_target(Some("//evil.example"), RETURN_DEMO),
+            RETURN_DEMO
+        );
+        assert_eq!(
+            delete_return_target(Some("/labels?ids=demo"), RETURN_DEFAULT),
+            RETURN_DEMO
+        );
+        assert_eq!(delete_return_target(None, RETURN_DEFAULT), RETURN_DEFAULT);
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let mut s = labels_state(data.path(), eval.path());
+        let calls = data.path().join("calls.txt");
+        s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
+        let resp = crate::handle_routes(
+            &Request::post(
+                "/labels/delete",
+                "post=7&return=https%3A%2F%2Fevil.example%2F&request_id=00000000-0000-4000-8000-000000000012",
+            )
+            .with_cookie(COOKIE),
+            &s,
+        );
+        assert_eq!(resp.status, 303);
+        assert_eq!(
+            resp.location.as_deref(),
+            Some(format!("/labels?removed={ID7}").as_str())
+        );
+    }
+
+    /// `?removed=<digits>` renders the notice and the form carries the
+    /// return field and submit-disable; non-numeric values render nothing.
+    #[test]
+    fn removed_notice_renders() {
+        assert_eq!(
+            removed_notice(Some("2008023259649089960")),
+            "<p class=\"notice\">Removed on X: bookmark 2008023259649089960.</p>"
+        );
+        assert_eq!(removed_notice(Some("<script>")), "");
+        assert_eq!(removed_notice(Some("")), "");
+        assert_eq!(removed_notice(None), "");
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let s = labels_state(data.path(), eval.path());
+        let resp =
+            crate::handle_routes(&Request::get("/labels?removed=123").with_cookie(COOKIE), &s);
+        assert_eq!(resp.status, 200);
+        let body = resp.body.clone();
+        assert!(body.contains("Removed on X: bookmark 123."), "{body}");
+        assert!(body.contains("name=\"return\" value=\"/labels\""), "{body}");
+        assert!(body.contains("disabled=true"), "{body}");
+    }
+
+    /// Exit 1 with `request_in_progress` on stdout shows the pending page,
+    /// not "Delete failed", and saves no label.
+    #[test]
+    #[cfg(unix)]
+    fn delete_in_progress_shows_pending() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        let mut s = labels_state(data.path(), eval.path());
+        s.labels_remove_bin = Some(write_executable(
+            data.path(),
+            "remove_bookmark",
+            "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"failed\",\"detail\":\"request_in_progress\"}'\nexit 1\n",
+        ));
+        let resp = crate::handle_routes(
+            &Request::post(
+                "/labels/delete",
+                "post=7&request_id=00000000-0000-4000-8000-000000000013",
+            )
+            .with_cookie(COOKIE),
+            &s,
+        );
+        assert_eq!(resp.status, 202);
+        let body = resp.body.clone();
+        assert!(
+            body.contains("Removal in progress, reload in a few seconds"),
+            "{body}"
+        );
+        assert!(!body.contains("Delete failed"), "{body}");
+        let stored = labels::load_labels(eval.path()).unwrap();
+        assert!(stored.get("7").is_none_or(|r| r.label != Label::Delete));
     }
 
     /// Demo delete gate: allowlisted + in store is accepted; unknown id,
@@ -1415,7 +1606,10 @@ mod tests {
         std::env::remove_var(DEMO_IDS_ENV);
         std::env::remove_var(BOOKMARKS_PATH_ENV);
         assert_eq!(first.status, 303, "{}", first.body);
-        assert_eq!(first.location.as_deref(), Some("/labels?ids=demo"));
+        assert_eq!(
+            first.location.as_deref(),
+            Some(format!("/labels?ids=demo&removed={SID}").as_str())
+        );
         assert_eq!(replay.status, 303, "{}", replay.body);
         assert_eq!(unknown.status, 400);
         assert_eq!(
@@ -1566,7 +1760,7 @@ mod tests {
             a,
             "<p class=\"delete-preview\">Delete preview: removes bookmark 7 (@syn_sleeper) \
              · categories: q1, q2, sleep · logs: label=delete for 7 in the labels store; \
-             Social's remover unbookmarks it. Nothing else changes.</p>",
+             a separate X worker unbookmarks it. Nothing else changes.</p>",
             "{a}"
         );
     }
