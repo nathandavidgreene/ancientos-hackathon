@@ -820,6 +820,18 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// X status ids that the removal audit log records as removed (an
+/// `outcome` of `removed` or `already_absent`). Read-only; a missing or
+/// unreadable log yields an empty set, and malformed lines are skipped.
+pub fn removed_post_ids(dir: &Path) -> std::collections::BTreeSet<String> {
+    let text = std::fs::read_to_string(dir.join(REMOVALS_FILE)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| matches!(v["outcome"].as_str(), Some("removed" | "already_absent")))
+        .filter_map(|v| v["post_id"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// Return the saved result for a duplicate request UUID without invoking the CLI.
 fn prior_request(
     dir: &Path,
@@ -1111,6 +1123,21 @@ mod tests {
         );
         assert!(out.is_err(), "{out:?}");
         assert_eq!(removal_rows(dir.path()).len(), 1);
+    }
+
+    /// `removed_post_ids` keeps only removed/already_absent rows and
+    /// tolerates junk lines and a missing log.
+    #[test]
+    fn removed_post_ids_reads_ok_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(removed_post_ids(dir.path()).is_empty());
+        std::fs::write(
+            dir.path().join(REMOVALS_FILE),
+            "{\"outcome\":\"removed\",\"post_id\":\"1\"}\njunk\n{\"outcome\":\"failed\",\"post_id\":\"2\"}\n{\"outcome\":\"already_absent\",\"post_id\":\"3\"}\n",
+        )
+        .unwrap();
+        let ids: Vec<String> = removed_post_ids(dir.path()).into_iter().collect();
+        assert_eq!(ids, vec!["1".to_string(), "3".to_string()]);
     }
 
     /// Read the removal log rows as JSON values.

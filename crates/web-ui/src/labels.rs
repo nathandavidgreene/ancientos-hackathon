@@ -434,12 +434,21 @@ fn delete_pending(target: &str, state: &State) -> Response {
     )
 }
 
-/// "Removed on X" notice for `?removed=<id>`; empty unless the value is
+/// Inline style for the "Removed on X" banner: green background, white
+/// large bold text (the layout has no stylesheet for it).
+const NOTICE_STYLE: &str = "background:#1b7f3b;color:#fff;font-weight:bold;\
+font-size:1.5em;padding:14px 16px;border-radius:8px;margin:8px 0 16px";
+
+/// Inline style for a card whose post is already removed on X.
+const REMOVED_CARD_STYLE: &str = "opacity:0.55;background:#e6e6e6;filter:grayscale(1)";
+
+/// Banner-style "Removed on X" notice (bold, coloured, `role=status`) for
+/// `?removed=<id>`; rendered at the top of the page; empty unless the value is
 /// 1-25 ASCII digits, so arbitrary query text is never rendered.
 fn removed_notice(removed: Option<&str>) -> String {
     match removed {
         Some(id) if !id.is_empty() && id.len() <= 25 && id.bytes().all(|b| b.is_ascii_digit()) => {
-            format!("<p class=\"notice\">Removed on X: bookmark {id}.</p>")
+            format!("<div class=\"notice\" role=\"status\" style=\"{NOTICE_STYLE}\">Removed on X: bookmark {id}.</div>")
         }
         _ => String::new(),
     }
@@ -448,7 +457,10 @@ fn removed_notice(removed: Option<&str>) -> String {
 /// One post card: header, tags, text, thumbs, findings, radios, Delete
 /// preview line, and a Delete form that posts `return_to` (the view to come
 /// back to) and disables its button on submit (the form still posts
-/// normally when JS is off).
+/// normally when JS is off). A card whose post is in `removed_ids` (by key
+/// or X status id) is greyed, badged "Removed on X", and gets a disabled
+/// Delete button with no form, so it cannot post.
+#[allow(clippy::too_many_arguments)]
 fn card_html(
     queries: &LabelQueries,
     key: &str,
@@ -457,9 +469,14 @@ fn card_html(
     findings: &BTreeMap<String, Vec<labels::ShownFinding>>,
     classify: &BTreeMap<String, BTreeSet<String>>,
     return_to: &str,
+    removed_ids: &BTreeSet<String>,
 ) -> String {
     let post = &queries.posts[key];
     let status_id = labels::status_id_of_url(&post.url);
+    let removed = removed_ids.contains(key)
+        || status_id
+            .as_deref()
+            .is_some_and(|id| removed_ids.contains(id));
     let rel = current == Some(Label::Relevant);
     let not = current == Some(Label::Not);
     let mut preview_cats: Vec<String> = queries.member_of(key);
@@ -472,8 +489,8 @@ fn card_html(
         }
     }
     format!(
-        "<div class=\"card\" id=\"post-{}\">\
-         <h2>#{key} by {author} {badge}</h2>\
+        "<div class=\"card{removed_class}\" id=\"post-{}\"{removed_style}>\
+         <h2>#{key} by {author} {badge}{removed_badge}</h2>\
          <p>{tags}</p>\
          <blockquote>{text}</blockquote>\
          <p>{link}</p>\
@@ -483,12 +500,7 @@ fn card_html(
          <label><input type=\"radio\" form=\"{form}\" name=\"label-{key}\" \
          value=\"not\"{not}> Not</label></p>\
          {preview}\
-         <form method=\"post\" action=\"/labels/delete\" \
-         onsubmit=\"this.querySelector('button').disabled=true\">\
-         <input type=\"hidden\" name=\"post\" value=\"{key}\">\
-         <input type=\"hidden\" name=\"return\" value=\"{return_to}\">\
-         <input type=\"hidden\" name=\"request_id\" value=\"{request_id}\">\
-         <button type=\"submit\">Delete</button></form>\
+         {delete}\
          </div>",
         escape(key),
         key = escape(key),
@@ -503,6 +515,37 @@ fn card_html(
         rel = if rel { " checked" } else { "" },
         not = if not { " checked" } else { "" },
         preview = delete_preview_line(key, &post.author, &preview_cats),
+        delete = if removed {
+            "<button type=\"button\" disabled>Delete</button>".to_string()
+        } else {
+            delete_form(key, return_to)
+        },
+        removed_class = if removed { " removed" } else { "" },
+        removed_style = if removed {
+            format!(" style=\"{REMOVED_CARD_STYLE}\"")
+        } else {
+            String::new()
+        },
+        removed_badge = if removed {
+            " <strong class=\"removed-badge\" style=\"background:#b00020;color:#fff;\
+             padding:2px 8px;border-radius:4px\">Removed on X</strong>"
+        } else {
+            ""
+        },
+    )
+}
+
+/// Active Delete form for one card: posts the key, a fresh request UUID,
+/// and the allowlisted `return_to`; disables its button on submit.
+fn delete_form(key: &str, return_to: &str) -> String {
+    format!(
+        "<form method=\"post\" action=\"/labels/delete\" \
+         onsubmit=\"this.querySelector('button').disabled=true\">\
+         <input type=\"hidden\" name=\"post\" value=\"{key}\">\
+         <input type=\"hidden\" name=\"return\" value=\"{return_to}\">\
+         <input type=\"hidden\" name=\"request_id\" value=\"{request_id}\">\
+         <button type=\"submit\">Delete</button></form>",
+        key = escape(key),
         request_id = request_uuid(),
         return_to = escape(return_to),
     )
@@ -560,6 +603,7 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
     } else {
         RETURN_DEFAULT
     };
+    let removed_ids = labels::removed_post_ids(dir);
     let mut body = removed_notice(req.query.get("removed").map(String::as_str));
     body += &format!(
         "<h1>Labels ({} post{}, {} labeled)</h1>\
@@ -589,6 +633,7 @@ pub fn page_labels(req: &Request, state: &State) -> Response {
             &findings,
             &classify,
             return_to,
+            &removed_ids,
         ));
     }
     body.push_str(&format!(
@@ -654,7 +699,9 @@ pub fn save_labels(req: &Request, state: &State) -> Response {
 /// (no phone approval; the click is the authorization). Success records the
 /// `delete` label and redirects to the allowlisted `return` view with
 /// `removed=<id>`; a still-running earlier request shows a pending page;
-/// failure keeps the bookmark and its label and shows the error.
+/// failure keeps the bookmark and its label and shows the error. A post the
+/// audit log already records as removed skips the remover entirely (no X
+/// call) and just converges the label and redirects with the notice.
 /// Already-removed posts just converge the label and redirect.
 pub fn delete_post(req: &Request, state: &State) -> Response {
     let Some(dir) = state.labels_dir.as_deref() else {
@@ -690,6 +737,9 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
         // Demo-allowlisted store post: same remover, log, and replay as
         // eval posts. It has no eval label row, so no label is saved.
         let target = delete_return_target(form.get("return").map(String::as_str), RETURN_DEMO);
+        if labels::removed_post_ids(dir).contains(key) {
+            return removed_redirect(target, key);
+        }
         let path_env = std::env::var("PATH").ok();
         return match labels::remove_one_id(
             dir,
@@ -715,6 +765,13 @@ pub fn delete_post(req: &Request, state: &State) -> Response {
     let now = now_secs();
     let path_env = std::env::var("PATH").ok();
     let target = delete_return_target(form.get("return").map(String::as_str), RETURN_DEFAULT);
+    if labels::removed_post_ids(dir).contains(&post_id) {
+        // Already removed per the audit log: no remover run, no X call.
+        return match labels::save_labels(dir, &[(key.to_string(), Label::Delete)], now) {
+            Ok(_) => removed_redirect(target, &post_id),
+            Err(e) => failed("Delete failed", &e, state),
+        };
+    }
     match labels::remove_one(
         dir,
         key,
@@ -1476,7 +1533,10 @@ mod tests {
     fn removed_notice_renders() {
         assert_eq!(
             removed_notice(Some("2008023259649089960")),
-            "<p class=\"notice\">Removed on X: bookmark 2008023259649089960.</p>"
+            format!(
+                "<div class=\"notice\" role=\"status\" style=\"{NOTICE_STYLE}\">\
+                 Removed on X: bookmark 2008023259649089960.</div>"
+            )
         );
         assert_eq!(removed_notice(Some("<script>")), "");
         assert_eq!(removed_notice(Some("")), "");
@@ -1491,6 +1551,101 @@ mod tests {
         assert!(body.contains("Removed on X: bookmark 123."), "{body}");
         assert!(body.contains("name=\"return\" value=\"/labels\""), "{body}");
         assert!(body.contains("disabled=true"), "{body}");
+    }
+
+    /// The banner is a bold, coloured `role=status` block.
+    #[test]
+    fn removed_banner_markup() {
+        let b = removed_notice(Some("42"));
+        assert!(
+            b.starts_with("<div class=\"notice\" role=\"status\""),
+            "{b}"
+        );
+        assert!(
+            b.contains("font-weight:bold") && b.contains("background:#"),
+            "{b}"
+        );
+        assert!(b.contains("font-size:1.5em"), "{b}");
+    }
+
+    /// A card whose X id is logged removed is greyed, badged, and has only
+    /// a disabled Delete (no form); others keep an active Delete form.
+    #[test]
+    fn removed_card_disabled_and_others_active() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        std::fs::write(
+            eval.path().join(labels::REMOVALS_FILE),
+            format!("{{\"outcome\":\"removed\",\"post_id\":\"{ID7}\",\"post_key\":\"7\"}}\n"),
+        )
+        .unwrap();
+        let s = labels_state(data.path(), eval.path());
+        let resp = crate::handle_routes(&Request::get("/labels").with_cookie(COOKIE), &s);
+        assert_eq!(resp.status, 200);
+        let body = resp.body.clone();
+        let card = |k: &str| {
+            let start = body.find(&format!("id=\"post-{k}\"")).unwrap();
+            let rest = &body[start..];
+            rest[..rest[1..]
+                .find("<div class=\"card")
+                .map_or(rest.len(), |i| i + 1)]
+                .to_string()
+        };
+        let c7 = card("7");
+        assert!(c7.contains("Removed on X</strong>"), "{c7}");
+        assert!(c7.contains(REMOVED_CARD_STYLE), "{c7}");
+        assert!(
+            c7.contains("<button type=\"button\" disabled>Delete</button>"),
+            "{c7}"
+        );
+        assert!(!c7.contains("action=\"/labels/delete\""), "{c7}");
+        let others: Vec<&str> = body
+            .match_indices("id=\"post-")
+            .map(|(i, _)| &body[i + 9..i + 12])
+            .collect();
+        let other = others
+            .iter()
+            .find(|k| !k.starts_with('7'))
+            .expect("another card");
+        let key: String = other.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let co = card(&key);
+        assert!(co.contains("action=\"/labels/delete\""), "{co}");
+        assert!(
+            co.contains("<button type=\"submit\">Delete</button>"),
+            "{co}"
+        );
+        assert!(!co.contains("Removed on X</strong>"), "{co}");
+    }
+
+    /// Delete on a post already logged removed never runs the remover and
+    /// redirects with the notice.
+    #[test]
+    #[cfg(unix)]
+    fn delete_already_removed_skips_remover() {
+        let data = tempfile::tempdir().unwrap();
+        let eval = eval_fixture();
+        std::fs::write(
+            eval.path().join(labels::REMOVALS_FILE),
+            format!("{{\"outcome\":\"removed\",\"post_id\":\"{ID7}\",\"post_key\":\"7\"}}\n"),
+        )
+        .unwrap();
+        let mut s = labels_state(data.path(), eval.path());
+        let calls = data.path().join("calls.txt");
+        s.labels_remove_bin = Some(fake_remove_bin(data.path(), &calls, 0, ""));
+        let resp = crate::handle_routes(
+            &Request::post(
+                "/labels/delete",
+                "post=7&request_id=00000000-0000-4000-8000-000000000021",
+            )
+            .with_cookie(COOKIE),
+            &s,
+        );
+        assert_eq!(resp.status, 303);
+        assert_eq!(
+            resp.location.as_deref(),
+            Some(format!("/labels?removed={ID7}").as_str())
+        );
+        assert!(!calls.exists(), "remover must not run");
     }
 
     /// Exit 1 with `request_in_progress` on stdout shows the pending page,
