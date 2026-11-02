@@ -66,11 +66,11 @@ configured loopback bind host and port are allowed. For the tailnet HTTPS proxy,
 configure:
 
 ```sh
-export ANCIENTOS_UI_ALLOWED_ORIGINS=https://ser6buzz.tail3ab3aa.ts.net:8445
+export ANCIENTOS_UI_ALLOWED_ORIGINS=https://agent.example.ts.net:8445
 ```
 
-The proxy must preserve `Host: ser6buzz.tail3ab3aa.ts.net:8445` and the browser's
-`Origin: https://ser6buzz.tail3ab3aa.ts.net:8445`. Forwarded headers are not trusted.
+The proxy must preserve `Host: agent.example.ts.net:8445` and the browser's
+`Origin: https://agent.example.ts.net:8445`. Forwarded headers are not trusted.
 Add the loopback origin explicitly, separated by a comma, if both access paths
 are needed. An invalid or empty configured allowlist prevents startup. No proxy
 hostname is implicitly trusted.

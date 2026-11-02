@@ -4806,8 +4806,8 @@ mod request_security_tests {
             request.origin = Some(origin.into());
             assert_eq!(handle(&request, &state).status, 403);
         }
-        let proxy = "https://ser6buzz.tail3ab3aa.ts.net:8445";
-        request.host = Some("ser6buzz.tail3ab3aa.ts.net:8445".into());
+        let proxy = "https://agent.example.ts.net:8445";
+        request.host = Some("agent.example.ts.net:8445".into());
         request.origin = Some(proxy.into());
         assert_eq!(handle(&request, &state).status, 403);
         state.allowed_origins = allowed_origins(proxy).unwrap();

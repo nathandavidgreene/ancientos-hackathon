@@ -114,8 +114,10 @@ request). Deleted posts, suspended/deleted authors and protected posts are
 dropped silently — only a 24h on-disk cache entry (`liveness_cache.json`) is
 recorded, never a decision-log entry. Transient errors fail closed (skipped,
 not cached); `brief --offline` / `--demo`, `ANCIENTOS_OFFLINE=1` and paid-off
-skip the check with no network. X is read-only (never un-bookmark) and stored
-bookmarks are never deleted.
+skip the check with no network. The agent itself is read-only on X. The one
+exception is Delete on the labels page: each click un-bookmarks one post on X
+through a separate X worker (not in this repo). Every attempt is logged, and
+nothing is deleted on failure. Stored bookmarks are never deleted.
 
 ## Launch web UI
 ```sh

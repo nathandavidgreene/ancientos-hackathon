@@ -1,5 +1,6 @@
-//! X bookmarks agent, the first app on the AncientOS core: read-only X
-//! sign-in and incremental sync (never deletes bookmarks), a daily brief of
+//! X bookmarks agent, the first app on the AncientOS core. The agent itself
+//! is read-only on X: sign-in and incremental sync (never deletes bookmarks;
+//! labels-page Delete hands off to a separate X worker), a daily brief of
 //! 3-5 picks, votes and feedback, a personal ranker, the try-it cascade,
 //! go-deeper walkthroughs, idea cards, the wiki, and the scheduler daemon.
 //! Risky actions go through [`app_gate`] and the core approvals queue.
