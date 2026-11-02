@@ -5,7 +5,7 @@ A small Rust core that lets AI agents act on your behalf only through a fail-clo
 
 ## Demo video
 
-[Watch the demo](https://example.com/demo-video) (link coming soon).
+[Watch the demo](https://www.youtube.com/watch?v=lXqM33cO3EM)
 
 ## Why AncientOS exists
 
