@@ -1,7 +1,15 @@
 # ancientos-hackathon
-AncientOS rebuild for the Meta hackathon \(Oct 26-Nov 4, 2026\)
+AncientOS rebuild for the Meta hackathon (Oct 26–Nov 4, 2026).
+
+A small Rust core that lets AI agents act on your behalf only through a fail-closed approval gate, a privacy router and a hash-chained decision log.
+
+## Demo video
+
+[Watch the demo](https://example.com/demo-video) (link coming soon).
 
 ## Why AncientOS exists
+
+Rebuilt from a private ~180k-line Python assistant (not in this repo).
 
 An AI agent is only useful if it can act: sync your bookmarks, run a coding job, ask a model a question. But most agents get that power by being handed your keys and trusted to behave.
 
@@ -20,7 +28,7 @@ AncientOS takes a different route: the agent can act, but it never holds unrestr
 
 Three apps (an X bookmarks curator, gated Muse Code runs, and Muse Wonder questions) share this one small core, which knows nothing about any of them.
 
-What isn't done yet: the gate is enforced by convention, not by types; the log has no cross-process lock and isn't signed; and the router can still be bypassed by code that calls a model directly. Those are next.
+What isn't done yet: the release-token type check covers paid execution but not every action; the log has no cross-process lock, and signing is opt-in (ANCIENTOS_LOG_KEY_PATH); code can still call a model client without going through the router. Those are next. The demo runs with an unsigned log; the live deploy can sign it.
 
 ## What this is
 AncientOS hackathon build (Oct 26 - Nov 4 2026): a Rust core with a scheduler,
@@ -69,13 +77,14 @@ Mock and local clients only, temp data dir, no network, no real data.
 cargo run -p web-ui -- --demo     # add --port 8799 if 8787 is taken
 ```
 Open http://127.0.0.1:8787/ (loopback only, server-rendered, works without JS).
+Use `--data DIR` instead of `--demo` to serve your own data dir.
 The brief (`/`) and ideas (`/ideas`) pages work. `/m` (phone approvals) and
 `/labels` report "off" without their tokens and private label queries; that is
 expected. `/log` needs a scoped login.
 
 ### 3. Tests
 ```sh
-cargo test --workspace --quiet    # 1031 tests on current main
+cargo test --workspace --quiet    # 1041 tests on current main
 ```
 Run from the repo root: `scripts/demo.sh` and its tests use `./target`, so do
 not set `CARGO_TARGET_DIR`.
@@ -118,9 +127,3 @@ skip the check with no network. The agent itself is read-only on X. The one
 exception is Delete on the labels page: each click un-bookmarks one post on X
 through a separate X worker (not in this repo). Every attempt is logged, and
 nothing is deleted on failure. Stored bookmarks are never deleted.
-
-## Launch web UI
-```sh
-cargo run -p web-ui -- --demo   # temp data dir seeded with the scripts/demo.sh fixtures
-```
-Then open http://127.0.0.1:8787/ in a browser (loopback only, server-rendered HTML, works without JS). Use `--data DIR` instead of `--demo` to serve your own data dir; `--port` and loopback-only `--host` are optional.
