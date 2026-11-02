@@ -7,9 +7,17 @@ A small Rust core that lets AI agents act on your behalf only through a fail-clo
 
 [Watch the demo](https://www.youtube.com/watch?v=lXqM33cO3EM)
 
+## Meta stack
+
+- **Meta Model API** (Muse Spark / Wonder) for hosted intelligence on sanitized text.
+- **Llama running locally** (Ollama or llama.cpp) for sensitive data.
+- **Muse Spark Open** (Meta open weights) on Baseten as an alternate image-analysis backend.
+
+Muse Spark and Wonder are Meta's model names on the Meta Model API, not AncientOS crates.
+
 ## Why AncientOS exists
 
-Rebuilt from a private ~180k-line Python assistant (not in this repo).
+Built from scratch in Rust for this hackathon (Oct 26–Nov 4, 2026), distilling the governance and security core from a private ~180k-line Python assistant (not in this repo).
 
 An AI agent is only useful if it can act: sync your bookmarks, run a coding job, ask a model a question. But most agents get that power by being handed your keys and trusted to behave.
 
@@ -19,6 +27,17 @@ AncientOS takes a different route: the agent can act, but it never holds unrestr
  intelligence  ->  authorization  ->  execution  ->  evidence
  (models,          (gate + your       (runs once,     (hash-chained
   privacy router)   approval)          paid switch)    decision log)
+```
+
+```mermaid
+flowchart LR
+  A[Request] --> R{Privacy router}
+  R -->|sensitive| L[Local Llama]
+  R -->|sanitized| M[Meta Model API]
+  L --> G[Approval gate]
+  M --> G
+  G -->|approved release token| X[Execution with paid switch]
+  X --> E[Hash-chained decision log]
 ```
 
 - **Intelligence** proposes. A privacy router keeps sensitive or unclassified text on a local Llama model; only sanitized text goes to Meta's cloud models.
