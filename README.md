@@ -5,7 +5,7 @@ A small Rust core that lets AI agents act on your behalf only through a fail-clo
 
 ## Demo video
 
-[Watch the demo](https://www.youtube.com/watch?v=lXqM33cO3EM)
+[Watch the demo](https://www.youtube.com/watch?v=AqqmyBX3_5E)
 
 ## Meta stack
 
